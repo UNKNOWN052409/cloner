@@ -11,6 +11,39 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { taskDir, outDir, loadTask, updateTask, purgeCredentials } from "./tasks.js";
 
+// v2 pipeline export: exploration + reconstruction artifacts live in artifacts/<jobId>/
+function v2TaskDir(id) { return path.join(process.cwd(), "artifacts", id); }
+
+export async function exportV2Task(id) {
+  const v2Dir = v2TaskDir(id);
+  const manifestFile = path.join(v2Dir, "manifest.json");
+  if (!fs.existsSync(manifestFile)) throw new Error("not a v2 exploration job (manifest.json missing)");
+  const staging = path.join(v2Dir, "export-staging");
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.mkdirSync(staging, { recursive: true });
+  const copyDir = (from, to) => {
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      if (entry.name === "private" || entry.name === "export-staging" || entry.name === "node_modules") continue;
+      const src = path.join(from, entry.name);
+      const dst = path.join(to, entry.name);
+      if (entry.isDirectory()) { fs.mkdirSync(dst, { recursive: true }); copyDir(src, dst); }
+      else fs.copyFileSync(src, dst);
+    }
+  };
+  copyDir(v2Dir, staging);
+  const zipPath = path.join(v2Dir, "export.zip");
+  fs.rmSync(zipPath, { force: true });
+  await new Promise((resolve, reject) => {
+    const cmd = process.platform === "win32" ? "powershell" : "zip";
+    const args = process.platform === "win32"
+      ? ["-NoProfile", "-Command", `Compress-Archive -Path '${staging}\\*' -DestinationPath '${zipPath}' -Force`]
+      : ["-r", "-q", zipPath, "."];
+    execFile(cmd, args, { cwd: staging, timeout: 120000 }, (err) => err ? reject(err) : resolve());
+  });
+  fs.rmSync(staging, { recursive: true, force: true });
+  return { zipPath, size: fs.statSync(zipPath).size };
+}
+
 // code/asset extensions — a site's own source named "storage.js" must survive the export
 const CODE_FILE = /\.(js|mjs|cjs|ts|jsx|tsx|css|html?|mhtml|svg|woff2?|ttf|eot|png|jpe?g|gif|webp|avif|ico|map)$/i;
 // data extensions that CAN hold session state when the name says so (spec §11)

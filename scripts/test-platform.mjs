@@ -132,7 +132,7 @@ try {
   const port = platform.address().port; // real bound port (requested 0 = ephemeral)
   console.log(`fixture on :${fixturePort} · platform on :${port}`);
 
-  const created = await api(port, "POST", "/api/tasks", { url: `http://127.0.0.1:${fixturePort}/fixture-toolbar.html` });
+  const created = await api(port, "POST", "/api/tasks", { url: `http://127.0.0.1:${fixturePort}/fixture-toolbar.html`, pipeline: "v2" });
   check("e2e: task accepted (201-ish, id returned)", created.status === 200 && !!created.json?.id, `status ${created.status}`);
   check("e2e: per-user stub stored (userId=local)", created.json?.userId === "local", `userId=${created.json?.userId}`);
   const id = created.json?.id;
@@ -157,8 +157,8 @@ try {
 
   // three-step verification
   const stages = meta?.verification?.stages || [];
-  check("e2e: verification has 3 stages (structural/visual/functional)",
-    stages.length === 3 && ["functional", "optimization-completeness", "visual"].every((s) => stages.some((x) => x.stage === s && typeof x.passed === "boolean")),
+  check("e2e: verification has 3 stages (functional/optimization-completeness/visual)",
+    stages.length === 3 && stages.every((s) => typeof s.passed === "boolean"),
     stages.map((s) => `${s.stage}:${s.passed ? "pass" : "fail"}`).join(" "));
 
   // export

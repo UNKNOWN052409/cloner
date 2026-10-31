@@ -14,7 +14,7 @@ import { loadCookies } from "../browser.js";
 import * as exploration from "./exploration-runner.js";
 import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
-import { exportTask } from "./exporter.js";
+import { exportTask, exportV2Task } from "./exporter.js";
 import { verifyTask } from "./verify.js";
 import { authRequired } from "../auth/auth-middleware.js";
 import * as auth from "../auth/auth-service.js";
@@ -78,7 +78,12 @@ export function startPlatform({ port = 4180 } = {}) {
       bus.emit("log", { level: "warn", msg: `task ${meta.id} failed: ${e.message}` });
     });
   });
-  app.get("/api/tasks", (_req, res) => res.json(tasks.listTasks()));
+  app.get("/api/tasks", async (_req, res) => {
+    // merge legacy tasks + exploration-runner jobs
+    const legacy = tasks.listTasks();
+    const jobs = exploration.listJobs();
+    res.json([...legacy, ...jobs]);
+  });
 
   // ---- exploration jobs (Phase 1 intelligence engine, spec §15) ----
   app.post("/api/jobs/explore", (req, res) => {
@@ -107,9 +112,20 @@ export function startPlatform({ port = 4180 } = {}) {
     res.sendFile(file);
   });
   app.get("/api/tasks/:id", (req, res) => {
+    // check legacy task store first, then exploration-runner (pipeline v2)
     const meta = tasks.loadTask(req.params.id);
-    if (!meta) return res.status(404).json({ error: "not found" });
-    res.json(meta);
+    if (meta) return res.json(meta);
+    const job = exploration.getExplorationJob(req.params.id);
+    if (job) {
+      return res.json({
+        id: job.jobId, url: job.url, status: job.status,
+        pipeline: "v2", artifactsDir: job.artifactsDir,
+        reconstruction: job.reconstruction || null,
+        verification: job.verification || null,
+        history: job.history || [],
+      });
+    }
+    return res.status(404).json({ error: "not found" });
   });
   app.delete("/api/tasks/:id", (req, res) => {
     sessions.release(req.params.id);
@@ -172,7 +188,8 @@ export function startPlatform({ port = 4180 } = {}) {
   // ---- export ----
   app.post("/api/export/:id", async (req, res) => {
     try {
-      const { zipPath, size } = await exportTask(req.params.id);
+      const isV2 = fs.existsSync(path.join(process.cwd(), 'artifacts', req.params.id, 'manifest.json'));
+      const { zipPath, size } = isV2 ? await (async () => { const { exportV2Task } = await import('./exporter.js'); return exportV2Task(req.params.id); })() : await exportTask(req.params.id);
       sessions.release(req.params.id); // explicit finish → close the session
       res.json({ ok: true, download: `/api/export/${req.params.id}/download`, size });
     } catch (e) {

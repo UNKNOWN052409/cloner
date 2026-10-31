@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>cloner — live</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- ambient scene -->
+  <div class="bg-scene" aria-hidden="true">
+    <div class="blob blob-purple"></div>
+    <div class="blob blob-blue"></div>
+    <div class="blob blob-green"></div>
+    <div class="blob blob-salmon"></div>
+    <div class="blob blob-red"></div>
+    <div class="bg-vignette"></div>
+  </div>
+
+  <header>
+    <div class="logo">
+      <span class="logo-mark">◤</span>
+      <span class="logo-text">cloner</span>
+    </div>
+    <div class="chip" id="runInfo">waiting for a run…</div>
+    <div class="spacer"></div>
+    <div class="chip chip-accent" id="modelChip">—</div>
+    <div class="chip" id="runsCount">0 runs</div>
+  </header>
+
+  <main>
+    <!-- LEFT: live pipeline -->
+    <aside class="glass panel" id="pipeline">
+      <h2><span class="h-dot dot-purple"></span> pipeline</h2>
+      <div id="steps" class="steps"></div>
+      <h2><span class="h-dot dot-blue"></span> log</h2>
+      <div id="log" class="log"></div>
+    </aside>
+
+    <!-- CENTER: compare -->
+    <section class="stage" id="stage">
+      <nav class="stage-tabs glass">
+        <button data-tab="clone" class="active">Clone</button>
+        <button data-tab="original">Original</button>
+        <button data-tab="compare">Side-by-side</button>
+        <span class="spacer"></span>
+        <span class="preview-chip" id="previewChip">desktop 1440px · fit</span>
+        <button id="reloadPreview" class="icon-btn" title="reload">⟳</button>
+        <button id="fsBtn" class="icon-btn" title="fullscreen (Esc to exit)">⛶</button>
+        <a id="openTab" class="icon-btn" href="#" target="_blank" title="open in new tab">↗</a>
+      </nav>
+      <div class="stage-body glass">
+        <div id="pane-clone" class="pane active"><div class="frame-wrap" id="frameWrap"><iframe id="cloneFrame"></iframe></div></div>
+        <div id="pane-original" class="pane"><div id="shots" class="shots"></div></div>
+        <div id="pane-compare" class="pane"><div class="compare"><div class="half"><h3><span class="h-dot dot-green"></span> original</h3><div id="shotsC1"></div></div><div class="half"><h3><span class="h-dot dot-purple"></span> clone</h3><div id="shotsC2"></div></div></div></div>
+      </div>
+    </section>
+
+    <!-- RIGHT: edit -->
+    <aside class="glass panel" id="editpanel">
+      <h2><span class="h-dot dot-salmon"></span> edit clone</h2>
+      <div class="hint">Pick an element in the preview, describe the change, apply.</div>
+      <button id="armBtn" class="btn">⊕ Select element</button>
+      <div id="picked" class="picked empty">no element selected</div>
+      <textarea id="instruction" placeholder="e.g. make this button larger and green; change this text to 'Get Started'; remove this section…"></textarea>
+      <button id="applyBtn" class="btn primary">⚡ Apply with model</button>
+      <div id="editStatus"></div>
+      <div id="briefBox" hidden>
+        <h2><span class="h-dot dot-green"></span> brief</h2>
+        <div id="briefBody" class="brief"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

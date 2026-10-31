@@ -1,0 +1,334 @@
+{
+  "counts": {
+    "triggersInHtml": 33,
+    "runtimeInteractions": 3,
+    "iconTotal": 8,
+    "iconMissing": 2,
+    "btnTotal": 92,
+    "btnMissing": 15,
+    "toolbarTotal": 88,
+    "toolbarMissing": 15
+  },
+  "topMissing": [
+    {
+      "icon": "icon icon-arrow-down",
+      "chain": "div.context-toolbar > div.btn-group.btn-group-seamless > div.btn.btn-icon > div.icon.icon-arrow-down",
+      "trigger": null,
+      "text": "",
+      "cat": "icon"
+    },
+    {
+      "icon": "icon icon-close",
+      "chain": "div.context-toolbar > div.btn-group.btn-group-seamless > div.btn.btn-icon > div.icon.icon-close",
+      "trigger": null,
+      "text": "",
+      "cat": "icon"
+    },
+    {
+      "chain": "div > div.app-wrapper.layout-lg > div.app-controls > div.btn-wrap.search-box-button",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.app-controls > div.flex-row.account-selector-wrapper > span > a.btn.btn-primary",
+      "trigger": null,
+      "text": "Open Account",
+      "cat": "btn"
+    },
+    {
+      "chain": "div > div.app-wrapper.layout-lg > div.app-controls > div.btn-wrap.settings",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.tab > div.tab-controls > div.btn-group.btn-group-sm.btn-group-seamless.pull-right > div.btn.btn-icon",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.tab-content > div.context-toolbar > div.btn-group.btn-group-seamless > div.btn.btn-icon",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.info-column > div.row > div.col-xs-6 > div.btn.btn-success",
+      "trigger": null,
+      "text": "Buy Mkt",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.info-column > div.row > div.col-xs-6 > div.btn.btn-danger",
+      "trigger": null,
+      "text": "Sell Mkt",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.info-column > div.row > div.col-xs-6 > div.btn.btn-success",
+      "trigger": null,
+      "text": "Buy Bid",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.info-column > div.row > div.col-xs-6 > div.btn.btn-danger",
+      "trigger": null,
+      "text": "Sell Ask",
+      "cat": "btn"
+    },
+    {
+      "chain": "div.market-buttons-wrapper > div > div > div.market-buttons.btn-group.btn-group-sm",
+      "trigger": null,
+      "text": "Buy MktExit at Mkt & CxlSell Mkt",
+      "cat": "btn"
+    },
+    {
+      "chain": "div > div > div.market-buttons.btn-group.btn-group-sm > div.btn.btn-success",
+      "trigger": null,
+      "text": "Buy Mkt",
+      "cat": "btn"
+    },
+    {
+      "chain": "div > div > div.market-buttons.btn-group.btn-group-sm > div.btn.btn-danger",
+      "trigger": null,
+      "text": "Sell Mkt",
+      "cat": "btn"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div.flex-row.account-selector-wrapper > div.pane.account-selector.dropdown > ul.dropdown-menu > li",
+      "trigger": null,
+      "text": "Go to Replay",
+      "cat": "toolbar"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div.pane.account-selector.dropdown > ul.dropdown-menu > li > a.account.logout",
+      "trigger": null,
+      "text": "Go to Replay",
+      "cat": "toolbar"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div.flex-row.account-selector-wrapper > div.pane.account-selector.dropdown > ul.dropdown-menu > li",
+      "trigger": null,
+      "text": "Logout",
+      "cat": "toolbar"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div.pane.account-selector.dropdown > ul.dropdown-menu > li > a.account.logout",
+      "trigger": null,
+      "text": "Logout",
+      "cat": "toolbar"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div.account-info-inline > div.pane.balance-view.dropdown > div.dropdown-menu > li",
+      "trigger": null,
+      "text": "EquityOpen P/LTotal P/LDay Loss Limit ⬤W",
+      "cat": "toolbar"
+    },
+    {
+      "chain": "div.app-sidebar > div.tab > div.tab-controls > div.btn-group.btn-group-sm.btn-group-seamless.pull-right",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "chain": "li.lm_tab > div.tab-content > div.context-toolbar > div.btn-group.btn-group-seamless",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "chain": "li.lm_tab.lm_active > div.tab-content > div.context-toolbar > div.btn-group.btn-group-seamless",
+      "trigger": null,
+      "text": "",
+      "cat": "btn"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div.pane.account-selector.dropdown > div > div.account > div.icon-wrapper",
+      "trigger": null,
+      "text": "",
+      "cat": "toolbar"
+    },
+    {
+      "toolbar": "app-controls",
+      "chain": "div > div.account > div.icon-wrapper > div.icon.icon-sm.icon-circle-demo",
+      "trigger": null,
+      "text": "",
+      "cat": "toolbar"
+    }
+  ],
+  "triggerEls": [
+    {
+      "trigger": "t0",
+      "chain": "div > div.app-wrapper.layout-lg > div.app-controls > div.btn-wrap.add-module",
+      "text": ""
+    },
+    {
+      "trigger": "t2",
+      "chain": "div > div.app-wrapper.layout-lg > div.app-controls > div.btn-wrap.trade",
+      "text": ""
+    },
+    {
+      "trigger": "t4",
+      "chain": "div > div.app-wrapper.layout-lg > div.app-controls > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t7",
+      "chain": "div > div.app-wrapper.layout-lg > div.app-controls > button.btn.btn-outline.switch-to-beta",
+      "text": "Try the beta"
+    },
+    {
+      "trigger": "t10",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.btn-wrap.settings > a.btn.btn-icon",
+      "text": ""
+    },
+    {
+      "trigger": "t11",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t13",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t15",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap.active",
+      "text": "2"
+    },
+    {
+      "trigger": "t17",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t19",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t21",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t23",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap",
+      "text": ""
+    },
+    {
+      "trigger": "t25",
+      "chain": "div.app-wrapper.layout-lg > div.app-controls > div.aside-controls.open > div.btn-wrap.riskManager",
+      "text": ""
+    },
+    {
+      "trigger": "t29",
+      "chain": "div.tab > div.tab-controls > div.btn-group.btn-group-sm.btn-group-seamless.pull-right > div.btn.btn-icon",
+      "text": ""
+    },
+    {
+      "trigger": "t36",
+      "chain": "div.tab-content > div.context-toolbar > div.btn-group.btn-group-seamless > div.btn.btn-icon",
+      "text": ""
+    },
+    {
+      "trigger": "t38",
+      "chain": "div.lm_header > ul.lm_tabs > li.lm_tab.tab_add > div.context-toolbar.btn-toolbar",
+      "text": ""
+    },
+    {
+      "trigger": "t41",
+      "chain": "div.lm_item.lm_column > div.lm_item.lm_stack > div.lm_header > ul.lm_controls.context-toolbar.btn-group.btn-group-seamless",
+      "text": "H"
+    },
+    {
+      "trigger": "t47",
+      "chain": "div.golden-layout-inner-wrapper > div.quoteboard.module.data-table.compact-data-table > div.module-header.flex-row > div.icon-switch.btn-group.falsy-value",
+      "text": ""
+    },
+    {
+      "trigger": "t52",
+      "chain": "div.lm_header > ul.lm_tabs > li.lm_tab.tab_add > div.context-toolbar.btn-toolbar",
+      "text": ""
+    },
+    {
+      "trigger": "t55",
+      "chain": "div.lm_item.lm_column > div.lm_item.lm_stack > div.lm_header > ul.lm_controls.context-toolbar.btn-group.btn-group-seamless",
+      "text": "H"
+    },
+    {
+      "trigger": "t65",
+      "chain": "div.info-column > div > div.select-input.combobox > div.btn",
+      "text": ""
+    },
+    {
+      "trigger": "t66",
+      "chain": "div.info-column > div > div > div.dropdown.btn-group.btn-split.btn-group-default",
+      "text": "Exit at Mkt & Cxl"
+    },
+    {
+      "trigger": "t69",
+      "chain": "div.info-column > div.simple-tpsl-chart-header-dropdowns > div > div.btn-group",
+      "text": "TP/SL: None"
+    },
+    {
+      "trigger": "t70",
+      "chain": "div.info-column > div.simple-tpsl-chart-header-dropdowns > div > div.btn-group",
+      "text": "TIF: End of day"
+    },
+    {
+      "trigger": "t73",
+      "chain": "div.lm_header > ul.lm_tabs > li.lm_tab.tab_add > div.context-toolbar.btn-toolbar",
+      "text": ""
+    },
+    {
+      "trigger": "t76",
+      "chain": "div.lm_item.lm_column > div.lm_item.lm_stack > div.lm_header > ul.lm_controls.context-toolbar.btn-group.btn-group-seamless",
+      "text": "H"
+    },
+    {
+      "trigger": "t84",
+      "chain": "div.lm_header > ul.lm_tabs > li.lm_tab.tab_add > div.context-toolbar.btn-toolbar",
+      "text": ""
+    },
+    {
+      "trigger": "t87",
+      "chain": "div.lm_item.lm_row > div.lm_item.lm_stack > div.lm_header > ul.lm_controls.context-toolbar.btn-group.btn-group-seamless",
+      "text": "H"
+    },
+    {
+      "trigger": "t93",
+      "chain": "div.info-column.info-column-qty > div.form-group > div.select-input.combobox > div.btn",
+      "text": ""
+    },
+    {
+      "trigger": "t96",
+      "chain": "div > div > div.market-buttons.btn-group.btn-group-sm > div.dropdown.btn-group.btn-split.btn-group-default",
+      "text": "Exit at Mkt & Cxl"
+    },
+    {
+      "trigger": "t100",
+      "chain": "div.module.module-dom > div.simple-tpsl-dom-table-footer > div > div.btn-group",
+      "text": "TP/SL: None"
+    },
+    {
+      "trigger": "t101",
+      "chain": "div.module.module-dom > div.simple-tpsl-dom-table-footer > div > div.btn-group",
+      "text": "TIF: End of day"
+    },
+    {
+      "trigger": "t102",
+      "chain": "div.walkme-player.walkme-mississippi.walkme-theme-black-blue.walkme-direction-ltr",
+      "text": "Tradovate Help"
+    }
+  ]
+}

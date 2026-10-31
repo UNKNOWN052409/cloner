@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Toolbar Fixture</title>
+<style>
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 0; background: #f5f6f8; }
+  .app { display: flex; height: 100vh; }
+  .sidebar { width: 220px; background: #fff; border-right: 1px solid #e3e5ea; padding: 12px; }
+  .main { flex: 1; padding: 20px; position: relative; }
+  .context-toolbar.btn-toolbar { display: flex; gap: 8px; padding: 8px; background: #fff; border: 1px solid #e3e5ea; border-radius: 6px; width: max-content; margin-bottom: 16px; }
+  .btn-group { display: flex; border: 1px solid #d0d3da; border-radius: 4px; overflow: hidden; }
+  .btn.btn-icon { width: 32px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; background: #fafbfc; }
+  .btn.btn-icon:hover { background: #eef1f5; }
+  .icon { width: 16px; height: 16px; display: block; }
+  .icon-plus { background: #2a7fff; -webkit-mask: radial-gradient(circle at center, #000 40%, transparent 41%); mask: radial-gradient(circle at center, #000 40%, transparent 41%); }
+  .icon-chart { background: #888; }
+  .icon-table { background: #888; }
+  .picker-menu { position: absolute; top: 76px; left: 20px; width: 240px; background: #fff; border: 1px solid #d0d3da; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.14); padding: 6px; display: none; z-index: 100; }
+  .picker-menu.open { display: block; }
+  .picker-menu .item { padding: 8px 10px; border-radius: 5px; cursor: pointer; }
+  .picker-menu .item:hover { background: #eef4ff; }
+  .module-panel { position: absolute; right: 30px; top: 60px; width: 380px; height: 300px; background: #fff; border: 1px solid #d0d3da; border-radius: 8px; box-shadow: 0 14px 40px rgba(0,0,0,.18); display: none; padding: 14px; }
+  .module-panel.open { display: block; }
+  canvas { background: #101418; width: 352px; height: 200px; display: block; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <h3>Workspace</h3>
+    <ul><li>Watchlist</li><li>Charts</li><li>Orders</li></ul>
+  </div>
+  <div class="main">
+    <div class="context-toolbar btn-toolbar">
+      <div class="btn-group" title="Add module">
+        <div class="btn btn-icon" title="Add module" aria-label="Add module"><div class="icon icon-plus"></div></div>
+        <div class="btn btn-icon" title="Add chart" aria-label="Add chart"><div class="icon icon-chart"></div></div>
+      </div>
+      <div class="btn-group">
+        <div class="btn btn-icon" title="Add table" aria-label="Add table"><div class="icon icon-table"></div></div>
+      </div>
+    </div>
+    <h1>Toolbar fixture</h1>
+    <p>Click the + icons — a picker menu should open with module options.</p>
+    <div class="picker-menu" id="picker">
+      <div class="item" data-module="Market Analyzer">Market Analyzer</div>
+      <div class="item" data-module="Order Ladder">Order Ladder</div>
+      <div class="item" data-module="DOM Table">DOM Table</div>
+      <div class="item" data-module="Time & Sales">Time & Sales</div>
+      <div class="item" data-module="Depth Map">Depth Map</div>
+    </div>
+    <div class="module-panel" id="panel">
+      <h3 id="panel-title">Module</h3>
+      <canvas id="chart" width="352" height="200"></canvas>
+    </div>
+  </div>
+</div>
+<script>
+  const picker = document.getElementById("picker");
+  const panel = document.getElementById("panel");
+  document.querySelectorAll(".btn-icon").forEach((b) => {
+    b.addEventListener("click", (e) => {
+      if ((b.title || "").includes("Add module")) {
+        picker.classList.toggle("open");
+        panel.classList.remove("open");
+        e.stopPropagation();
+      }
+    });
+  });
+  document.querySelectorAll(".picker-menu .item").forEach((it) => {
+    it.addEventListener("click", () => {
+      document.getElementById("panel-title").textContent = it.dataset.module;
+      panel.classList.add("open");
+      picker.classList.remove("open");
+      // draw a fake chart on the canvas so canvas-snapshot is exercised
+      const c = document.getElementById("chart");
+      const g = c.getContext("2d");
+      g.fillStyle = "#101418"; g.fillRect(0, 0, c.width, c.height);
+      g.strokeStyle = "#22c55e"; g.beginPath();
+      for (let x = 0; x < c.width; x += 8) g.lineTo(x, 100 + Math.sin(x / 18) * 55 * Math.random());
+      g.stroke();
+    });
+  });
+  document.addEventListener("click", () => picker.classList.remove("open"));
+</script>
+</body>
+</html>

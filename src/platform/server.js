@@ -1,0 +1,211 @@
+// Cloner platform server: task API, persistent sessions, WebSocket progress,
+// preview + element picker, verification, export. The engine (src/*.js) does the
+// reverse engineering; this is the product shell around it.
+import fs from "node:fs";
+import path from "node:path";
+import http from "node:http";
+import express from "express";
+import { WebSocketServer } from "ws";
+import { fileURLToPath } from "node:url";
+import { bus } from "../events.js";
+import { loadConfig } from "../config.js";
+import { cloneUrl } from "../cloneUrl.js";
+import { loadCookies } from "../browser.js";
+import * as tasks from "./tasks.js";
+import * as sessions from "./sessions.js";
+import { exportTask } from "./exporter.js";
+import { verifyTask } from "./verify.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+export function startPlatform({ port = 4180 } = {}) {
+  const app = express();
+  app.use(express.json({ limit: "20mb" }));
+
+  // ---- static UI ----
+  app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "..", "..", "platform-ui", "index.html")));
+  app.use("/ui", express.static(path.join(__dirname, "..", "..", "platform-ui")));
+  // picker script injected into previews (element selection)
+  const PICKER_JS = fs.readFileSync(path.join(__dirname, "..", "picker.js"), "utf8");
+
+  // ---- tasks ----
+  app.post("/api/tasks", (req, res) => {
+    const { url, username, password, cookies, storage, instructions, mode } = req.body || {};
+    if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    const meta = tasks.createTask({ url, mode, username, password, cookies, storage, instructions });
+    res.json(meta);
+    runTask(meta.id).catch((e) => {
+      tasks.updateTask(meta.id, { status: "error", error: String(e.message || e).slice(0, 300) }, "failed");
+      bus.emit("log", { level: "warn", msg: `task ${meta.id} failed: ${e.message}` });
+    });
+  });
+  app.get("/api/tasks", (_req, res) => res.json(tasks.listTasks()));
+  app.get("/api/tasks/:id", (req, res) => {
+    const meta = tasks.loadTask(req.params.id);
+    if (!meta) return res.status(404).json({ error: "not found" });
+    res.json(meta);
+  });
+  app.delete("/api/tasks/:id", (req, res) => {
+    sessions.release(req.params.id);
+    tasks.deleteTask(req.params.id);
+    res.json({ ok: true });
+  });
+
+  // ---- clone preview (with element picker injected) ----
+  app.get("/preview/:id", (req, res) => res.redirect(`/preview/${req.params.id}/index.html`));
+  app.get("/preview/:id/*", (req, res) => {
+    const dir = tasks.outDir(req.params.id);
+    const file = path.resolve(dir, req.params[0] || "index.html");
+    if (!file.startsWith(path.resolve(dir))) return res.status(403).send("forbidden");
+    if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return res.status(404).send("not found yet");
+    if (file.endsWith(".html")) {
+      let html = fs.readFileSync(file, "utf8");
+      html = html.replace(/<\/body>/i, `<script>${PICKER_JS}</script>`);
+      res.type("html").send(html);
+    } else res.sendFile(file);
+  });
+
+  // ---- chat / edit selected element (reuses engine edit flow) ----
+  app.post("/api/tasks/:id/chat", async (req, res) => {
+    const { selector, info = {}, instruction } = req.body || {};
+    const file = req.body?.file || "index.html";
+    if (!instruction) return res.status(400).json({ error: "instruction required" });
+    const cfg = loadConfig();
+    if (cfg.model.provider === "none" || !cfg.model.apiKey) return res.status(400).json({ error: "no vision model configured (Settings → API providers, phase 6)" });
+    const target = path.join(tasks.outDir(req.params.id), file);
+    if (!fs.existsSync(target)) return res.status(404).json({ error: "clone not ready" });
+    try {
+      const { routeChat } = await import("./model-router.js");
+      const { EDIT_SYSTEM, EDIT_ELEMENT } = await import("../prompts.js");
+      const html = fs.readFileSync(target, "utf8");
+      const { out, provider } = await routeChat(
+        cfg,
+        [{ role: "system", content: EDIT_SYSTEM }, { role: "user", content: EDIT_ELEMENT({ file, fileContent: html, selector, info, instruction }) }],
+        { maxTokens: 4000, timeoutMs: 280000 },
+        "edit-element",
+      );
+      console.log(`[chat] edit via provider: ${provider}`);
+      const patch = firstJson(out);
+      if (!patch) throw new Error("model returned no JSON patch");
+      let updated = html;
+      if (patch.replaceHtml?.find && patch.replaceHtml?.html) updated = updated.replace(patch.replaceHtml.find, patch.replaceHtml.html);
+      if (patch.removeSelector) updated = updated.replace(new RegExp(`<\\w+[^>]*${patch.removeSelector.replace(/[.#]/g, "\\$&")}[^>]*>[\\s\\S]*?</\\w+>`, "i"), "");
+      if (patch.css) {
+        fs.appendFileSync(path.join(tasks.outDir(req.params.id), "chat-fixes.css"), `\n/* ${new Date().toISOString()} — ${instruction.replace(/\*\//g, "")} */\n${patch.css}\n`);
+        if (!updated.includes("chat-fixes.css")) updated = updated.replace(/<\/head>/i, `<link rel="stylesheet" href="chat-fixes.css"></head>`);
+      }
+      if (updated === html) throw new Error("empty patch");
+      fs.writeFileSync(target, updated);
+      broadcast({ type: "preview:reload", data: { task: req.params.id } });
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message.slice(0, 200) });
+    }
+  });
+
+  // ---- export ----
+  app.post("/api/export/:id", async (req, res) => {
+    try {
+      const { zipPath, size } = await exportTask(req.params.id);
+      sessions.release(req.params.id); // explicit finish → close the session
+      res.json({ ok: true, download: `/api/export/${req.params.id}/download`, size });
+    } catch (e) {
+      res.status(500).json({ error: e.message.slice(0, 200) });
+    }
+  });
+  app.get("/api/export/:id/download", (req, res) => {
+    const zipPath = path.join(tasks.taskDir(req.params.id), "export.zip");
+    if (!fs.existsSync(zipPath)) return res.status(404).json({ error: "export first" });
+    res.download(zipPath, `clone-${req.params.id}.zip`);
+  });
+
+  // ---- sessions (inspection panel uses the persistent session) ----
+  app.get("/api/sessions", (_req, res) => res.json(sessions.stats()));
+  // provider router stats (multi-model usage, quota tracking — spec §12)
+  app.get("/api/providers", async (_req, res) => {
+    const { getProviders, usageStats } = await import("./model-router.js");
+    const cfg = loadConfig();
+    res.json({ providers: getProviders(cfg).map((p) => ({ name: p.name, provider: p.provider, model: p.model, capabilities: p.capabilities, hasKey: !!p.apiKey })), usage: usageStats() });
+  });
+
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ server, path: "/ws" });
+  const sockets = new Set();
+  wss.on("connection", (ws) => {
+    sockets.add(ws);
+    ws.send(JSON.stringify({ type: "catchup", data: bus.catchUp() }));
+    ws.on("close", () => sockets.delete(ws));
+    ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "join" && msg.task) ws.taskId = msg.task; // room = task
+      } catch {}
+    });
+  });
+  function broadcast(msg) {
+    for (const ws of sockets) {
+      try { if (!ws.taskId || !msg.task || ws.taskId === msg.task) ws.send(JSON.stringify(msg)); } catch {}
+    }
+  }
+  // engine progress → WS (tagged with the running task) + server-side console
+  // (stdout is the only place errors survive when no WS client is attached)
+  const T0 = Date.now();
+  const at = () => `+${((Date.now() - T0) / 1000).toFixed(1)}s`;
+  for (const evt of ["step", "log", "tabs:found", "assets:progress", "assets:done", "page:goto", "run:done", "run:error", "polish:round"]) {
+    bus.on(evt, (e) => {
+      broadcast({ type: evt, task: currentTaskId || null, data: e });
+      // events.js wraps payloads as {type, data, t} — read from e.data
+      const d = e?.data || {};
+      if (evt === "step") console.log(`[${at()}][${currentTaskId || "-"}] ${d.status || ""} ${d.msg || d.id || ""}`);
+      else if (evt === "log") console.log(`[${at()}][${currentTaskId || "-"}] ${d.level === "warn" ? "WARN" : "·"} ${d.msg || ""}`);
+      else if (evt === "run:error") console.error(`[${at()}][${currentTaskId || "-"}] RUN ERROR ${d.error || ""}`);
+    });
+  }
+  let currentTaskId = null;
+
+  // ---- task runner: engine pipeline + verification, wired to the task ----
+  async function runTask(id) {
+    const meta = tasks.loadTask(id);
+    if (!meta) return;
+    currentTaskId = id;
+    tasks.updateTask(id, { status: "running" }, "clone started");
+    const priv = path.join(tasks.taskDir(id), "private");
+    const cookiesFile = fs.existsSync(path.join(priv, "cookies.json")) ? path.join(priv, "cookies.json") : null;
+    const storageFile = fs.existsSync(path.join(priv, "storage.json")) ? JSON.parse(fs.readFileSync(path.join(priv, "storage.json"), "utf8")) : undefined;
+    const out = tasks.outDir(id);
+    const cookies = meta.hasCookies ? loadCookies(cookiesFile) : null;
+    const cfg = loadConfig();
+    // vision polish ON by default (model router handles providers); a task can opt out
+    if (meta.noPolish) cfg.polish = { enabled: false };
+    await cloneUrl(meta.url, cfg, out, { cookies, storage: storageFile, interactions: { waitMs: 800, max: 56, triggerMax: 140, budgetMs: 170000 } });
+    tasks.updateTask(id, { status: "verifying" }, "clone complete — verifying");
+    const artifacts = {};
+    for (const f of ["index.html", "snapshot.mhtml", "exploration.md", "exploration.json", "design-tokens.json", "cloner-runtime.js", "clone.json"]) {
+      const fp = path.join(out, f);
+      if (fs.existsSync(fp)) artifacts[f.replace(".md", "").replace(".json", "").replace(".html", "").replace(".mhtml", "").replace(".js", "")] = f;
+    }
+    if (fs.existsSync(path.join(out, "scaffold"))) artifacts.scaffold = "scaffold/";
+    const verification = await verifyTask(out);
+    tasks.updateTask(id, { status: verification.passed ? "done" : "done", artifacts, verification }, `verification ${verification.passed ? "passed" : "completed with failures"}`);
+    broadcast({ type: "task:done", task: id, data: { verification: verification.passed } });
+  }
+
+  // retention sweep (15-day default) on boot + hourly
+  const removed = tasks.sweepExpired();
+  if (removed.length) console.log(`[retention] removed ${removed.length} expired task(s)`);
+  setInterval(() => tasks.sweepExpired(), 3600_000).unref();
+
+  return new Promise((resolve) => {
+    server.listen(port, () => resolve({ server, wss, port }));
+  });
+}
+
+function firstJson(text) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const c = fenced ? fenced[1] : text;
+  const s = c.indexOf("{");
+  for (let e = c.lastIndexOf("}"); e > s; e = c.lastIndexOf("}", e - 1)) {
+    try { return JSON.parse(c.slice(s, e + 1)); } catch {}
+  }
+  return null;
+}

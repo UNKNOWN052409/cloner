@@ -1,0 +1,21 @@
+{
+  "name": "cloner",
+  "version": "0.1.0",
+  "description": "Universal frontend cloner: URL+cookies / image / video → pixel-faithful, editable clone with live dashboard",
+  "type": "module",
+  "bin": {
+    "cloner": "bin/cloner.js",
+    "cloner-platform": "bin/platform.js"
+  },
+  "scripts": {
+    "start": "node bin/cloner.js",
+    "platform": "node bin/platform.js",
+    "test": "node scripts/test-vision.mjs && node scripts/test-integration.mjs",
+    "test:platform": "node scripts/test-platform.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.49.1",
+    "ws": "^8.18.0"
+  }
+}

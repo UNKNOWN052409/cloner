@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloner platform</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext x='4' y='24' font-size='22' fill='%238b7cf7'%3E%E2%97%88%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <!-- top bar: brand · task switcher · export · settings -->
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">◈</span> <b>cloner</b><span class="brand-sub">platform</span></div>
+    <div class="top-center">
+      <label class="switcher">
+        <span class="switcher-label">task</span>
+        <select id="task-switch" title="switch task"><option value="">no tasks yet</option></select>
+      </label>
+    </div>
+    <div class="top-actions">
+      <button id="btn-activity" class="btn ghost" title="live progress log">Activity</button>
+      <button id="btn-export" class="btn primary" disabled>Export</button>
+      <button id="btn-settings" class="btn ghost" title="vision model / sessions">Settings</button>
+    </div>
+  </header>
+
+  <!-- left sidebar: tasks with live status dots + status-event history -->
+  <aside class="sidebar">
+    <div class="side-head">Tasks</div>
+    <ul id="task-list" class="task-list"></ul>
+    <div class="side-head">History <span id="history-owner" class="side-head-note"></span></div>
+    <ol id="history" class="history"><li class="empty-note">select a task</li></ol>
+  </aside>
+
+  <!-- center workspace: tabbed split view + bottom chat bar -->
+  <main class="workspace">
+    <nav class="view-tabs" id="tabs">
+      <button data-view="clone" class="tab active">Clone</button>
+      <button data-view="original" class="tab">Original</button>
+      <button data-view="compare" class="tab">Compare</button>
+      <button data-view="exploration" class="tab">Exploration</button>
+      <button data-view="verification" class="tab">Verification</button>
+      <span id="task-status-pill" class="status-pill"></span>
+    </nav>
+
+    <section class="views">
+      <div class="view" id="view-clone">
+        <iframe id="frame-clone" title="clone preview"></iframe>
+        <div class="empty hidden" id="empty-clone"><div class="empty-icon">◈</div><p id="empty-clone-text">no task selected</p></div>
+      </div>
+      <div class="view checker hidden" id="view-original">
+        <img id="img-original" alt="original screenshot">
+        <div class="empty hidden" id="empty-original"><div class="empty-icon">▦</div><p>original screenshot not available yet</p></div>
+      </div>
+      <div class="view hidden" id="view-compare">
+        <div class="cmp-modes">
+          <button data-cmp="heatmap" class="seg active">Diff heatmap</button>
+          <button data-cmp="ab" class="seg">Original vs Clone</button>
+        </div>
+        <div class="cmp-body" id="cmp-heatmap">
+          <div class="checker cmp-frame"><img id="img-diff" alt="diff heatmap"></div>
+          <div class="empty hidden" id="empty-diff"><div class="empty-icon">◑</div><p>diff heatmap not available yet — produced during verification</p></div>
+        </div>
+        <div class="cmp-body hidden" id="cmp-ab">
+          <div class="checker cmp-frame" id="ab-wrap">
+            <img id="ab-clone" alt="clone screenshot" draggable="false">
+            <img id="ab-orig" alt="original screenshot" draggable="false">
+            <div id="ab-divider"><span class="ab-handle"></span></div>
+            <span class="ab-label left">original</span><span class="ab-label right">clone</span>
+          </div>
+          <div class="empty hidden" id="empty-ab"><div class="empty-icon">⇔</div><p>needs _reference/page-1.png and clone-verify.png</p></div>
+        </div>
+      </div>
+      <div class="view hidden scroll" id="view-exploration">
+        <div class="expl-head"><b>App exploration</b><span id="expl-meta" class="muted"></span></div>
+        <div id="expl-content"><p class="empty-note">exploration report not available yet</p></div>
+      </div>
+      <div class="view hidden scroll" id="view-verification">
+        <div id="ver-banner" class="ver-banner pending">verification pending</div>
+        <div id="ver-stages"></div>
+      </div>
+    </section>
+
+    <!-- bottom chat bar: URL → new task, otherwise instruction for the picked element -->
+    <footer class="chatbar">
+      <div id="pick-chip" class="pick-chip hidden">
+        <span class="chip-dot"></span><code id="pick-chip-selector"></code>
+        <button id="pick-chip-clear" class="chip-x" title="clear selection">×</button>
+      </div>
+      <div class="chat-row">
+        <button id="btn-pick" class="pick-btn" title="toggle element picker in the preview">⌖</button>
+        <input id="chat-input" placeholder="Paste a URL to clone a site — or pick an element and describe the change…" autocomplete="off" spellcheck="false">
+        <button id="btn-send" class="btn primary send-btn" title="send">Send ↵</button>
+      </div>
+    </footer>
+  </main>
+
+  <!-- right dock: element inspector + live activity log -->
+  <aside class="dock" id="dock">
+    <div class="dock-tabs">
+      <button data-dock="element" class="dock-tab">Element</button>
+      <button data-dock="activity" class="dock-tab active">Activity</button>
+      <button id="btn-dock-close" class="dock-close" title="close panel">×</button>
+    </div>
+    <div class="dock-body" id="dock-element">
+      <div id="inspector">
+        <p class="empty-note">Click ⌖ then an element in the Clone preview to inspect it.</p>
+      </div>
+    </div>
+    <div class="dock-body hidden" id="dock-activity">
+      <div class="log" id="log"></div>
+    </div>
+  </aside>
+
+  <!-- settings modal -->
+  <div id="modal-root" class="modal-root hidden">
+    <div class="modal" role="dialog" aria-label="settings">
+      <div class="modal-head"><b>Settings</b><button id="btn-modal-close" class="chip-x">×</button></div>
+      <div class="modal-body">
+        <div class="side-head">Vision model <span class="side-head-note">chat edits — phase 6</span></div>
+        <p class="muted">Element edit instructions run through the vision model. Configure <code>cloner.config.json</code> (or env <code>ANTHROPIC_API_KEY</code> / <code>OPENAI_API_KEY</code>):</p>
+        <pre class="snippet">{
+  "model": {
+    "provider": "custom",
+    "model": "your-vision-model",
+    "baseUrl": "https://your-endpoint/v1",
+    "apiKey": "sk-…"
+  }
+}</pre>
+        <div class="side-head">Sessions</div>
+        <p class="muted" id="sessions-info">persistent browser sessions — press refresh to inspect.</p>
+        <button id="btn-sessions-refresh" class="btn ghost">Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

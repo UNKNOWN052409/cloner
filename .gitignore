@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# never commit real credentials or provider keys
+cloner.config.json
+.env
+*.key
+
+# cloned site outputs + task data (site content + session artifacts)
+output/
+platform-data/
+exports/
+
+# logs
+*.log
+
+# local tooling state
+.zcode/
+.gstack/
+
+# OS junk
+Thumbs.db
+.DS_Store

@@ -62,8 +62,15 @@ export function startPlatform({ port = 4180 } = {}) {
 
   // ---- tasks ----
   app.post("/api/tasks", (req, res) => {
-    const { url, username, password, cookies, storage, instructions, mode } = req.body || {};
+    const { url, username, password, cookies, storage, instructions, mode, pipeline } = req.body || {};
     if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    // pipeline "v2" → exploration + reconstruction + verification (integrated)
+    // pipeline "v1" or absent → legacy cloneUrl flow (backward compatible)
+    if (pipeline === "v2") {
+      const entry = exploration.queueExploration({ url, username, password, cookies, storage, instructions });
+      res.json({ id: entry.tempId, status: entry.status, pipeline: "v2" });
+      return;
+    }
     const meta = tasks.createTask({ url, mode, username, password, cookies, storage, instructions });
     res.json(meta);
     runTask(meta.id).catch((e) => {

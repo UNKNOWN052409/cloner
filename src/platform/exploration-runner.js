@@ -1,7 +1,11 @@
-// Exploration job registry for the platform: bounded queue + status + lookup.
-// Heavy artifacts live under artifacts/<jobId>/ (spec §15).
+// Exploration job registry + full pipeline runner: exploration → reconstruction
+// → verification. Bounded queue + status + lookup. Heavy artifacts live under
+// artifacts/<jobId>/ (spec §15).
+import fs from "node:fs";
 import path from "node:path";
 import { runExplorationJob } from "../pipeline/exploration-pipeline.js";
+import { reconstructFromArtifacts } from "../reconstruction/reconstruction-pipeline.js";
+import { verifyTask } from "./verify.js";
 
 const ROOT = path.join(process.cwd(), "artifacts");
 const jobs = new Map(); // jobId -> entry
@@ -10,7 +14,7 @@ const running = new Set();
 const queue = [];
 const MAX_CONCURRENT = Number(process.env.MAX_EXPLORATION_JOBS || 2);
 
-export function queueExploration({ url, username, password, cookies, storage, policy, sessionId = "local" }) {
+export function queueExploration({ url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [] }) {
   const tempId = "pending-" + Date.now().toString(36);
   const entry = {
     tempId,
@@ -21,49 +25,53 @@ export function queueExploration({ url, username, password, cookies, storage, po
     sessionId,
     credentialsProvided: !!(username && password),
     hasCookies: !!cookies,
+    history: [],
   };
   jobs.set(tempId, entry);
 
-  const launch = () => {
+  const launch = async () => {
     entry.startedAt = new Date().toISOString();
-    // cookies are passed in-memory to the pipeline — never written to disk
-    // (no credential-at-rest window between write and unlink)
-    const jobPromise = runExplorationJob({
-      url,
-      cookies,
-      storage,
-      username,
-      password,
-      config: { policy, sessionId },
-      artifactsRoot: ROOT,
-    })
-      .then(({ jobId, manifest }) => {
-        jobs.delete(tempId);
-        entry.jobId = jobId;
-        entry.status = manifest.status;
-        entry.manifest = { status: manifest.status, coverage: manifest.coverage, pages: manifest.pages?.length, metrics: manifest.metrics };
-        entry.finishedAt = new Date().toISOString();
-        entry.history = (entry.history || []).concat([{ at: entry.finishedAt, event: "completed: " + manifest.status }]);
-        running.delete(entry);
-        drain();
-      })
-      .catch((e) => {
-        entry.status = "error";
-        entry.error = String(e.message || e).slice(0, 200);
-        entry.finishedAt = new Date().toISOString();
-        entry.history = (entry.history || []).concat([{ at: entry.finishedAt, event: "failed: " + entry.error }]);
-        running.delete(entry);
-        drain();
-        // failed jobs stay queryable under their temp handle for 30 minutes,
-        // then are evicted (previously they accumulated in the map forever)
-        setTimeout(() => { if (jobs.get(tempId) === entry) jobs.delete(tempId); }, 30 * 60 * 1000).unref();
+    entry.status = "exploring";
+    try {
+      // ---- Stage 1: exploration ----
+      const { jobId, artifactsDir, manifest } = await runExplorationJob({
+        url, cookies, storage, username, password,
+        config: { policy, sessionId },
+        artifactsRoot: ROOT,
       });
-    jobPromise.finally(() => {
-      // credential-at-rest elimination: the temp cookie file is shredded on EVERY
-      // path (success, failure, crash) — no window where it outlives the job
-      if (cookieFile) { try { fs.unlinkSync(cookieFile); } catch {} }
-    });
+      entry.jobId = jobId;
+      entry.artifactsDir = artifactsDir;
+      entry.status = manifest.status;
+      entry.manifest = { status: manifest.status, coverage: manifest.coverage, pages: manifest.pages?.length, metrics: manifest.metrics };
+      entry.history.push({ at: new Date().toISOString(), event: "exploration completed: " + manifest.status });
 
+      // ---- Stage 2: reconstruction ----
+      entry.status = "reconstructing";
+      const reconstruction = await reconstructFromArtifacts(artifactsDir, {
+        outDir: artifactsDir + "-project",
+        interactionRecords,
+      });
+      entry.reconstruction = { passed: reconstruction.report.passed, pages: reconstruction.report.generatedFiles, repairs: reconstruction.report.repairs?.length || 0 };
+      entry.history.push({ at: new Date().toISOString(), event: "reconstruction: " + (reconstruction.report.passed ? "passed" : "completed with limitations") });
+
+      // ---- Stage 3: verification ----
+      entry.status = "verifying";
+      const verification = await verifyTask(artifactsDir);
+      entry.verification = { passed: verification.passed, stages: verification.stages?.map((s) => ({ stage: s.stage, passed: s.passed })) };
+      entry.status = verification.passed ? "completed" : "completed_with_limitations";
+      entry.history.push({ at: new Date().toISOString(), event: "verification " + (verification.passed ? "PASSED" : "completed with failures") });
+
+    } catch (e) {
+      entry.status = "error";
+      entry.error = String(e.message || e).slice(0, 300);
+      entry.history.push({ at: new Date().toISOString(), event: "failed: " + entry.error });
+      running.delete(entry);
+      drain();
+      setTimeout(() => { if (jobs.get(tempId) === entry) jobs.delete(tempId); }, 30 * 60 * 1000).unref();
+      return;
+    }
+    running.delete(entry);
+    drain();
   };
 
   if (running.size < MAX_CONCURRENT) { running.add(entry); launch(); }
@@ -81,8 +89,8 @@ export function getExplorationJob(jobId) {
   const resolved = aliases.get(jobId) || jobId;
   const entry = jobs.get(resolved);
   if (!entry) return null;
-  const { jobId: id, url, status, startedAt, finishedAt, manifest, error, credentialsProvided, hasCookies } = entry;
-  return { jobId: id, url, status, startedAt, finishedAt, manifest: manifest || null, error: error || null, credentialsProvided, hasCookies };
+  const { jobId: id, url, status, startedAt, finishedAt, manifest, error, credentialsProvided, hasCookies, reconstruction, verification, history, artifactsDir } = entry;
+  return { jobId: id, url, status, startedAt, finishedAt, manifest: manifest || null, error: error || null, credentialsProvided, hasCookies, reconstruction, verification, history, artifactsDir };
 }
 
 export function listJobs() {

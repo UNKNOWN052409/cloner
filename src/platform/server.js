@@ -16,12 +16,43 @@ import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
 import { exportTask } from "./exporter.js";
 import { verifyTask } from "./verify.js";
+import { authRequired } from "../auth/auth-middleware.js";
+import * as auth from "../auth/auth-service.js";
+import * as taskRepo from "../database/task-repository.js";
+import { migrate } from "../database/client.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export function startPlatform({ port = 4180 } = {}) {
   const app = express();
   app.use(express.json({ limit: "20mb" }));
+
+  // ---- database migrations (run once at boot) ----
+  migrate().catch((e) => console.error('[db] migration failed:', e.message));
+
+  // ---- auth routes (spec §6) ----
+  app.post('/api/auth/register', async (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      const user = await auth.registerUser(email, password);
+      res.json({ ok: true, userId: user.id, email: user.email });
+    } catch (e) { res.status(400).json({ error: e.message.slice(0, 120) }); }
+  });
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      const session = await auth.loginUser(email, password);
+      res.json({ ok: true, token: session.token, userId: session.userId, email: session.email, expiresAt: session.expiresAt });
+    } catch (e) { res.status(401).json({ error: e.message.slice(0, 120) }); }
+  });
+  app.post('/api/auth/logout', authRequired, async (req, res) => {
+    const token = (req.headers.authorization || '').replace('Bearer ', '');
+    await auth.revokeSession(token);
+    res.json({ ok: true });
+  });
+  app.get('/api/auth/me', authRequired, (req, res) => {
+    res.json({ userId: req.userId, email: req.userEmail, role: req.userRole });
+  });
 
   // ---- static UI ----
   app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "..", "..", "platform-ui", "index.html")));

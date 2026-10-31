@@ -24,3 +24,4 @@ artifacts/
 # OS junk
 Thumbs.db
 .DS_Store
+nul

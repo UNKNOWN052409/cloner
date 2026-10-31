@@ -14,7 +14,11 @@
     "test:platform": "node scripts/test-platform.mjs"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "bullmq": "^6.5.3",
     "express": "^4.21.2",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1",
     "playwright": "^1.49.1",
     "ws": "^8.18.0"
   }

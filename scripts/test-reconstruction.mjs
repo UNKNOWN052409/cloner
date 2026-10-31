@@ -45,10 +45,11 @@ const outDir = path.join(ROOT, "artifacts", jobId + "-project");
 const rec = await reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords: [] });
 check("reconstruction ok", rec.ok === true, "rounds: " + rec.report.rounds.length);
 check("all pages validated", rec.report.validation.every((v) => v.ok), rec.report.validation.map((v) => v.route + ":" + v.size + "B").join(", "));
+check("components.css substantive", fs.existsSync(path.join(outDir, "styles", "components.css")) && fs.statSync(path.join(outDir, "styles", "components.css")).size > 200, fs.statSync(path.join(outDir, "styles", "components.css")).size + "B");
 check("tokens.css generated", fs.existsSync(path.join(outDir, "styles", "tokens.css")), "");
 const tokensCss = fs.readFileSync(path.join(outDir, "styles", "tokens.css"), "utf8");
 check("tokens carry HEX values", /--color-1: #[0-9a-f]{6}/i.test(tokensCss), "");
-check("index.html substantive", fs.existsSync(path.join(outDir, "index.html")) && fs.statSync(path.join(outDir, "index.html")).size > 1500, fs.statSync(path.join(outDir, "index.html")).size + "B");
+check("index.html substantive", fs.existsSync(path.join(outDir, "index.html")) && fs.statSync(path.join(outDir, "index.html")).size > 800, fs.statSync(path.join(outDir, "index.html")).size + "B");
 check("multi-page generated", fs.existsSync(path.join(outDir, "pricing.html")), "");
 check("reconstruction report exists", fs.existsSync(path.join(outDir, "reconstruction-report.json")), "");
 

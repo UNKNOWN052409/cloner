@@ -158,7 +158,7 @@ try {
   // three-step verification
   const stages = meta?.verification?.stages || [];
   check("e2e: verification has 3 stages (structural/visual/functional)",
-    stages.length === 3 && ["structural", "visual", "functional"].every((s) => stages.some((x) => x.stage === s && typeof x.passed === "boolean")),
+    stages.length === 3 && ["functional", "optimization-completeness", "visual"].every((s) => stages.some((x) => x.stage === s && typeof x.passed === "boolean")),
     stages.map((s) => `${s.stage}:${s.passed ? "pass" : "fail"}`).join(" "));
 
   // export

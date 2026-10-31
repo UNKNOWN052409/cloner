@@ -75,6 +75,8 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     // returned recorder MUST be attached or every network.json stays empty
     const { attachNetworkRecorder } = await import("../network/network-recorder.js");
     const network = { entries: [] };
+    const allNetwork = []; // job-level accumulation for asset capture
+    let netCursor = 0;
     attachNetworkRecorder(ctx, network).attach(page);
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -183,8 +185,12 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       } finally { engineActive = false; }
 
       // network flush AFTER the interactions so interaction traffic is
-      // attributed to the page that caused it (spec §11)
-      store.writeJson(`pages/${pageId}/network.json`, { pageId, url: page.url(), entries: redact(network.entries.splice(0, network.entries.length)) });
+      // attributed to the page that caused it (spec §11). The full buffer is
+      // retained in allNetwork for the asset-capture stage.
+      const newEntries = network.entries.slice(netCursor);
+      netCursor = network.entries.length;
+      allNetwork.push(...newEntries);
+      store.writeJson(`pages/${pageId}/network.json`, { pageId, url: page.url(), entries: redact(newEntries) });
 
       // harvest THIS page's SPA transitions before navigating away — the
       // recorder buffer is per-document and resets on every navigation (spec §7A)
@@ -247,8 +253,18 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       edges: graphData.edges,
     });
 
-    // ---- asset manifest (spec §11/§12) ----
+    // ---- asset capture (spec §0 preflight) + manifest (§11/§12) ----
+    // persist static resources found by the network recorder (browser still open)
+    let assetCapture = { count: 0, bytes: 0 };
+    try {
+      const { captureAssets } = await import("./asset-capture.js");
+      assetCapture = await captureAssets(ctx, allNetwork, store, logger);
+      if (assetCapture.count) logger.info("assets", `captured ${assetCapture.count} resource(s), ${(assetCapture.bytes / 1024).toFixed(0)}KB`);
+    } catch (e) {
+      warnings.push("asset capture failed: " + String(e.message || e).slice(0, 100));
+    }
     const assetManifest = buildAssetManifest(store.dirs.root);
+    assetManifest.capturedFromNetwork = assetCapture;
     store.writeJson("assets/manifest.json", assetManifest);
 
     // ---- manifest (spec §15) ----
@@ -263,7 +279,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       discoveredRoutes: discovery.routes.length,
       discoveredStates: graphData.stats.nodes,
       discoveredInteractions: graphData.stats.edges,
-      assets: { total: assetManifest.total, totalBytes: assetManifest.totalBytes, byType: assetManifest.byType, deduplicated: assetManifest.deduplicated },
+      assets: { total: assetManifest.total + assetCapture.count, totalBytes: assetManifest.totalBytes + assetCapture.bytes, byType: assetManifest.byType, deduplicated: assetManifest.deduplicated, capturedFromNetwork: assetCapture },
       pages,
       coverage: { routesExplored: pages.length, routesDiscovered: discovery.routes.length, statesRecorded: graphData.stats.nodes },
       errors: errors.map((e) => ({ message: String(e).slice(0, 200) })),

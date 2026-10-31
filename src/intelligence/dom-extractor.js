@@ -24,6 +24,7 @@ export const DOM_EXTRACTOR_SCRIPT = `(() => {
       role: el.getAttribute("role") || null,
       ariaName: el.getAttribute("aria-label") || null,
       id: el.id || null,
+      href: el.tagName === "A" ? (el.getAttribute("href") || null) : null,
       cls: String(el.className || "").slice(0, 80) || null,
       text: (el.children.length === 0 ? (el.innerText || "").trim().slice(0, 60) : "") || null,
       parent: null,

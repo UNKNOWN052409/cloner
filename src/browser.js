@@ -216,7 +216,8 @@ export async function capturePage(page, url, { networkIdleMs = 6000, spaWaitMs =
       } catch {}
     }
   }
-  const htmlFinal = html;
+  // let (not const): the interaction prune below rewrites dead trigger attrs
+  let htmlFinal = html;
   // boot-shell guard: a real app page is never this small
   if (htmlFinal && htmlFinal.length < 8000) {
     bus.emit("log", { level: "warn", msg: `serialized DOM suspiciously small (${htmlFinal.length}B) — SPA may not have mounted; clone will be a boot shell` });

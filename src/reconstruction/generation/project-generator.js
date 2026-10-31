@@ -66,8 +66,16 @@ function renderNode(node, cssCtx, depth) {
     }
     attrs += ` href="${esc(href)}"`;
   }
-  if (tag === "img" && node._assetSrc) attrs += ` src="${esc(node._assetSrc)}"`;
+  if (tag === "img") {
+    // captured asset wins (offline-safe); else the original absolute URL
+    // (works online); else a visible placeholder
+    const local = cssCtx.assetByIndex?.get(node._elementIndex);
+    const src = local || node.src || "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='80'%3E%3Crect width='100%25' height='100%25' fill='%23e5e7eb'/%3E%3Ctext x='50%25' y='54%25' text-anchor='middle' font-size='11' fill='%239ca3af'%3Eimg%3C/text%3E%3C/svg%3E";
+    attrs += ` src="${esc(src)}"`;
+    if (node.rect && node.rect.w > 2 && node.rect.h > 2) attrs += ` width="${node.rect.w}" height="${node.rect.h}"`;
+  }
   if (node.tag === "input" && node.ariaName) attrs += ` placeholder="${esc(node.ariaName)}"`;
+  if (node.dataClonerTrigger) attrs += ` data-cloner-trigger="${esc(node.dataClonerTrigger)}"`;
   const wire = cssCtx.interactionsByIndex.get(node._elementIndex);
   if (wire) attrs += ` data-replay-id="${esc(wire)}"`;
   const indent = "  ".repeat(depth);
@@ -108,7 +116,7 @@ export function buildLayoutCss(elements, layoutByIndex) {
   return lines.join("\n");
 }
 
-export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, componentsCss, assetMap, interactionRecords = [] }) {
+export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, componentsCss, assetMap, assetRoot, interactionRecords = [] }) {
   const dirs = ["styles", "runtime", "public/assets"];
   for (const d of dirs) fs.mkdirSync(path.join(outDir, d), { recursive: true });
   fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({
@@ -122,7 +130,7 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
   // assets copy with verified source resolution
   let copied = 0, failed = 0;
   for (const [url, localRel] of assetMap || []) {
-    const src = path.resolve(artifactsAssetRoot(), localRel);
+    const src = path.resolve(assetRoot || artifactsAssetRoot(), localRel);
     if (!fs.existsSync(src)) { failed++; continue; }
     const dest = path.join(outDir, "public", "assets", path.basename(localRel));
     try {
@@ -135,10 +143,11 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
       console.warn(`asset copy failed: ${localRel} — ${e.message.slice(0, 60)}`);
     }
   }
-  // pages
+  // pages — p.file (pipeline-assigned, page-001 → index.html) wins; the route
+  // fallback must not double-append .html to routes that already carry it
   const files = [];
   for (const p of pageHtmls) {
-    const rel = p.route === "/" ? "index.html" : p.route.replace(/^\//, "").replace(/[?&#]/g, "_") + ".html";
+    const rel = p.file || (p.route === "/" ? "index.html" : p.route.replace(/^\//, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_") + ".html");
     const safe = rel.replace(/[^a-zA-Z0-9_./-]/g, "_");
     if (safe.includes("..")) { failed++; continue; }
     fs.writeFileSync(path.join(outDir, safe), p.html);

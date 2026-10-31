@@ -41,6 +41,10 @@ export function queueExploration({ url, username, password, cookies, storage, po
       });
       entry.jobId = jobId;
       entry.artifactsDir = artifactsDir;
+      // the client still holds the temp handle — make BOTH ids resolve to this
+      // entry (aliases for tempId lookups, jobs for direct jobId lookups)
+      aliases.set(tempId, jobId);
+      jobs.set(jobId, entry);
       entry.status = manifest.status;
       entry.manifest = { status: manifest.status, coverage: manifest.coverage, pages: manifest.pages?.length, metrics: manifest.metrics };
       entry.history.push({ at: new Date().toISOString(), event: "exploration completed: " + manifest.status });
@@ -94,7 +98,14 @@ export function getExplorationJob(jobId) {
 }
 
 export function listJobs() {
-  return [...jobs.values()].map((e) => ({ jobId: e.jobId || e.tempId, url: e.url, status: e.status, queuedAt: e.queuedAt, finishedAt: e.finishedAt }));
+  const seen = new Set();
+  const out = [];
+  for (const e of jobs.values()) {
+    if (seen.has(e)) continue; // same entry keyed under tempId + jobId
+    seen.add(e);
+    out.push({ jobId: e.jobId || e.tempId, url: e.url, status: e.status, queuedAt: e.queuedAt, finishedAt: e.finishedAt });
+  }
+  return out;
 }
 
 function drain() {

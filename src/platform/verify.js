@@ -19,13 +19,22 @@ const OPEN_GATE = 0.6; // 60% of clicked triggers must open overlay/module
 const MAX_TRIGGERS = 120;
 
 function parseRuntimeRecords(out) {
-  try {
-    const rt = fs.readFileSync(path.join(out, "cloner-runtime.js"), "utf8");
-    const m = rt.match(/window\.__CLONER_INTERACTIONS = (\[.*\]);\s*$/m);
-    return { records: JSON.parse(m ? m[1] : "[]"), error: null };
-  } catch (e) {
-    return { records: [], error: e.message.slice(0, 80) };
+  // v1 writes cloner-runtime.js; v2 reconstruction writes runtime/interactions.js
+  for (const f of ["cloner-runtime.js", path.join("runtime", "interactions.js")]) {
+    try {
+      const rt = fs.readFileSync(path.join(out, f), "utf8");
+      const m = rt.match(/window\.__CLONER_INTERACTIONS = (\[.*\]);?\s*$/m);
+      return { records: JSON.parse(m ? m[1] : "[]"), error: null };
+    } catch {}
   }
+  return { records: [], error: "no runtime file" };
+}
+
+// v2 layout detection: the reconstruction pipeline writes the editable project
+// to <artifactsDir>-project/ — verification must target that tree
+function v2Layout(artifactsDir) {
+  const cloneDir = artifactsDir + "-project";
+  return fs.existsSync(path.join(cloneDir, "index.html")) ? cloneDir : null;
 }
 
 // 12×8 grid index → page region estimate: top rows = header, middle = content,
@@ -61,10 +70,12 @@ export function parseComparisonTxt(text) {
   return { pct, meanDelta, hotRegions, tokens, grade, parsed: !Number.isNaN(pct) };
 }
 
-// rgb(a) string → #rrggbbaa-less hex (alpha dropped for comparison)
+// rgb(a) string → #rrggbb hex (alpha dropped for comparison); fully transparent
+// colors return null — transparent black is NOT #000000
 export function toHex(rgbStr) {
-  const m = String(rgbStr || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/);
+  const m = String(rgbStr || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+%?)\s*)?\)/);
   if (!m) return null;
+  if (m[4] !== undefined && Number(m[4]) === 0) return null;
   return "#" + [m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, "0")).join("").toLowerCase();
 }
 
@@ -196,6 +207,7 @@ async function stage1Functional(out) {
         ok: ex.dead.length === 0 || ex.working / ex.total >= 0.7,
         detail: `${ex.working}/${ex.total} clickable elements respond${ex.dead.length ? " — dead: " + ex.dead.slice(0, 4).map((d) => `${d.label} (${d.kind})`).join(", ") : ""}`,
       });
+      fs.mkdirSync(path.join(out, "_reference"), { recursive: true });
       fs.writeFileSync(path.join(out, "_reference", "exhaustive-test.json"), JSON.stringify(ex, null, 2));
     } catch (e) {
       checks.push({ name: "exhaustive click-everywhere", ok: true, detail: "skipped: " + e.message.slice(0, 60) });
@@ -237,9 +249,18 @@ const REQUIRED_ARTIFACTS = [
   { file: "design-tokens.json", label: "measured design tokens" },
   { file: "cloner-runtime.js", label: "interaction replay runtime" },
 ];
+// v2 reconstruction contract: editable project tree + pipeline artifacts
+const REQUIRED_ARTIFACTS_V2 = [
+  { file: "index.html", label: "static clone page" },
+  { file: "styles/tokens.css", label: "design tokens stylesheet" },
+  { file: "styles/layout.css", label: "layout stylesheet" },
+  { file: "styles/components.css", label: "component stylesheet" },
+  { file: "runtime/interactions.js", label: "interaction replay runtime" },
+];
 
-async function stage2Optimization(out, task = null) {
+async function stage2Optimization(out, task = null, artifactsDir = null) {
   const checks = [];
+  const required = artifactsDir ? REQUIRED_ARTIFACTS_V2 : REQUIRED_ARTIFACTS;
   const b = await launchBrowser({ headless: true });
   let loadMs = null;
   try {
@@ -251,11 +272,11 @@ async function stage2Optimization(out, task = null) {
   } catch {}
   await b.close().catch(() => {});
 
-  // asset weight by type
+  // asset weight by type (v1: assets/ · v2: public/assets/)
   const weights = {};
   let totalBytes = 0, totalFiles = 0;
+  const assetsDir = artifactsDir ? path.join(out, "public", "assets") : path.join(out, "assets");
   try {
-    const assetsDir = path.join(out, "assets");
     for (const dir of fs.readdirSync(assetsDir, { withFileTypes: true })) {
       if (!dir.isDirectory()) continue;
       let bytes = 0, files = 0;
@@ -268,18 +289,26 @@ async function stage2Optimization(out, task = null) {
     }
   } catch {}
 
-  // completeness: required artifacts
-  const missingArtifacts = REQUIRED_ARTIFACTS.filter((a) => !fs.existsSync(path.join(out, a.file)));
+  // completeness: required artifacts (v2 also requires pipeline-level artifacts
+  // in the artifacts dir: exploration manifest + measured tokens + the report)
+  const missingArtifacts = required.filter((a) => !fs.existsSync(path.join(out, a.file)));
+  if (artifactsDir) {
+    for (const a of [{ file: "manifest.json", label: "exploration manifest" }, { file: "design-tokens.json", label: "measured design tokens" }]) {
+      if (!fs.existsSync(path.join(artifactsDir, a.file))) missingArtifacts.push(a);
+    }
+  }
   checks.push({
     name: "required artifacts complete",
     ok: missingArtifacts.length === 0,
-    detail: missingArtifacts.length ? `missing: ${missingArtifacts.map((m) => m.label + " (" + m.file + ")").join(", ")}` : `all ${REQUIRED_ARTIFACTS.length} present`,
+    detail: missingArtifacts.length ? `missing: ${missingArtifacts.map((m) => m.label + " (" + m.file + ")").join(", ")}` : `all ${required.length} present`,
   });
 
-  // completeness: exploration coverage + replay data
+  // completeness: exploration coverage + replay data (v1: exploration.json in
+  // the clone dir · v2: exploration.json in the artifacts dir)
   const { records, error } = parseRuntimeRecords(out);
   let behaviors = 0, explMissing = false;
-  try { behaviors = (JSON.parse(fs.readFileSync(path.join(out, "exploration.json"), "utf8")).behaviors || []).length; } catch { explMissing = true; }
+  const explFile = artifactsDir ? path.join(artifactsDir, "exploration.json") : path.join(out, "exploration.json");
+  try { behaviors = (JSON.parse(fs.readFileSync(explFile, "utf8")).behaviors || []).length; } catch { explMissing = true; }
   checks.push({
     name: "exploration + replay data complete",
     ok: !explMissing && behaviors > 0 && records.length > 0,
@@ -315,19 +344,27 @@ async function stage2Optimization(out, task = null) {
 }
 
 // ============================================================ STEP 3 — VISUAL
-function stage3Visual(out) {
+function stage3Visual(out, artifactsDir = null) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [path.join(process.cwd(), "scripts", "compare-clone.mjs"), out], { timeout: 180000 }, async (err, stdout, stderr) => {
+    // v1: compare within the run dir. v2: the original screenshot is the
+    // exploration capture (pages/page-001/) and the clone lives in -project/
+    const args = [path.join(process.cwd(), "scripts", "compare-clone.mjs"), out];
+    if (artifactsDir) {
+      const origShot = path.join(artifactsDir, "pages", "page-001", "screenshot-viewport.png");
+      args.push("4199", origShot, path.join(out, "index.html"), artifactsDir);
+    }
+    execFile(process.execPath, args, { timeout: 180000 }, async (err, stdout, stderr) => {
       const text = (stdout || "") + (err?.stdout || "") + (stderr || "");
       let cmp = parseComparisonTxt(text);
       if (!cmp.parsed) {
-        try { cmp = parseComparisonTxt(fs.readFileSync(path.join(out, "_reference", "comparison.txt"), "utf8")); } catch {}
+        try { cmp = parseComparisonTxt(fs.readFileSync(path.join(artifactsDir || out, "_reference", "comparison.txt"), "utf8")); } catch {}
       }
       // EXACT HEX comparison: live tokens (design-tokens.json) vs re-measured clone
-      const hexReport = await hexTokenComparison(out);
+      const hexReport = await hexTokenComparison(out, artifactsDir);
       const pct = cmp.pct;
       const tokenOk = cmp.tokens.length > 0 && cmp.tokens.every((t) => !t.error && t.total > 0 && t.matched / t.total >= 0.5);
-      const hexOk = hexReport.error ? false : hexReport.categories.every((c) => c.matched / c.total >= 0.7);
+      // total=0 = no captured evidence for that category — absence can't fail
+      const hexOk = hexReport.error ? false : hexReport.categories.every((c) => c.total === 0 || c.matched / c.total >= 0.7);
       resolve({
         stage: "visual",
         passed: cmp.parsed && pct < 60 && hexOk,
@@ -349,9 +386,9 @@ function stage3Visual(out) {
 
 // render the clone, measure its tokens, HEX-compare against the live site's
 // measured tokens (design-tokens.json) + report extra/missing interactive elements
-async function hexTokenComparison(out) {
+async function hexTokenComparison(out, artifactsDir = null) {
   try {
-    const live = JSON.parse(fs.readFileSync(path.join(out, "design-tokens.json"), "utf8"));
+    const live = JSON.parse(fs.readFileSync(path.join(artifactsDir || out, "design-tokens.json"), "utf8"));
     const b = await launchBrowser({ headless: true });
     const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
     await p.goto("file:///" + path.join(out, "index.html").replace(/\\/g, "/"), { waitUntil: "load", timeout: 30000 });
@@ -395,7 +432,7 @@ async function hexTokenComparison(out) {
     // behaviors the explorer documented but that produced no replayable record
     let missing = [];
     try {
-      const expl = JSON.parse(fs.readFileSync(path.join(out, "exploration.json"), "utf8"));
+      const expl = JSON.parse(fs.readFileSync(path.join(artifactsDir || out, "exploration.json"), "utf8"));
       missing = (expl.behaviors || []).filter((bh) => bh.trigger?.id && !recordIds.has(bh.trigger.id)).map((b) => b.trigger.id).slice(0, 8);
     } catch {}
     return { categories, extra, missing };
@@ -409,12 +446,14 @@ async function hexTokenComparison(out) {
 //  - visual token drift → clone-fixes.css overrides from the LIVE measured tokens
 //    (body background/color/font + :root variables) — the "grey vs black" class
 //  - dead trigger attrs / empty module records → strip them from the clone
-function autoRemediate(report, out) {
+function autoRemediate(report, out, artifactsDir = null) {
   const fixes = [];
   try {
     const visual = report.stages.find((s) => s.stage === "visual");
     if (visual && !visual.passed && visual.hex && !visual.hex.error) {
-      const live = JSON.parse(fs.readFileSync(path.join(out, "design-tokens.json"), "utf8"));
+      // measured tokens live in the artifacts dir (v2) or the clone dir (v1)
+      const tokensFile = path.join(artifactsDir || out, "design-tokens.json");
+      const live = JSON.parse(fs.readFileSync(tokensFile, "utf8"));
       const bg = live.backgrounds?.[0]?.[0], color = live.colors?.[0]?.[0], font = live.fonts?.[0]?.[0];
       if (bg || color || font) {
         let css = `\n/* auto-correction: token overrides from measured live values */\n`;
@@ -451,26 +490,29 @@ function autoRemediate(report, out) {
 }
 
 export async function verifyTask(outDirPath, task = null) {
+  const v2Clone = v2Layout(outDirPath);
   const rounds = [];
   let report = null;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     // stage order per spec: 1 functional → 2 optimization/completeness → 3 visual
-    const s1 = await stage1Functional(outDirPath);
-    const s2 = await stage2Optimization(outDirPath, task);
-    const s3 = await stage3Visual(outDirPath);
+    const s1 = await stage1Functional(v2Clone || outDirPath);
+    const s2 = await stage2Optimization(v2Clone || outDirPath, task, v2Clone ? outDirPath : null);
+    const s3 = await stage3Visual(v2Clone || outDirPath, v2Clone ? outDirPath : null);
     report = {
       generatedAt: new Date().toISOString(),
       round,
       stages: [s1, s2, s3],
       passed: s1.passed && s2.passed && s3.passed,
+      layout: v2Clone ? "v2" : "v1",
     };
     rounds.push({ round, passed: report.passed, failed: report.stages.filter((s) => !s.passed).map((s) => s.stage) });
     if (report.passed || round === MAX_ROUNDS) break;
-    const fixes = autoRemediate(report, outDirPath);
+    const fixes = autoRemediate(report, v2Clone || outDirPath, outDirPath);
     if (!fixes.length) break;
     report.fixes = (report.fixes || []).concat(fixes.map((f) => `round ${round}: ${f}`));
   }
   report.rounds = rounds;
+  fs.mkdirSync(path.join(outDirPath, "_reference"), { recursive: true });
   fs.writeFileSync(path.join(outDirPath, "_reference", "verification.json"), JSON.stringify(report, null, 2));
   return report;
 }

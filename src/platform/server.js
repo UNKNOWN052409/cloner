@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { bus } from "../events.js";
 import { loadConfig } from "../config.js";
 import { cloneUrl } from "../cloneUrl.js";
+import { validatePublicUrl } from "../security/url-guard.js";
 import { loadCookies } from "../browser.js";
 import * as exploration from "./exploration-runner.js";
 import * as tasks from "./tasks.js";
@@ -61,9 +62,11 @@ export function startPlatform({ port = 4180 } = {}) {
   const PICKER_JS = fs.readFileSync(path.join(__dirname, "..", "picker.js"), "utf8");
 
   // ---- tasks ----
-  app.post("/api/tasks", (req, res) => {
+  app.post("/api/tasks", async (req, res) => {
     const { url, username, password, cookies, storage, instructions, mode, pipeline } = req.body || {};
     if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    const guard = await validatePublicUrl(url);
+    if (!guard.ok) return res.status(400).json({ error: "url rejected: " + guard.error });
     // pipeline "v2" → exploration + reconstruction + verification (integrated)
     // pipeline "v1" or absent → legacy cloneUrl flow (backward compatible)
     if (pipeline === "v2") {
@@ -86,9 +89,11 @@ export function startPlatform({ port = 4180 } = {}) {
   });
 
   // ---- exploration jobs (Phase 1 intelligence engine, spec §15) ----
-  app.post("/api/jobs/explore", (req, res) => {
+  app.post("/api/jobs/explore", async (req, res) => {
     const { url, username, password, cookies, storage, policy } = req.body || {};
     if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    const guard = await validatePublicUrl(url);
+    if (!guard.ok) return res.status(400).json({ error: "url rejected: " + guard.error });
     if (policy !== undefined && (typeof policy !== "object" || policy === null || Array.isArray(policy))) return res.status(400).json({ error: "policy must be an object" });
     const entry = exploration.queueExploration({ url, username, password, cookies, storage, policy });
     res.json({ jobId: entry.tempId, status: entry.status });
@@ -188,8 +193,12 @@ export function startPlatform({ port = 4180 } = {}) {
   // ---- export ----
   app.post("/api/export/:id", async (req, res) => {
     try {
-      const isV2 = fs.existsSync(path.join(process.cwd(), 'artifacts', req.params.id, 'manifest.json'));
-      const { zipPath, size } = isV2 ? await (async () => { const { exportV2Task } = await import('./exporter.js'); return exportV2Task(req.params.id); })() : await exportTask(req.params.id);
+      // a v2 task created via POST /api/tasks is held under its temp handle —
+      // resolve it to the real jobId before touching the artifacts tree
+      const job = exploration.getExplorationJob(req.params.id);
+      const id = job?.jobId || req.params.id;
+      const isV2 = fs.existsSync(path.join(process.cwd(), 'artifacts', id, 'manifest.json'));
+      const { zipPath, size } = isV2 ? await (async () => { const { exportV2Task } = await import('./exporter.js'); return exportV2Task(id); })() : await exportTask(req.params.id);
       sessions.release(req.params.id); // explicit finish → close the session
       res.json({ ok: true, download: `/api/export/${req.params.id}/download`, size });
     } catch (e) {

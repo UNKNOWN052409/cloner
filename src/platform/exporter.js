@@ -11,13 +11,18 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { taskDir, outDir, loadTask, updateTask, purgeCredentials } from "./tasks.js";
 
-// v2 pipeline export: exploration + reconstruction artifacts live in artifacts/<jobId>/
+// v2 pipeline export: exploration artifacts + the reconstructed project tree.
+// The clone lives in the SIBLING <jobId>-project/ dir — staged under project/
+// so the ZIP carries both evidence and the runnable site. Uses makeZip (same
+// portable entry-name rewriting as the v1 flow) and ships docs/INSPECTION.md.
 function v2TaskDir(id) { return path.join(process.cwd(), "artifacts", id); }
 
 export async function exportV2Task(id) {
   const v2Dir = v2TaskDir(id);
+  const projectDir = v2Dir + "-project";
   const manifestFile = path.join(v2Dir, "manifest.json");
   if (!fs.existsSync(manifestFile)) throw new Error("not a v2 exploration job (manifest.json missing)");
+  if (!fs.existsSync(path.join(projectDir, "index.html"))) throw new Error("v2 project dir missing (no -project/index.html) — reconstruction did not run");
   const staging = path.join(v2Dir, "export-staging");
   fs.rmSync(staging, { recursive: true, force: true });
   fs.mkdirSync(staging, { recursive: true });
@@ -31,17 +36,34 @@ export async function exportV2Task(id) {
     }
   };
   copyDir(v2Dir, staging);
+  fs.mkdirSync(path.join(staging, "project"), { recursive: true });
+  copyDir(projectDir, path.join(staging, "project"));
+  verifyStagedTree(staging); // fail-closed: no credential-shaped entries reach the zip
+  // inspection guide — quickstart points at the reconstructed project
+  const explPath = path.join(v2Dir, "exploration.md");
+  const expl = fs.existsSync(explPath) ? fs.readFileSync(explPath, "utf8") : null;
+  fs.mkdirSync(path.join(staging, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(staging, "docs", "INSPECTION.md"),
+    `# Inspection guide\n\nTask: ${id} · Generated ${new Date().toISOString()}\n\n` +
+    `## Quick start\n\n1. Open \`project/index.html\` in a browser — the reconstructed editable site (design tokens + component styles + replay runtime).\n` +
+    `2. \`styles/tokens.css\` holds the measured design tokens; \`runtime/interactions.js\` replays the recorded controls.\n` +
+    `3. \`pages/\`, \`states/\` and \`reports/\` hold the exploration evidence this clone was built from.\n\n` +
+    `## Interaction report\n\n` +
+    (expl
+      ? `Recorded from the live site during exploration — every documented control, its trigger and the captured UI states:\n\n${expl}`
+      : `No exploration report was produced for this task (the page exposed no safe interactions to record).`),
+  );
   const zipPath = path.join(v2Dir, "export.zip");
   fs.rmSync(zipPath, { force: true });
-  await new Promise((resolve, reject) => {
-    const cmd = process.platform === "win32" ? "powershell" : "zip";
-    const args = process.platform === "win32"
-      ? ["-NoProfile", "-Command", `Compress-Archive -Path '${staging}\\*' -DestinationPath '${zipPath}' -Force`]
-      : ["-r", "-q", zipPath, "."];
-    execFile(cmd, args, { cwd: staging, timeout: 120000 }, (err) => err ? reject(err) : resolve());
-  });
-  fs.rmSync(staging, { recursive: true, force: true });
-  return { zipPath, size: fs.statSync(zipPath).size };
+  try {
+    await makeZip(staging, zipPath);
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
+  }
+  const zst = fs.existsSync(zipPath) ? fs.statSync(zipPath) : null;
+  if (!zst || !zst.isFile() || zst.size === 0) throw new Error("ZIP failed — no archive was produced");
+  return { zipPath, size: zst.size };
 }
 
 // code/asset extensions — a site's own source named "storage.js" must survive the export

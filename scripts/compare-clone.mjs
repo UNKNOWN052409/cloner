@@ -1,7 +1,8 @@
 // Original vs clone comparison: pixel diff + heatmap + design-token deltas.
-// Usage: node scripts/compare-clone.mjs <runDir> [port]
-//  - original screenshot: <runDir>/_reference/page-1.png (captured from the live site)
-//  - clone: renders <runDir>/index.html fresh, screenshots it
+// Usage: node scripts/compare-clone.mjs <runDir> [port] [origPng] [cloneHtml] [outDir]
+//   v1 layout: original at <runDir>/_reference/page-1.png, clone at <runDir>/index.html
+//   v2 layout: pass explicit origPng (exploration screenshot) + cloneHtml
+//     (<artifactsDir>-project/index.html) + outDir (artifactsDir for _reference/)
 //  - pixel diff: mean delta, % pixels differing, 12×8 grid heatmap → _reference/diff.png
 //  - token deltas: design-tokens.json (captured from the LIVE site) vs tokens
 //    re-measured from the rendered clone — exact colors/fonts/spacing drift
@@ -11,10 +12,13 @@ import { launchBrowser, renderCloneScreenshot } from "../src/browser.js";
 
 const runDir = path.resolve(process.argv[2] || "");
 const port = Number(process.argv[3]) || 4199;
-const origPath = path.join(runDir, "_reference", "page-1.png");
-const cloneHtml = path.join(runDir, "index.html");
+const origPath = process.argv[4] ? path.resolve(process.argv[4]) : path.join(runDir, "_reference", "page-1.png");
+const cloneHtml = process.argv[5] ? path.resolve(process.argv[5]) : path.join(runDir, "index.html");
+const outDir = process.argv[6] ? path.resolve(process.argv[6]) : runDir;
+const refDir = path.join(outDir, "_reference");
+fs.mkdirSync(refDir, { recursive: true });
 if (!fs.existsSync(origPath) || !fs.existsSync(cloneHtml)) {
-  console.error("usage: node scripts/compare-clone.mjs <runDir>  (needs _reference/page-1.png + index.html)");
+  console.error("usage: node scripts/compare-clone.mjs <runDir> [port] [origPng] [cloneHtml] [outDir]  (needs an original screenshot + clone index.html)");
   process.exit(1);
 }
 
@@ -24,7 +28,7 @@ const viewport = { width: 1440, height: 900 };
 // render the clone (same engine as verify.mjs)
 const cloneShot = await renderCloneScreenshot(b, cloneHtml, viewport);
 if (!cloneShot) { console.error("clone render failed"); process.exit(1); }
-const clonePath = path.join(runDir, "_reference", "clone-verify.png");
+const clonePath = path.join(refDir, "clone-verify.png");
 fs.writeFileSync(clonePath, cloneShot);
 
 // ---- pixel diff in-browser (no new deps) ----
@@ -72,13 +76,13 @@ const stats = await p.evaluate(async ({ aData, bData }) => {
   };
 }, { aData: "data:image/png;base64," + fs.readFileSync(origPath).toString("base64"), bData: "data:image/png;base64," + cloneShot.toString("base64") });
 
-fs.writeFileSync(path.join(runDir, "_reference", "diff.png"), Buffer.from(stats.heat.split(",")[1], "base64"));
+fs.writeFileSync(path.join(refDir, "diff.png"), Buffer.from(stats.heat.split(",")[1], "base64"));
 const hot = [...stats.cells].sort((x, y) => y.score - x.score).slice(0, 5);
 
 // ---- token deltas: live-site tokens (design-tokens.json) vs clone-rendered tokens ----
 let tokenRows = [];
 try {
-  const live = JSON.parse(fs.readFileSync(path.join(runDir, "design-tokens.json"), "utf8"));
+  const live = JSON.parse(fs.readFileSync(path.join(outDir, "design-tokens.json"), "utf8"));
   const cp = await b.newPage({ viewport });
   await cp.goto("file:///" + cloneHtml.replace(/\\/g, "/"), { waitUntil: "load", timeout: 30000 }).catch(() => {});
   await cp.waitForTimeout(900);
@@ -98,9 +102,19 @@ try {
     return { colors: top(freq.colors), backgrounds: top(freq.backgrounds), fonts: top(freq.fonts, 6), fontSizes: top(freq.fontSizes, 10) };
   });
   await cp.close();
+  // normalize both sides before comparing: live tokens are hex (buildTokens),
+  // clone-measured values are rgb()/rgba() computed strings — transparent
+  // colors map to null and drop out so they can't masquerade as black
+  const toHexNorm = (v) => {
+    const m = String(v || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+%?)\s*)?\)/);
+    if (!m) return null;
+    if (m[4] !== undefined && Number(m[4]) === 0) return null;
+    return "#" + [m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, "0")).join("").toLowerCase();
+  };
+  const norm = (arr) => arr.map(([v, n]) => [toHexNorm(v) ?? String(v).toLowerCase(), n]).filter((x) => x[0] !== "null");
   const overlap = (liveArr, cloneArr) => {
-    const cs = new Set(cloneArr.map((x) => x[0]));
-    const hit = liveArr.filter((x) => cs.has(x[0])).length;
+    const cs = new Set(norm(cloneArr).map((x) => x[0]));
+    const hit = norm(liveArr).filter((x) => cs.has(x[0])).length;
     return `${hit}/${liveArr.length} match`;
   };
   tokenRows = [
@@ -116,7 +130,7 @@ await b.close();
 
 // ---- report ----
 const lines = [
-  "CLONE COMPARISON — " + path.basename(runDir),
+  "CLONE COMPARISON — " + path.basename(outDir),
   "═".repeat(52),
   `pixels compared   : ${stats.w}×${stats.h} (original vs clone render)`,
   `mean channel delta: ${stats.meanDelta}/255`,
@@ -132,6 +146,6 @@ const lines = [
 ];
 const report = lines.join("\n");
 console.log(report);
-fs.writeFileSync(path.join(runDir, "_reference", "comparison.txt"), report);
+fs.writeFileSync(path.join(refDir, "comparison.txt"), report);
 const fail = stats.diffPct >= 60;
 process.exit(fail ? 1 : 0);

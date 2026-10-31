@@ -12,6 +12,7 @@ import { DOM_EXTRACTOR_SCRIPT, analyzeTypography } from "../intelligence/dom-ext
 import { buildAssetManifest, captureResponsive } from "../assets/asset-manifest.js";
 import { createArtifactStore, redact } from "../storage/artifact-store.js";
 import { createLogger } from "../observability/logger.js";
+import { withJobScope } from "../events.js";
 
 function makeJobId() {
   return "exp-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -39,11 +40,13 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
   let engineActive = false;
   const onStep = (e) => {
     if (!engineActive) return;
+    if (e?.job && e.job !== id) return; // another job's engine traffic
     const d = e?.data || {};
     logger.info("engine", d.msg || d.id || "step", { status: d.status });
   };
   const onLog = (e) => {
     if (!engineActive) return;
+    if (e?.job && e.job !== id) return; // another job's engine traffic
     const d = e?.data || {};
     if (d.level === "warn") {
       // the engine logs these only after its own click retry also failed
@@ -149,6 +152,11 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       if (shotFull) store.writeBinary(`pages/${pageId}/screenshot-viewport.png`, shotFull);
       logger.metric("screenshotMs", Date.now() - tShot);
 
+      // mark triggers BEFORE the DOM extractor so data-cloner-trigger attrs
+      // are captured in dom.json and carried through to the generated project
+      const { markTriggers } = await import("../interactions.js");
+      await markTriggers(page, { max: policy.budgets.maxInteractionsPerState }).catch((e) => logger.warn("markTriggers", e.message.slice(0, 80)));
+
       // DOM intelligence (spec §9)
       const tDom = Date.now();
       const domIntel = await page.evaluate(DOM_EXTRACTOR_SCRIPT).catch(() => null);
@@ -178,10 +186,12 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       engineActive = true;
       let records;
       try {
-        records = await recordInteractions(page, {
+        // engine emissions are tagged with THIS job id (bus job scope) so the
+        // bridge can drop concurrent jobs' traffic even mid-overlap
+        records = await withJobScope(id, () => recordInteractions(page, {
           waitMs: 800, max: policy.budgets.maxStatesPerPage, triggerMax: policy.budgets.maxInteractionsPerState,
           budgetMs: Math.max(20000, pageDeadline - Date.now()), outDir: store.dirs.root,
-        });
+        }));
       } finally { engineActive = false; }
 
       // network flush AFTER the interactions so interaction traffic is

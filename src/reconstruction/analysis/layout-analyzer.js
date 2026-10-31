@@ -48,15 +48,28 @@ export function analyzeLayout(elements, rectMap) {
 // EXACT original values (hex where possible) — no redesign, no substitutions.
 export function buildTokens(designTokensJson, stylesElements) {
   const toHex = (rgb) => {
-    const m = String(rgb || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/);
-    return m ? "#" + [m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, "0")).join("").toLowerCase() : null;
+    const m = String(rgb || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+%?)\s*)?\)/);
+    if (!m) return null;
+    // fully transparent — not a real color; mapping it to #000000 turned
+    // clone backgrounds black (the 81% pixel-diff class of bug)
+    if (m[4] !== undefined && Number(m[4]) === 0) return null;
+    return "#" + [m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, "0")).join("").toLowerCase();
   };
   const colors = new Map(), bgs = new Map(), fonts = new Map(), sizes = new Map(), spacing = new Map(), radii = new Map();
   const bump = (map, value) => { if (value) map.set(value, (map.get(value) || 0) + 1); };
+  // non-hex fallback must also exclude fully-transparent colors (rgba(...,0))
+  const realColor = (v) => {
+    const s = String(v || "");
+    const m = s.match(/rgba?\(([^)]*)\)/i);
+    if (!m) return v || null;
+    const parts = m[1].split(/[\s,/]+/).filter(Boolean);
+    if (parts.length >= 4 && Number(parts[3]) === 0) return null; // alpha 0 → invisible
+    return v;
+  };
   for (const el of stylesElements || []) {
     const s = el.style || {};
-    bump(colors, toHex(s.color) || s.color);
-    bump(bgs, toHex(s.backgroundColor) || s.backgroundColor);
+    bump(colors, toHex(s.color) || realColor(s.color));
+    bump(bgs, toHex(s.backgroundColor) || realColor(s.backgroundColor));
     bump(fonts, s.fontFamily);
     bump(sizes, s.fontSize);
   }
@@ -64,7 +77,9 @@ export function buildTokens(designTokensJson, stylesElements) {
   for (const [v, n] of designTokensJson?.backgrounds || []) bump(bgs, toHex(v) || v);
   for (const [v, n] of designTokensJson?.radii || []) bump(radii, v);
   for (const [v, n] of designTokensJson?.spacing || []) bump(spacing, v);
-  const top = (m, n = 10) => [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([value]) => value);
+  // [value, count] pairs — the honest measured data (verification's HEX stage
+  // consumes this shape; tokensCss destructures below)
+  const top = (m, n = 10) => [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
   return {
     colors: top(colors), backgrounds: top(bgs),
     fonts: top(fonts, 4), fontSizes: top(sizes, 8),
@@ -75,12 +90,12 @@ export function buildTokens(designTokensJson, stylesElements) {
 
 export function tokensCss(tokens) {
   const lines = [":root {"];
-  tokens.colors?.forEach((c, i) => lines.push(`  --color-${i + 1}: ${c};`));
-  tokens.backgrounds?.forEach((c, i) => lines.push(`  --bg-${i + 1}: ${c};`));
-  tokens.fontSizes?.forEach((c, i) => lines.push(`  --fs-${i + 1}: ${c};`));
-  tokens.radii?.forEach((c, i) => lines.push(`  --radius-${i + 1}: ${c};`));
-  lines.push(`  --font-primary: ${tokens.fonts?.[0] || "system-ui, sans-serif"};`);
-  if (tokens.fonts?.[1]) lines.push(`  --font-secondary: ${tokens.fonts[1]};`);
+  tokens.colors?.forEach(([c], i) => lines.push(`  --color-${i + 1}: ${c};`));
+  tokens.backgrounds?.forEach(([c], i) => lines.push(`  --bg-${i + 1}: ${c};`));
+  tokens.fontSizes?.forEach(([c], i) => lines.push(`  --fs-${i + 1}: ${c};`));
+  tokens.radii?.forEach(([c], i) => lines.push(`  --radius-${i + 1}: ${c};`));
+  lines.push(`  --font-primary: ${tokens.fonts?.[0]?.[0] || "system-ui, sans-serif"};`);
+  if (tokens.fonts?.[1]) lines.push(`  --font-secondary: ${tokens.fonts[1][0]};`);
   lines.push("}");
   lines.push(`body { margin: 0; background: var(--bg-1, #fff); color: var(--color-1, #111); font-family: var(--font-primary); }`);
   return lines.join("\n");

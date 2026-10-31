@@ -17,6 +17,9 @@ import { fileURLToPath } from "node:url";
 
 const PROJECT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.chdir(PROJECT); // platform-data + cloner.config.json + scripts/* are cwd-relative
+// the e2e fixture target is a private loopback address — the SSRF guard would
+// (correctly) reject it; this test explicitly opts in
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1";
 // dynamic imports AFTER chdir — tasks.js pins ROOT to process.cwd() at module load
 const tasks = await import("../src/platform/tasks.js");
 const { startPlatform } = await import("../src/platform/server.js");
@@ -133,27 +136,37 @@ try {
   console.log(`fixture on :${fixturePort} · platform on :${port}`);
 
   const created = await api(port, "POST", "/api/tasks", { url: `http://127.0.0.1:${fixturePort}/fixture-toolbar.html`, pipeline: "v2" });
-  check("e2e: task accepted (201-ish, id returned)", created.status === 200 && !!created.json?.id, `status ${created.status}`);
-  check("e2e: per-user stub stored (userId=local)", created.json?.userId === "local", `userId=${created.json?.userId}`);
+  check("e2e: task accepted (200, temp handle returned)", created.status === 200 && !!created.json?.id, `status ${created.status}`);
   const id = created.json?.id;
 
-  // poll to done — 120s cap
+  // poll to a terminal v2 status — 120s cap (v2 lifecycle: completed /
+  // completed_with_limitations / error — not the v1 "done")
   const deadline = Date.now() + 120_000;
   let meta = created.json;
-  while (Date.now() < deadline && !["done", "error", "exported"].includes(meta?.status)) {
+  while (Date.now() < deadline && !["completed", "completed_with_limitations", "error"].includes(meta?.status)) {
     await sleep(1000);
     meta = (await api(port, "GET", `/api/tasks/${id}`)).json;
   }
-  check("e2e: task reached done within 120s", meta?.status === "done", `status=${meta?.status} ${meta?.error ? "error=" + meta.error : ""}`);
+  check("e2e: task reached a terminal v2 status within 120s", ["completed", "completed_with_limitations"].includes(meta?.status), `status=${meta?.status} ${meta?.error ? "error=" + meta.error : ""}`);
+  const jobId = meta?.id || meta?.jobId || id; // GET returns the upgraded job id as `id`
 
-  // artifacts — the five named in the spec, plus the files on disk
-  const art = meta?.artifacts || {};
-  const needArt = ["index", "snapshot", "exploration", "design-tokens", "cloner-runtime"];
-  check("e2e: artifacts recorded (index/snapshot/exploration/design-tokens/cloner-runtime)",
-    needArt.every((k) => !!art[k]), needArt.map((k) => `${k}:${art[k] ? "y" : "MISSING"}`).join(" "));
-  const outDirPath = tasks.outDir(id);
-  const needFiles = ["index.html", "snapshot.mhtml", "exploration.md", "design-tokens.json", "cloner-runtime.js"];
-  check("e2e: artifact files exist in out/", needFiles.every((f) => exists(path.join(outDirPath, f))));
+  // v2 artifacts — reconstruction project + pipeline artifacts (spec §15 layout)
+  const artDir = path.join(PROJECT, "artifacts", jobId);
+  const projDir = artDir + "-project";
+  const needV2 = [
+    ["exploration manifest", path.join(artDir, "manifest.json")],
+    ["exploration report", path.join(artDir, "exploration.json")],
+    ["measured design tokens", path.join(artDir, "design-tokens.json")],
+    ["clone page", path.join(projDir, "index.html")],
+    ["tokens stylesheet", path.join(projDir, "styles", "tokens.css")],
+    ["components stylesheet", path.join(projDir, "styles", "components.css")],
+    ["replay runtime", path.join(projDir, "runtime", "interactions.js")],
+    ["reconstruction report", path.join(projDir, "reconstruction-report.json")],
+  ];
+  check("e2e: v2 artifact tree complete", needV2.every(([_, f]) => exists(f)),
+    needV2.map(([l, f]) => `${l}:${exists(f) ? "y" : "MISSING"}`).join(" "));
+  check("e2e: clone page carries recorded triggers", exists(path.join(projDir, "index.html")) &&
+    /data-cloner-trigger=/.test(fs.readFileSync(path.join(projDir, "index.html"), "utf8")));
 
   // three-step verification
   const stages = meta?.verification?.stages || [];
@@ -161,9 +174,9 @@ try {
     stages.length === 3 && stages.every((s) => typeof s.passed === "boolean"),
     stages.map((s) => `${s.stage}:${s.passed ? "pass" : "fail"}`).join(" "));
 
-  // export
+  // export — the v2 export writes artifacts/<jobId>/export.zip
   const exp = await api(port, "POST", `/api/export/${id}`);
-  const zipPath = path.join(tasks.taskDir(id), "export.zip");
+  const zipPath = path.join(artDir, "export.zip");
   check("e2e: export succeeded (ok:true, size>0, zip on disk)", exp.status === 200 && exp.json?.ok === true && exp.json?.size > 0 && exists(zipPath),
     exp.status === 200 ? `size=${exp.json?.size}` : (exp.json?.error || exp.text).slice(0, 160));
 
@@ -173,7 +186,7 @@ try {
   check("e2e: zip contains zero private/ or credential-named entries", offenders.length === 0,
     offenders.length ? offenders.join(", ") : `${entries.length} entries scanned`);
   check("e2e: zip entry names are portable (forward slashes)", !entries.some((e) => e.includes("\\")));
-  check("e2e: zip ships index.html and docs/INSPECTION.md", entries.includes("index.html") && entries.includes("docs/INSPECTION.md"));
+  check("e2e: zip ships the clone + inspection guide", entries.includes("project/index.html") && entries.includes("docs/INSPECTION.md"));
   check("e2e: private/ shredded from task dir after export", !exists(path.join(tasks.taskDir(id), "private")));
 } catch (e) {
   check("e2e: no unexpected crash", false, String(e?.stack || e).split("\n")[0]);

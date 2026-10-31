@@ -11,6 +11,9 @@ output/
 platform-data/
 exports/
 
+# exploration job artifacts (site content + session data)
+artifacts/
+
 # logs
 *.log
 

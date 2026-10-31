@@ -11,6 +11,7 @@ import { bus } from "../events.js";
 import { loadConfig } from "../config.js";
 import { cloneUrl } from "../cloneUrl.js";
 import { loadCookies } from "../browser.js";
+import * as exploration from "./exploration-runner.js";
 import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
 import { exportTask } from "./exporter.js";
@@ -40,6 +41,33 @@ export function startPlatform({ port = 4180 } = {}) {
     });
   });
   app.get("/api/tasks", (_req, res) => res.json(tasks.listTasks()));
+
+  // ---- exploration jobs (Phase 1 intelligence engine, spec §15) ----
+  app.post("/api/jobs/explore", (req, res) => {
+    const { url, username, password, cookies, storage, policy } = req.body || {};
+    if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    if (policy !== undefined && (typeof policy !== "object" || policy === null || Array.isArray(policy))) return res.status(400).json({ error: "policy must be an object" });
+    const entry = exploration.queueExploration({ url, username, password, cookies, storage, policy });
+    res.json({ jobId: entry.tempId, status: entry.status });
+  });
+  app.get("/api/jobs", (_req, res) => res.json(exploration.listJobs()));
+  app.get("/api/jobs/:jobId", (req, res) => {
+    const job = exploration.getExplorationJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "job not found" });
+    res.json(job);
+  });
+  app.get("/api/jobs/:jobId/artifacts/*", (req, res) => {
+    const root = path.join(process.cwd(), "artifacts");
+    const file = path.resolve(root, req.params.jobId, req.params[0] || "manifest.json");
+    const jobRoot = path.resolve(root, req.params.jobId);
+    // traversal guard: the resolved file must stay inside BOTH artifacts/ and
+    // artifacts/<jobId>/ (a startsWith(root) check alone is bypassable by
+    // ../-encoded paths into sibling directories like artifacts-leak/)
+    const relRoot = path.relative(root, file);
+    const relJob = path.relative(jobRoot, file);
+    if (relRoot.startsWith("..") || path.isAbsolute(relRoot) || relJob.startsWith("..") || path.isAbsolute(relJob) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return res.status(404).json({ error: "not found" });
+    res.sendFile(file);
+  });
   app.get("/api/tasks/:id", (req, res) => {
     const meta = tasks.loadTask(req.params.id);
     if (!meta) return res.status(404).json({ error: "not found" });

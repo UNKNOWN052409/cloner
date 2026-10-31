@@ -13,6 +13,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { launchBrowser } from "../browser.js";
+// Phase 3.4 integrations (wired by the integration agent):
+import { analyzeFidelity } from "../reconstruction/visual-fidelity-analyzer.js"; // task 3.4.3
+import { classifyDefects } from "../reconstruction/visual-diff-classifier.js"; // task 3.4.3
+import { runRepairLoop } from "../reconstruction/repair-executor.js"; // task 3.4.5
+import { DOM_EXTRACTOR_SCRIPT } from "../intelligence/dom-extractor.js"; // clone element measurement
 
 const MAX_ROUNDS = 3;
 const OPEN_GATE = 0.6; // 60% of clicked triggers must open overlay/module
@@ -489,6 +494,77 @@ function autoRemediate(report, out, artifactsDir = null) {
   return fixes;
 }
 
+// ==================================================== FIDELITY + REPAIR (tasks 3.4.3/3.4.5)
+// measureFidelity(cloneDir, artifactsDir) — render the clone and measure it
+// against the exploration's page-001 viewport screenshot with the 3.4.3
+// analyzer (same 12×8 geometry + threshold 30 as compare-clone.mjs). Returns
+// the fidelity report, or null when there is nothing to compare (v1 runs, or
+// the page-001 screenshot/dom evidence is missing) — null is honest absence,
+// never a zero.
+async function measureFidelity(cloneDir, artifactsDir) {
+  try {
+    const origPng = path.join(artifactsDir, "pages", "page-001", "screenshot-viewport.png");
+    const domPath = path.join(artifactsDir, "pages", "page-001", "dom.json");
+    if (!fs.existsSync(origPng) || !fs.existsSync(domPath) || !fs.existsSync(path.join(cloneDir, "index.html"))) return null;
+    const dom = JSON.parse(fs.readFileSync(domPath, "utf8"));
+    const originalElements = Array.isArray(dom?.elements) ? dom.elements : null;
+    if (!originalElements) return null;
+    const b = await launchBrowser({ headless: true });
+    let fidelity = null;
+    try {
+      // same viewport as compare-clone.mjs (policy primary 1440×900) and DPR 1
+      // so element rects map 1:1 onto screenshot px
+      const p = await b.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+      await p.goto("file:///" + path.join(cloneDir, "index.html").replace(/\\/g, "/"), { waitUntil: "load", timeout: 30000 });
+      await p.waitForTimeout(600);
+      const cloneShot = await p.screenshot({ timeout: 20000 });
+      const intel = await p.evaluate(DOM_EXTRACTOR_SCRIPT).catch(() => null);
+      const cloneElements = intel && Array.isArray(intel.elements) ? intel.elements : [];
+      fidelity = await analyzeFidelity(origPng, cloneShot, originalElements, cloneElements, { page: p });
+    } finally {
+      await b.close().catch(() => {});
+    }
+    return fidelity;
+  } catch {
+    return null; // measurement failure must not break verification — the repair loop treats null as unmeasurable
+  }
+}
+
+// functionalScoreFile(projectDir) — repair-loop functional check (higher = better):
+// share of data-cloner-trigger elements that a runtime record backs. File-only so
+// the executor measures it before/after each dead-attribute prune without a
+// browser round-trip; after a successful strip the score is exactly 1.
+function functionalScoreFile(projectDir) {
+  try {
+    const html = fs.readFileSync(path.join(projectDir, "index.html"), "utf8");
+    const { records } = parseRuntimeRecords(projectDir);
+    const ids = new Set(records.map((r) => r.id));
+    const triggers = [...html.matchAll(/data-cloner-trigger="(t\d+)"/g)].map((m) => m[1]);
+    if (!triggers.length) return 1;
+    return triggers.filter((t) => ids.has(t)).length / triggers.length;
+  } catch (e) {
+    throw new Error("functional score not measurable: " + String(e?.message || e).slice(0, 80));
+  }
+}
+
+// repairAssetMap(artifactsDir, cloneDir) — url → clone-relative replacement path
+// for asset-remap actions, built from the exploration's captured-assets entries
+// (same url→localPath pairs the reconstruction pipeline's asset copy used).
+function repairAssetMap(artifactsDir, cloneDir) {
+  const map = {};
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(artifactsDir, "assets", "manifest.json"), "utf8"));
+    const have = new Set();
+    try { for (const f of fs.readdirSync(path.join(cloneDir, "public", "assets"))) have.add(f); } catch {}
+    for (const e of manifest.capturedFromNetwork?.entries || []) {
+      if (!e.url || !e.localPath) continue;
+      const base = path.basename(e.localPath);
+      if (have.has(base)) map[e.url] = "public/assets/" + base;
+    }
+  } catch {}
+  return map;
+}
+
 export async function verifyTask(outDirPath, task = null) {
   const v2Clone = v2Layout(outDirPath);
   const rounds = [];
@@ -508,8 +584,41 @@ export async function verifyTask(outDirPath, task = null) {
     rounds.push({ round, passed: report.passed, failed: report.stages.filter((s) => !s.passed).map((s) => s.stage) });
     if (report.passed || round === MAX_ROUNDS) break;
     const fixes = autoRemediate(report, v2Clone || outDirPath, outDirPath);
-    if (!fixes.length) break;
-    report.fixes = (report.fixes || []).concat(fixes.map((f) => `round ${round}: ${f}`));
+    if (fixes.length) {
+      report.fixes = (report.fixes || []).concat(fixes.map((f) => `round ${round}: ${f}`));
+    } else {
+      // task 3.4.5: autonomous repair loop — autoRemediate had nothing bounded to
+      // offer, so classify 3.4.3 fidelity defects and apply measured repairs
+      // (snapshot → apply → re-measure the RELEVANT check → keep if improved,
+      // else byte-for-byte rollback). With no defects and no dead triggers the
+      // plan is empty and improved=false — exactly the old break behavior.
+      const cloneDir = v2Clone || outDirPath;
+      const fidelityReport = await measureFidelity(cloneDir, outDirPath);
+      const repair = await runRepairLoop(report, cloneDir, {
+        defects: fidelityReport ? classifyDefects(fidelityReport) : [],
+        checkFns: {
+          fidelity: async (projectDir) => {
+            const f = await measureFidelity(projectDir, outDirPath);
+            if (!f) throw new Error("fidelity not measurable (missing original screenshot/dom evidence)");
+            return f.pixel.similarityPct;
+          },
+          functional: functionalScoreFile,
+        },
+        assetMap: repairAssetMap(outDirPath, cloneDir),
+      });
+      report.fixes = (report.fixes || []).concat(repair.applied.map((r) => `round ${round}: repair ${r.action.kind} ${r.action.target} — ${r.reason}`));
+      report.repairLoop = {
+        stopped: repair.stopped,
+        baseline: repair.overall.baseline,
+        final: repair.overall.final,
+        improved: repair.improved,
+        applied: repair.applied.length,
+        reverted: repair.reverted.length,
+        pending: repair.pending.length,
+        unverifiable: repair.unverifiable.length,
+      };
+      if (!repair.improved) break;
+    }
   }
   report.rounds = rounds;
   fs.mkdirSync(path.join(outDirPath, "_reference"), { recursive: true });

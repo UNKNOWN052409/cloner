@@ -13,6 +13,10 @@ import { buildAssetManifest, captureResponsive } from "../assets/asset-manifest.
 import { createArtifactStore, redact } from "../storage/artifact-store.js";
 import { createLogger } from "../observability/logger.js";
 import { withJobScope } from "../events.js";
+// task 3.4.4: sanitized WebSocket session capture — payload SHAPES only, every
+// string value redacted (numbers kept per the ticker contract), query values
+// stripped from URLs, credential-named keys collapsed
+import { attachWebSocketCapture, createWebSocketSink, exportWebSocketSink } from "../exploration/websocket-session-capture.js";
 
 function makeJobId() {
   return "exp-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -81,6 +85,11 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     const allNetwork = []; // job-level accumulation for asset capture
     let netCursor = 0;
     attachNetworkRecorder(ctx, network).attach(page);
+
+    // task 3.4.4: WebSocket session capture — attached BEFORE navigation so the
+    // initial upgrade is captured; handlers are defensive and never throw
+    const wsSink = createWebSocketSink();
+    attachWebSocketCapture(page, wsSink);
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     try { await page.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
@@ -201,6 +210,15 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       netCursor = network.entries.length;
       allNetwork.push(...newEntries);
       store.writeJson(`pages/${pageId}/network.json`, { pageId, url: page.url(), entries: redact(newEntries) });
+
+      // task 3.4.4: sanitized WebSocket session fixture for THIS page, then reset
+      // the sink so each page's websocket.json carries only the frames observed
+      // while exploring it (the replayer pairs page widgets with page captures)
+      store.writeJson(`pages/${pageId}/websocket.json`, exportWebSocketSink(wsSink));
+      wsSink.events = [];
+      wsSink.sockets = 0;
+      wsSink.dropped = 0;
+      wsSink.startedAt = null;
 
       // harvest THIS page's SPA transitions before navigating away — the
       // recorder buffer is per-document and resets on every navigation (spec §7A)

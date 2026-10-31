@@ -4,6 +4,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { buildRuntime } from "../../runtimeTemplate.js";
+// Phase 3.4 integrations (wired by the integration agent):
+import { extendRuntimeWorkspace } from "../docking-layout-builder.js"; // task 3.4.2
+import { buildStreamRuntime } from "../data-stream-replayer.js"; // task 3.4.4
 
 const SELF_CLOSE = new Set(["img", "br", "hr", "input", "meta", "link"]);
 
@@ -12,12 +15,21 @@ function esc(s) {
 }
 
 // build per-element CSS rules (components.css) + collect geometry evidence
-export function buildComponentCss(elements, layoutByIndex) {
+// opts (additive): { scopeOf?: (el) => string } — element indexes restart at 0
+// per page, so a multi-page build collides .cx-N rules across pages in the
+// SHARED components.css (page-002's index-9 chart canvas would override
+// page-001's index-9 dock root). The pipeline passes scopeOf to prefix each
+// COLLIDING element's rule with a body[data-page] marker that generatePageHtml
+// emits (scoped by the element's OWN page); non-colliding indexes keep the
+// exact legacy output.
+export function buildComponentCss(elements, layoutByIndex, opts = {}) {
+  const scopeOf = typeof opts.scopeOf === "function" ? opts.scopeOf : null;
   const rules = [];
   for (const el of elements) {
     const i = el.i;
     const st = el.style || {};
     const lay = layoutByIndex.get(i);
+    const scoped = scopeOf ? scopeOf(el) : "";
     const rect = el.rect || el.getBoundingClientRect?.() || null;
     const props = [];
     if (lay) {
@@ -47,7 +59,7 @@ export function buildComponentCss(elements, layoutByIndex) {
       if (rect.w) props.push(`width:${rect.w}px`);
       if (rect.h) props.push(`height:${rect.h}px`);
     }
-    if (props.length) rules.push(`.cx-${i} { ${props.join("; ")}; }`);
+    if (props.length) rules.push(`${scoped}.cx-${i} { ${props.join("; ")}; }`);
   }
   return rules.join("\n");
 }
@@ -85,6 +97,11 @@ function renderNode(node, cssCtx, depth) {
   // and the runtime also falls back to structural paths for page elements.
   const wire = cssCtx.interactionsByIndex.get(node._elementIndex);
   if (wire) attrs += ` data-replay-id="${esc(wire)}"`;
+  // task 3.4.4: data-stream widget wiring — the pipeline's streamByIndex maps
+  // detected live-data widget element indexes → "channel.key" targets; the
+  // runtime/streams.js replayer applies the captured/synthetic sequence to them
+  const streamTarget = cssCtx.streamByIndex?.get(node._elementIndex);
+  if (streamTarget) attrs += ` data-stream-target="${esc(streamTarget)}"`;
   const indent = "  ".repeat(depth);
   if (SELF_CLOSE.has(tag)) return `${indent}<${tag} ${attrs} />`;
   const text = node.text ? esc(node.text) : "";
@@ -104,10 +121,10 @@ export function generatePageHtml(page, componentTree, cssCtx) {
   <link rel="stylesheet" href="styles/layout.css">
   <link rel="stylesheet" href="styles/components.css">
 </head>
-<body>
+<body data-page="${esc(page.pageId || "")}">
 ${body}
   <script src="runtime/interactions.js"></script>
-</body>
+${cssCtx.hasStreams ? '  <script src="runtime/streams.js"></script>\n' : ""}</body>
 </html>
 `;
 }
@@ -123,7 +140,7 @@ export function buildLayoutCss(elements, layoutByIndex) {
   return lines.join("\n");
 }
 
-export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, componentsCss, assetMap, assetRoot, interactionRecords = [] }) {
+export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, componentsCss, assetMap, assetRoot, interactionRecords = [], streamPlan = null }) {
   const dirs = ["styles", "runtime", "public/assets"];
   for (const d of dirs) fs.mkdirSync(path.join(outDir, d), { recursive: true });
   fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({
@@ -133,7 +150,11 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
   fs.writeFileSync(path.join(outDir, "styles", "tokens.css"), tokensCssText);
   fs.writeFileSync(path.join(outDir, "styles", "layout.css"), layoutCss);
   fs.writeFileSync(path.join(outDir, "styles", "components.css"), componentsCss);
-  fs.writeFileSync(path.join(outDir, "runtime", "interactions.js"), buildRuntime(interactionRecords));
+  // task 3.4.2: dock behaviors ride along with the replay runtime —
+  // marker-guarded (idempotent) and a no-op on pages with no data-ws-* stamps
+  fs.writeFileSync(path.join(outDir, "runtime", "interactions.js"), extendRuntimeWorkspace(buildRuntime(interactionRecords)));
+  // task 3.4.4: embedded data-stream replayer — inert when no channels were planned
+  fs.writeFileSync(path.join(outDir, "runtime", "streams.js"), buildStreamRuntime(streamPlan?.channelSpecs || []));
   // assets copy with verified source resolution
   let copied = 0, failed = 0;
   for (const [url, localRel] of assetMap || []) {

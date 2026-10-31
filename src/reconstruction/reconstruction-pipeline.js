@@ -7,6 +7,16 @@ import { buildComponentTree, flattenTree } from "./analysis/component-tree-build
 import { analyzeLayout, buildTokens, tokensCss } from "./analysis/layout-analyzer.js";
 import { buildComponentCss, buildLayoutCss, generatePageHtml, generateProject, buildLayoutCss as layoutCssBuilder } from "./generation/project-generator.js";
 import { createLogger } from "../observability/logger.js";
+// Phase 3.4 integrations (applied by the integration agent — each module keeps
+// its own public API; the pipeline is the only wiring point):
+import { buildUnderstandingPage, pageArtifactsFromLoaded, summarizeUnderstanding } from "./website-understanding.js"; // task 3.4.1
+import { detectWorkspace, summarizeWorkspace } from "./workspace-analyzer.js"; // task 3.4.2
+import { augmentProjectWithWorkspace } from "./docking-layout-builder.js"; // task 3.4.2
+import { refineTypography } from "./visual-fidelity-analyzer.js"; // task 3.4.3
+import { buildResponsiveCss, augmentProjectWithResponsive } from "./responsive-analyzer.js"; // task 3.4.7
+import { buildStreamPlan } from "./stateful-widget-builder.js"; // task 3.4.4
+import { buildStreamRuntime } from "./data-stream-replayer.js"; // task 3.4.4
+import { createVisionClientForConfig } from "../platform/vision-client.js"; // task 3.4.6
 
 const MAX_ROUNDS = 2;
 
@@ -146,11 +156,39 @@ export function structuralPathFor(elements, targetIndex) {
   return ["div.cx-x:nth-of-type(1)", ...segs].join(">");
 }
 
-export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords } = {}) {
+export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords, visionFn, visionCfg } = {}) {
   const logger = createLogger({ jobId: path.basename(artifactsDir) + "-recon", artifactsDir: path.dirname(artifactsDir) });
   const report = { rounds: [], repairs: [], limitations: [], generatedFiles: 0, passed: false };
   // explicit records win (runner may pass captured ones); else derive from artifacts
   const replayRecords = (interactionRecords && interactionRecords.length) ? interactionRecords : deriveInteractionRecords(artifactsDir);
+
+  // task 3.4.6: when no visionFn is injected, derive one from the caller's config
+  // through the reliability layer (streamed transport, retry/backoff, fallback
+  // contract). With provider "none" (or no config at all) createVisionClientForConfig
+  // returns null → buildUnderstandingPage's deterministic no-provider fallback, zero
+  // network — the offline/CI default.
+  let effectiveVisionFn = visionFn || null;
+  if (!effectiveVisionFn && visionCfg) {
+    const client = createVisionClientForConfig(visionCfg, { requestTimeoutMs: 20000 });
+    if (client) effectiveVisionFn = client.asVisionFn();
+  }
+
+  // task 3.4.4: data-stream plan — detect live-data widgets (tables/tickers/
+  // counters) per page from dom.json + network.json + websocket.json and build the
+  // channel specs the generated runtime/streams.js replays. Read-only over the
+  // artifacts; without a websocket capture the widgets are still detected and
+  // wired, with the plan honestly noting the stream is static.
+  const streamPlan = buildStreamPlan(artifactsDir, {});
+  report.streams = {
+    ok: streamPlan.ok,
+    channels: streamPlan.channelSpecs.length,
+    liveCapture: Object.entries(streamPlan.pages).filter(([, p]) => p.hasLiveEvents).map(([pid]) => pid),
+    notes: streamPlan.notes.slice(0, 8),
+  };
+
+  // task 3.4.1: unified understanding model per page — computed ONCE (it depends
+  // only on the artifacts, not on generation rounds) and memoized here.
+  const understandingByPage = new Map();
 
   // ---- load + validate evidence (spec §2) ----
   const loaded = loadArtifacts(artifactsDir);
@@ -173,6 +211,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
   }
 
   const fileByPageId = new Map(); // pageId → generated file (for rec.page below)
+  let gen = null; // last generated project (hoisted for the post-loop augmentations)
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     pages = [];
     const allElements = [];
@@ -189,6 +228,23 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
         layoutByIndex.set(el.i, analyzeLayout(lp.elements, rectMap)[el.i] || null);
       }
       const styleByIndex = new Map(lp.elements.map((e) => [e.i, e.style || {}]));
+      // task 3.4.1: unified website understanding — deterministic evidence-based
+      // region classification (+ the vision path for weak containers when a
+      // visionFn resolves). Written next to the artifacts as understanding.json
+      // and summarized on the report; never blocks reconstruction.
+      if (!understandingByPage.has(lp.pageId)) {
+        let u = null;
+        try {
+          u = await buildUnderstandingPage(pageArtifactsFromLoaded(lp, artifactsDir), { visionFn: effectiveVisionFn });
+          try { fs.writeFileSync(path.join(artifactsDir, "pages", lp.pageId, "understanding.json"), JSON.stringify(u, null, 2)); } catch {}
+        } catch (e) {
+          report.limitations.push(`understanding failed for ${lp.pageId}: ${String(e?.message || e).slice(0, 100)}`);
+        }
+        understandingByPage.set(lp.pageId, u);
+        report.understanding = report.understanding || {};
+        report.understanding[lp.pageId] = summarizeUnderstanding(u);
+      }
+      const understanding = understandingByPage.get(lp.pageId);
       // asset map: element index → web-relative asset URL. img src (captured
       // resolved absolute URL) is matched against the capture stage's url→localPath
       // entries — exact first, then query/hash-stripped
@@ -218,7 +274,13 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
         interactionsByIndex.set(rec.domIndex, rec.id);
       }
       const routeFileMap = new Map(pages.filter((p) => p.file).map((p) => [p.route, p.file]));
-      const cssCtx = { routeFileMap, interactionsByIndex, assetByIndex };
+      // task 3.4.4: per-page stream wiring — element index → "channel.key" target
+      // rendered as data-stream-target so runtime/streams.js can apply updates
+      const cssCtx = {
+        routeFileMap, interactionsByIndex, assetByIndex,
+        streamByIndex: streamPlan.byIndex.get(lp.pageId) || null,
+        hasStreams: streamPlan.channelSpecs.length > 0,
+      };
       const html = generatePageHtml({ url: lp.url, pageId: lp.pageId }, { children: [tree] }, cssCtx);
       // route-slug filenames: page-001 (the seed) is always index.html; other
       // pages take a readable route slug ("/pricing" → pricing.html)
@@ -250,7 +312,33 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
       const pageLayout = analyzeLayout(lp.elements, rectMap);
       for (const [k, v] of Object.entries(pageLayout)) layoutByIndex.set(Number(k), v);
     }
-    componentsCssText = buildComponentCss(allElements, layoutByIndex);
+    // element indexes restart per page — map each element OBJECT to its page and
+    // flag colliding indexes so the shared components.css can scope them
+    // (buildComponentCss/refineTypography emit body[data-page="…"]-prefixed
+    // rules for colliding indexes only, each scoped by the element's OWN page)
+    const pageOfElement = new Map(); // element object → pageId
+    const indexPages = new Map(); // index → Set<pageId>
+    for (const lp of loaded.pages) {
+      if (!lp.elements) continue;
+      for (const el of lp.elements) {
+        if (el === null || el === undefined || typeof el.i !== "number") continue;
+        pageOfElement.set(el, lp.pageId);
+        if (!indexPages.has(el.i)) indexPages.set(el.i, new Set());
+        indexPages.get(el.i).add(lp.pageId);
+      }
+    }
+    const colliding = new Set([...indexPages].filter(([, set]) => set.size > 1).map(([i]) => i));
+    const scopeOf = (el) => (el && colliding.has(el.i) && pageOfElement.get(el) ? `body[data-page="${pageOfElement.get(el)}"] ` : "");
+    componentsCssText = buildComponentCss(allElements, layoutByIndex, { scopeOf });
+    // task 3.4.3: typography refinement overrides — repairs the generator's two
+    // real drifts (captured font-weight 400 on UA-bold tags renders bold because
+    // buildComponentCss drops "400", and letter-spacing is never emitted) from
+    // captured styles ONLY. Appended last so the additive .cx-N rules win the
+    // cascade at equal specificity; never emits background/color.
+    const typoRefinement = refineTypography(allElements, { scopeOf });
+    if (typoRefinement.css) {
+      componentsCssText += "\n/* typography refinement overrides (task 3.4.3) */\n" + typoRefinement.css;
+    }
     layoutCssText = buildLayoutCss(allElements.slice(0, 5), layoutByIndex);
 
     // annotate replay records with the generated file of their page — the
@@ -262,14 +350,15 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     }
 
     // generate the project (copies assets, writes pages + CSS + runtime)
-    const routeFileMap = new Map(pages.filter((p) => p.file).map((p) => [p.route, p.file]));
-    const gen = generateProject({
+    const routeFileMap = new Map(pages.filter((p) => p.html).map((p) => [p.route, p.file]));
+    gen = generateProject({
       outDir,
       pageHtmls: pages.filter((p) => p.html),
       tokensCssText, layoutCss: layoutCssText, componentsCss: componentsCssText,
       assetMap, // url → captured localPath (routeFileMap is for hrefs, not assets)
       assetRoot: artifactsDir, // localPath is relative to the JOB artifact dir
       interactionRecords: replayRecords,
+      streamPlan, // task 3.4.4: embedded data-stream replayer (runtime/streams.js)
     });
 
     // validation (spec §7)
@@ -317,6 +406,44 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     report.passed = structuralOk;
 
     if (report.passed || round === MAX_ROUNDS) break;
+  }
+
+  // ---- one-call project augmentations (tasks 3.4.2 + 3.4.7) ----
+  // Applied ONCE after the round loop: regeneration in a later round would
+  // discard augmentations applied mid-loop. Both are honest no-ops when their
+  // evidence gate does not pass (no workspace tree / no breakpoint evidence).
+  const genFiles = (gen?.files || []).map((f) => f.file);
+
+  // task 3.4.2: workspace reconstruction — detect a docking tree from the first
+  // page with DOM evidence (understanding model corroborates region labels) and
+  // augment the generated project with workspace CSS + dock behaviors.
+  try {
+    const wsPage = loaded.pages.find((lp) => lp.elements && !lp.emptyEvidence) || null;
+    let wsTree = null;
+    if (wsPage) {
+      const wsRectMap = new Map(wsPage.elements.map((e) => [e.i, { x: e.rect.x, y: e.rect.y, width: e.rect.w, height: e.rect.h }]));
+      const wsLayout = analyzeLayout(wsPage.elements, wsRectMap);
+      wsTree = detectWorkspace(wsPage.elements, wsLayout, understandingByPage.get(wsPage.pageId) || null);
+    }
+    report.workspace = summarizeWorkspace(wsTree);
+    if (wsTree) report.workspaceAugmentation = augmentProjectWithWorkspace(outDir, wsTree, { pages: genFiles });
+  } catch (e) {
+    report.limitations.push(`workspace augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
+  }
+
+  // task 3.4.7: responsive reconstruction — infer media queries from the captured
+  // per-viewport evidence (pages/page-001/responsive.json + dom.json) and augment
+  // the project; without ≥2 viewports of evidence nothing is fabricated.
+  try {
+    const resp = buildResponsiveCss(artifactsDir, "page-001");
+    report.responsive = {
+      source: resp.source,
+      rules: (resp.analysis?.rules || []).length,
+      notes: (resp.analysis?.notes || []).slice(0, 6),
+    };
+    report.responsiveAugmentation = augmentProjectWithResponsive(outDir, resp.analysis, { pages: genFiles });
+  } catch (e) {
+    report.limitations.push(`responsive augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
   }
 
   // ---- success contract (spec §7) ----

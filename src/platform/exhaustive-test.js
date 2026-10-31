@@ -124,6 +124,9 @@ export async function exhaustiveTest(cloneDir, { maxClicks = 70, reloadEvery = 1
       let clickedThisRound = 0;
       for (const el of elems) {
         if (results.total >= maxClicks) break;
+        // a layout-changing click earlier in this round may have removed or moved
+        // this element — skip what is gone, click what is still there
+        if (el.gone) { results.skipped++; continue; }
         // visibility already filtered inside the enumerate evaluate
         const before = await p.evaluate(STATE_FN).catch(() => "");
         let err = null;
@@ -141,6 +144,36 @@ export async function exhaustiveTest(cloneDir, { maxClicks = 70, reloadEvery = 1
         await p.waitForTimeout(450);
         const after = await p.evaluate(STATE_FN).catch(() => "?");
         const changed = before !== after;
+        // layout-changing clicks (sidebar toggle, dock pane close/collapse, flex
+        // re-wraps) invalidate the remaining enumerated coordinates — re-resolve
+        // them from the live DOM so the next clicks land on the controls, not on
+        // where they used to be. Elements that left the DOM or became hidden are
+        // skipped, not reported dead.
+        if (changed) {
+          const rest = elems.filter((e2) => e2.i > el.i);
+          if (rest.length) {
+            const fresh = await p
+              .evaluate((ids) => {
+                const out = [];
+                for (const id of ids) {
+                  const el2 = document.querySelector(`[data-ex-id="${id}"]`);
+                  if (!el2) continue;
+                  const r = el2.getBoundingClientRect();
+                  const cs = getComputedStyle(el2);
+                  const vis = r.width > 1 && r.height > 1 && r.x >= 0 && r.y >= 0 && r.x < 2000 && r.y < 3000 && cs.display !== "none" && cs.visibility !== "hidden";
+                  out.push({ id, vis, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+                }
+                return out;
+              }, rest.map((e2) => e2.exid))
+              .catch(() => []);
+            const byId = new Map((fresh || []).map((f) => [f.id, f]));
+            for (const e2 of rest) {
+              const f = byId.get(e2.exid);
+              if (f && f.vis) { e2.x = f.x; e2.y = f.y; e2.gone = false; }
+              else e2.gone = true;
+            }
+          }
+        }
         results.total++;
         clickedThisRound++;
         const item = { label: el.label, kind: el.kind, path: el.path, changed, err };

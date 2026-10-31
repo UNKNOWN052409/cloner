@@ -13,6 +13,7 @@ import { cloneUrl } from "../cloneUrl.js";
 import { validatePublicUrl } from "../security/url-guard.js";
 import { loadCookies } from "../browser.js";
 import * as exploration from "./exploration-runner.js";
+import * as wsAuth from "./ws-auth.js";
 import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
 import { exportTask, exportV2Task } from "./exporter.js";
@@ -221,22 +222,85 @@ export function startPlatform({ port = 4180 } = {}) {
   });
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: "/ws" });
+
+  // ---- WebSocket: authenticated upgrade + task-scoped rooms (spec §6/§9) ----
+  // The upgrade validates an optional token (cookie `cloner_session` or
+  // ?token=) against the sessions table. Unauthenticated upgrades are refused
+  // with 401 UNLESS they come from loopback — the local dashboard
+  // (platform-ui) connects with no token and keeps working through the
+  // "legacy" room. Authenticated sockets join their `user:<id>` room instead.
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    verifyClient: (info, cb) => {
+      wsAuth.authenticateUpgrade(info.req).then((identity) => {
+        if (!identity && !wsAuth.isLoopback(info.req.socket?.remoteAddress)) {
+          cb(false, 401, "Unauthorized"); // remote + no valid token → refuse the handshake
+          return;
+        }
+        info.req.wsIdentity = identity; // null for the legacy loopback dashboard
+        cb(true);
+      });
+    },
+  });
   const sockets = new Set();
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, req) => {
+    const identity = req?.wsIdentity || null; // { userId, role, email } | null
+    ws.identity = identity;
+    ws.rooms = new Set();
+    if (identity) ws.rooms.add(`user:${identity.userId}`);
+    else ws.rooms.add("legacy"); // unauthenticated LOCAL only — remote ones never get here
     sockets.add(ws);
-    ws.send(JSON.stringify({ type: "catchup", data: bus.catchUp() }));
+    // catchup replay: unchanged (full ring buffer) for the legacy dashboard;
+    // scoped to tasks the identity may access for authenticated sockets
+    wsAuth.scopedCatchup(bus.catchUp(), identity)
+      .then((data) => { try { ws.send(JSON.stringify({ type: "catchup", data })); } catch {} })
+      .catch(() => {});
     ws.on("close", () => sockets.delete(ws));
     ws.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
-        if (msg.type === "join" && msg.task) ws.taskId = msg.task; // room = task
+        if (msg.type === "join" && msg.task) {
+          if (!identity) { ws.taskId = msg.task; return; } // legacy dashboard: unchanged
+          // authenticated: subscribe only to tasks this identity may access
+          // (defense in depth — the emit-side gate below is authoritative)
+          wsAuth.canAccessTask(msg.task, identity)
+            .then((ok) => { if (ok) ws.taskId = msg.task; })
+            .catch(() => {});
+        }
       } catch {}
     });
   });
-  function broadcast(msg) {
+
+  // Scoped broadcast. Task identity: v1 events carry msg.task; v2 (exploration)
+  // events are tagged inside the wrapped bus payload (data.job) or data.task.
+  // A task event fans out ONLY to sockets authorized for it — the owner's
+  // `user:<id>` room (all authenticated rooms for v2 exploration jobs, which
+  // are per-process and single-tenant) plus the legacy loopback room.
+  // Unknown-owner tasks → legacy room only (fail closed for authenticated
+  // fan-out; the local dashboard is unaffected). Events without a task id
+  // broadcast to everyone, as before.
+  async function broadcast(msg) {
+    let gate = null;
+    try {
+      const taskId = msg?.task || msg?.data?.job || msg?.data?.task || msg?.data?.taskId || null;
+      if (taskId) {
+        if (wsAuth.isExplorationTask(taskId)) {
+          gate = (ws) => ws.rooms.has("legacy") || !!ws.identity;
+        } else {
+          const users = [...new Set([...sockets].filter((s) => s.identity).map((s) => s.identity.userId))];
+          const allowed = await wsAuth.authorizedUserIds(taskId, users);
+          gate = (ws) => ws.rooms.has("legacy") || (ws.identity && allowed.has(ws.identity.userId));
+        }
+      }
+    } catch {
+      gate = (ws) => ws.rooms.has("legacy"); // unexpected failure → legacy room only
+    }
     for (const ws of sockets) {
-      try { if (!ws.taskId || !msg.task || ws.taskId === msg.task) ws.send(JSON.stringify(msg)); } catch {}
+      try {
+        if (gate && !gate(ws)) continue;
+        if (!ws.taskId || !msg.task || ws.taskId === msg.task) ws.send(JSON.stringify(msg));
+      } catch {}
     }
   }
   // engine progress → WS (tagged with the running task) + server-side console
@@ -288,7 +352,8 @@ export function startPlatform({ port = 4180 } = {}) {
   setInterval(() => tasks.sweepExpired(), 3600_000).unref();
 
   return new Promise((resolve) => {
-    server.listen(port, () => resolve({ server, wss, port }));
+    // broadcast is exposed additively so tests can drive the production emit path
+    server.listen(port, () => resolve({ server, wss, port, broadcast }));
   });
 }
 

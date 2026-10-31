@@ -15,8 +15,20 @@ const escHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<"
 // interaction replay records from captured evidence: exploration.json behaviors
 // + states/<pageId>/<recordId>.html captured content. These feed the generated
 // runtime so recorded controls actually replay in the clone (overlay for tN
-// triggers, module panels for mN picker entries — the runtime matches ids and
-// falls back to text signatures after SPA re-renders).
+// triggers, module panels for mN picker entries — the runtime matches ids, then
+// data-replay-id, then structural DOM paths, and falls back to text signatures
+// after SPA re-renders).
+//
+// Every record also carries pageId +, when resolvable, domIndex + path:
+//  - domIndex: the dom.json element whose dataClonerTrigger attr equals the
+//    record id (tN marks are applied BEFORE the DOM extractor runs, so dom.json
+//    carries them). The pipeline turns that into a data-replay-id wiring.
+//  - path: a stable structural path (tag.firstClass:nth-of-type(k) chain) of
+//    that element — the replay runtime recomputes the same path on the live
+//    clone at click time, which disambiguates duplicate/same-text controls that
+//    text signatures cannot. mN entries live INSIDE captured overlay HTML
+//    (marked after the DOM extraction) and never get a domIndex/path; they
+//    replay via their baked-in data-cloner-inner attrs.
 export function deriveInteractionRecords(artifactsDir) {
   const records = [];
   let behaviors = [];
@@ -28,6 +40,19 @@ export function deriveInteractionRecords(artifactsDir) {
   const statesRoot = path.join(artifactsDir, "states");
   let pageDirs = [];
   try { pageDirs = fs.readdirSync(statesRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return records; }
+  // dom.json element list per page, read once (trigger→element mapping + paths)
+  const domByPage = new Map();
+  const pageDom = (pageId) => {
+    if (!domByPage.has(pageId)) {
+      let els = null;
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(artifactsDir, "pages", pageId, "dom.json"), "utf8"));
+        if (raw && Array.isArray(raw.elements)) els = raw.elements;
+      } catch {}
+      domByPage.set(pageId, els);
+    }
+    return domByPage.get(pageId);
+  };
   for (const pageId of pageDirs) {
     let files = [];
     try { files = fs.readdirSync(path.join(statesRoot, pageId)); } catch { continue; }
@@ -40,16 +65,85 @@ export function deriveInteractionRecords(artifactsDir) {
       if (id.startsWith("t")) {
         const b = trigById.get(id);
         if (!b) continue; // no documented behavior for this capture — honest skip
-        records.push({ id, kind: b.opens?.kind || "overlay", text: b.trigger.label || "", html, box: { w: b.opens?.w, h: b.opens?.h } });
+        const rec = { id, kind: b.opens?.kind || "overlay", text: b.trigger.label || "", html, box: { w: b.opens?.w, h: b.opens?.h }, pageId };
+        const els = pageDom(pageId);
+        if (els) {
+          const el = els.find((e) => e && e.dataClonerTrigger === id && typeof e.i === "number");
+          if (el) {
+            rec.domIndex = el.i;
+            const sp = structuralPathFor(els, el.i);
+            if (sp) rec.path = sp;
+          }
+        }
+        records.push(rec);
       } else {
         const h = html.match(/<h[1-4][^>]*>([^<]{1,80})</);
         const text = (h ? h[1] : "").trim();
         const cp = modByText.get(text);
-        records.push({ id, kind: "module", text, html, box: cp ? { w: cp.w, h: cp.h } : {} });
+        records.push({ id, kind: "module", text, html, box: cp ? { w: cp.w, h: cp.h } : {}, pageId });
       }
     }
   }
   return records;
+}
+
+// tags renderNode keeps verbatim (generation/project-generator.js coerces every
+// other tag to <div>) — structural paths must coerce identically or they can
+// never match the clone at replay time
+const RENDER_TAGS = /^(h[1-6]|p|nav|header|footer|main|section|aside|ul|ol|li|form|table|button|a|img|canvas|input|select|label|span|div|article|figure)$/;
+
+// Stable structural path of one dom.json element, mirroring exactly what
+// renderNode emits for it: "tag.firstClass:nth-of-type(k)" segments joined by
+// ">", walked from the tree root down to the element via the captured parent
+// links (the same geometric-containment parents buildComponentTree renders).
+//  - tag is coerced through RENDER_TAGS like renderNode does
+//  - firstClass is the first captured class token — the only one renderNode
+//    keeps (besides its own generator-internal cx-N class, which the replay
+//    runtime skips when recomputing the path on the live clone)
+//  - k is the 1-based position among same-coerced-tag siblings
+//
+// The chain is prefixed with the generator's synthetic page wrapper:
+// reconstructFromArtifacts passes `{ children: [tree] }` to generatePageHtml, so
+// renderNode emits ONE extra rootless <div class="cx-x"> between <body> and the
+// dom.json roots — the replay runtime computes live paths from <body>, so the
+// derived paths must start at that exact wrapper to match.
+export function structuralPathFor(elements, targetIndex) {
+  const byI = new Map();
+  for (const el of elements) if (el && typeof el.i === "number") byI.set(el.i, el);
+  const target = byI.get(targetIndex);
+  if (!target) return null;
+  const parentKey = (el) => {
+    const p = el.parent;
+    return p !== null && p !== undefined && byI.has(p) ? p : "root";
+  };
+  const kids = new Map(); // parentKey → elements in captured (document) order
+  for (const el of byI.values()) {
+    const k = parentKey(el);
+    if (!kids.has(k)) kids.set(k, []);
+    kids.get(k).push(el);
+  }
+  // ancestor chain root→target (cycle-guarded — captured parent links are
+  // heuristic geometric containment, so a bad link must not hang the pipeline)
+  const chain = [];
+  const seen = new Set();
+  for (let cur = target; cur && !seen.has(cur.i); cur = byI.get(cur.parent)) {
+    seen.add(cur.i);
+    chain.unshift(cur);
+  }
+  if (!chain.length) return null;
+  const segs = chain.map((el) => {
+    const tag = RENDER_TAGS.test(el.tag || "") ? el.tag : "div";
+    const sibs = kids.get(parentKey(el)) || [];
+    let k = 0;
+    for (const s of sibs) {
+      if ((RENDER_TAGS.test(s.tag || "") ? s.tag : "div") !== tag) continue;
+      k++;
+      if (s.i === el.i) break;
+    }
+    const cls = String(el.cls || "").trim().split(/\s+/)[0] || "";
+    return tag + (cls ? "." + cls : "") + ":nth-of-type(" + k + ")";
+  });
+  return ["div.cx-x:nth-of-type(1)", ...segs].join(">");
 }
 
 export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords } = {}) {
@@ -78,6 +172,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     if (entry.localPath && entry.url) assetMap.set(entry.url, entry.localPath);
   }
 
+  const fileByPageId = new Map(); // pageId → generated file (for rec.page below)
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     pages = [];
     const allElements = [];
@@ -111,9 +206,16 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
         const hit = assetLookup.get(el.src) || assetLookup.get(el.src.split("?")[0].split("#")[0]);
         if (hit) assetByIndex.set(el.i, hit);
       }
+      // interaction wiring: EVERY record resolved to a dom element (domIndex set
+      // by deriveInteractionRecords) wires its element → data-replay-id. Records
+      // are page-scoped — a page-002 record must never wire a page-001 element
+      // that happens to share the index; records without a pageId (legacy caller
+      // arrays) keep the old apply-everywhere behavior.
       const interactionsByIndex = new Map();
       for (const rec of replayRecords) {
-        if (rec.domIndex !== undefined) interactionsByIndex.set(rec.domIndex, rec.id);
+        if (rec.domIndex === undefined) continue;
+        if (rec.pageId && rec.pageId !== lp.pageId) continue;
+        interactionsByIndex.set(rec.domIndex, rec.id);
       }
       const routeFileMap = new Map(pages.filter((p) => p.file).map((p) => [p.route, p.file]));
       const cssCtx = { routeFileMap, interactionsByIndex, assetByIndex };
@@ -125,6 +227,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
         ? "index.html"
         : (route.replace(/^\//, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_") || lp.pageId) + ".html";
       pages.push({ route, html, file, elements: flat.length });
+      fileByPageId.set(lp.pageId, file);
       allElements.push(...lp.elements);
       logger.info("generate", `${lp.pageId}: ${flat.length} components, file: ${file}`);
     }
@@ -149,6 +252,14 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     }
     componentsCssText = buildComponentCss(allElements, layoutByIndex);
     layoutCssText = buildLayoutCss(allElements.slice(0, 5), layoutByIndex);
+
+    // annotate replay records with the generated file of their page — the
+    // runtime's structural matcher uses rec.page so a record from one page can
+    // never satisfy a click on another page that happens to contain the same
+    // structure at the same path
+    for (const rec of replayRecords) {
+      if (rec.pageId && fileByPageId.has(rec.pageId)) rec.page = fileByPageId.get(rec.pageId);
+    }
 
     // generate the project (copies assets, writes pages + CSS + runtime)
     const routeFileMap = new Map(pages.filter((p) => p.file).map((p) => [p.route, p.file]));

@@ -76,6 +76,13 @@ function renderNode(node, cssCtx, depth) {
   }
   if (node.tag === "input" && node.ariaName) attrs += ` placeholder="${esc(node.ariaName)}"`;
   if (node.dataClonerTrigger) attrs += ` data-cloner-trigger="${esc(node.dataClonerTrigger)}"`;
+  // interaction wiring: the pipeline's interactionsByIndex maps EVERY captured
+  // record resolved to a dom element (page-scoped) → its record id, so every
+  // wired element gets data-replay-id — the runtime's second match layer after
+  // the capture-time data-cloner-trigger attr. mN picker entries are marked
+  // INSIDE captured overlay HTML after the DOM extraction, so they cannot be
+  // wired here; their data-cloner-inner attrs are baked into the record html
+  // and the runtime also falls back to structural paths for page elements.
   const wire = cssCtx.interactionsByIndex.get(node._elementIndex);
   if (wire) attrs += ` data-replay-id="${esc(wire)}"`;
   const indent = "  ".repeat(depth);

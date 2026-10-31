@@ -1,5 +1,9 @@
 // Build the interaction-replay runtime script for a clone.
-// records: [{ id, kind: "overlay"|"module", text, html, box }]
+// records: [{ id, kind: "overlay"|"module", text, html, box,
+//             pageId?, domIndex?, path?, page? }] — pageId/domIndex are
+// reconstruction bookkeeping; path (structural DOM path of the recorded
+// element) and page (generated file of its page) drive the runtime's exact
+// element matching, with the text signature kept as last resort.
 export function buildRuntime(interactions) {
   return (
     "window.__CLONER_INTERACTIONS = " +
@@ -13,8 +17,13 @@ const IIFE = String.raw`(function () {
   var DATA = window.__CLONER_INTERACTIONS || [];
   var byId = {};
   var bySig = [];
+  var pathMap = {}; // structural path → record (reconstruction derives rec.path)
   for (var i = 0; i < DATA.length; i++) {
     byId[DATA[i].id] = DATA[i];
+    // structural path map: rec.path identifies the EXACT recorded element in the
+    // clone ("tag.firstClass:nth-of-type(k)" chain) — resolves duplicate/same-text
+    // controls that attribute and text matching cannot tell apart
+    if (DATA[i].path && !pathMap[DATA[i].path]) pathMap[DATA[i].path] = DATA[i];
     // signature fallback: after a SPA re-render the data-cloner-* ids can vanish;
     // match by stable signature (text/label/class) instead of losing the record
     var sig = (DATA[i].text || "").trim().toLowerCase();
@@ -23,14 +32,78 @@ const IIFE = String.raw`(function () {
   var openOverlay = null;
   var openModules = [];
 
-  // walk up from the click target: page triggers (tN/mN) by attribute, then by
-  // text signature (stable across re-renders)
+  // elements the runtime itself inserted (replayed overlays/modules) are never
+  // part of a structural page path — counting them would shift nth-of-type
+  function isReplayUi(n) {
+    return !!(n.getAttribute && (n.getAttribute("data-cloner-overlay") || n.getAttribute("data-cloner-module")));
+  }
+  // stable structural path of el: tag.firstClass:nth-of-type(k) chain up to
+  // body — the mirror of structuralPathFor() in the reconstruction pipeline.
+  // The clone keeps only the first captured class plus the generator's cx-N,
+  // so cx-* tokens are skipped when picking the class. Returns null when el
+  // sits inside replay UI (no page path exists there).
+  function domPath(el) {
+    var parts = [];
+    var node = el;
+    var guard = 0;
+    while (node && node.tagName && node !== document.body && guard < 24) {
+      guard++;
+      if (isReplayUi(node)) return null;
+      var tag = node.tagName.toLowerCase();
+      var cls = "";
+      var cl = node.classList;
+      if (cl) {
+        for (var ci = 0; ci < cl.length; ci++) {
+          if (!/^cx-\d+$/.test(cl[ci])) { cls = cl[ci]; break; }
+        }
+      }
+      var k = 0;
+      var par = node.parentElement;
+      var sib = par ? par.children : [];
+      for (var si = 0; si < sib.length; si++) {
+        var s = sib[si];
+        if (!s.tagName || s.tagName !== node.tagName) continue;
+        if (s !== node && isReplayUi(s)) continue;
+        k++;
+        if (s === node) break;
+      }
+      parts.unshift(tag + (cls ? "." + cls : "") + ":nth-of-type(" + k + ")");
+      node = par;
+    }
+    return parts.length ? parts.join(">") : null;
+  }
+  // structural records annotated with rec.page (their generated file) must
+  // belong to the page this runtime is serving — two pages can contain the
+  // same structure at the same path
+  function pageMatches(rec) {
+    if (!rec.page) return true;
+    var cur = String((location.pathname || "").split("/").pop() || "index.html");
+    if (cur && cur.indexOf(".") < 0) cur += ".html";
+    return rec.page === cur;
+  }
+
+  // walk up from the click target, in priority order:
+  //  1. attribute match — page triggers (tN) + overlay-inner entries (mN)
+  //  2. data-replay-id — emitted by the generator for every wired element
+  //     (survives capture-attr pruning / re-renders)
+  //  3. structural DOM path — exact element identity (rec.path)
+  //  4. text signature — LAST resort (stable across re-renders, but ambiguous
+  //     on duplicate controls)
   function findRec(target) {
     var node = target;
     while (node && node.getAttribute) {
       var id = node.getAttribute && (node.getAttribute("data-cloner-trigger") || node.getAttribute("data-cloner-inner"));
       if (id && byId[id]) return byId[id];
+      var rid = node.getAttribute && node.getAttribute("data-replay-id");
+      if (rid && byId[rid]) return byId[rid];
       node = node.parentNode;
+    }
+    var snode = target;
+    for (var sp = 0; snode && snode.tagName && sp < 16; sp++) {
+      if (isReplayUi(snode)) break; // clicked inside a replayed overlay/module
+      var p = domPath(snode);
+      if (p && pathMap[p] && pageMatches(pathMap[p])) return pathMap[p];
+      snode = snode.parentElement;
     }
     var el = target && target.closest ? target : null;
     for (var j = 0; el && j < 4; j++) {

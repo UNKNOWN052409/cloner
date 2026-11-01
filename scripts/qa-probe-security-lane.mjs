@@ -176,6 +176,30 @@ const traversalProbe = async (label, p) => {
 };
 await traversalProbe("GET /api/tasks/<traversal> → 4xx", "/api/tasks/..%2f..%2fbackups");
 await traversalProbe("GET /api/export/<traversal>/download → 4xx", "/api/export/..%2f..%2fsecret/download");
+await traversalProbe("GET /preview/<traversal>/<file> → 4xx", "/preview/..%2f..%2f/package.json/x.html");
+await traversalProbe("GET /api/jobs/<traversal> → 4xx", "/api/jobs/..%2f..%2fbackups");
+await traversalProbe("GET /api/jobs/<traversal>/artifacts/manifest.json → 4xx", "/api/jobs/..%2f..%2fbackups/artifacts/manifest.json");
+// nonexistent job: no existence leak for anon + foreign callers; a GARBAGE
+// credential must 401 at the auth layer (documented: "once a credential IS
+// presented it is enforced fully") before any resource check
+{
+  const missing = "lane3-no-such-job";
+  for (const [hdr, who, want] of [[{}, "anon", 404], [A, "foreign", 404], [BAD, "garbage-bearer", 401]]) {
+    const r1 = await api(platform, "GET", `/api/jobs/${missing}`, { headers: hdr });
+    const r2 = await api(platform, "GET", `/api/jobs/${missing}/artifacts/manifest.json`, { headers: hdr });
+    check(`${who} GET /api/jobs/<missing> → ${want}`, r1.status === want, `got ${r1.status}`);
+    check(`${who} GET /api/jobs/<missing>/artifacts → ${want}`, r2.status === want, `got ${r2.status}`);
+  }
+  const rj = await api(platform, "GET", "/api/jobs", { headers: BAD });
+  check("garbage-bearer GET /api/jobs → 401", rj.status === 401, `got ${rj.status}`);
+}
+// auth routes: garbage input must 4xx (never 500)
+{
+  const reg = await api(platform, "POST", "/api/auth/register", { body: { email: "not-an-email", password: "x" } });
+  check("register garbage input → 4xx", reg.status >= 400 && reg.status < 500, `got ${reg.status}`);
+  const log = await api(platform, "POST", "/api/auth/login", { body: { email: "lane3-nope@example.invalid", password: "wrong" } });
+  check("login unknown user → 401 (no existence leak)", log.status === 401, `got ${log.status}`);
+}
 {
   // DESTRUCTIVE probe: traversal DELETE must not delete a real sibling dir.
   // Target a throwaway directory OUTSIDE platform-data via ../ from ROOT.
@@ -229,26 +253,32 @@ if (got429) {
 const bypass1 = await api(platform, "POST", "/api/tasks", { body: { url: "http://127.0.0.1:2/nope", pipeline: "v2" }, headers: K });
 check("crafted variant request still 429 (same key)", bypass1.status === 429, `got ${bypass1.status}`);
 
-// quota: reserve a slot for victim's user scope directly (simulates a running
-// job), then a Bearer POST /api/tasks must hit the concurrent limit (429)
+// quota: FRESH user (the API-key burst above already consumed victim's daily
+// job slots through the quota guard — by design, each crafted POST reserves
+// then releases). ORDER MATTERS: the daily test first (reserving a slot bumps
+// jobs_started), then the concurrent-hold test.
+const quotaUser = await makeUser("quota");
+const Q = { Authorization: `Bearer ${quotaUser.token}` };
 const { resolveScope, reserveJobSlot, releaseReservation, setQuotaLimit } = await import("../src/platform/quota-service.js");
-const vScope = resolveScope({ userId: victim.userId });
-await setQuotaLimit(vScope, "max_concurrent_jobs", 1);
-const heldKey = `lane3-held-${Date.now()}`;
-const held = await reserveJobSlot(vScope, heldKey, { userId: victim.userId });
-check("direct reserveJobSlot holds the slot", !!held.reservationId);
-const qHit = await api(platform, "POST", "/api/tasks", { body: { url: "https://example.com/lane3" }, headers: V });
-check("held concurrent slot → POST /api/tasks 429 concurrent_job_limit", qHit.status === 429 && qHit.json?.reason === "concurrent_job_limit", `got ${qHit.status} ${JSON.stringify(qHit.json?.reason || "")}`);
-await releaseReservation(vScope, heldKey, { userId: victim.userId, outcome: "cancelled" });
+const vScope = resolveScope({ userId: quotaUser.userId });
 
-// daily limit: set jobs/day=1, burn the day's slot with reserve+release, next POST → 402
+// daily limit: jobs/day=1, burn the day's slot with reserve+release, next POST → 402
 await setQuotaLimit(vScope, "max_jobs_per_day", 1);
 const k1 = `lane3-daily-${Date.now()}`;
-await reserveJobSlot(vScope, k1, { userId: victim.userId });
-await releaseReservation(vScope, k1, { userId: victim.userId, outcome: "failed" });
-const dailyHit = await api(platform, "POST", "/api/tasks", { body: { url: "https://example.com/lane3" }, headers: V });
+await reserveJobSlot(vScope, k1, { userId: quotaUser.userId });
+await releaseReservation(vScope, k1, { userId: quotaUser.userId, outcome: "failed" });
+const dailyHit = await api(platform, "POST", "/api/tasks", { body: { url: "https://example.com/lane3" }, headers: Q });
 check("daily quota exhausted → POST /api/tasks 402 daily_job_limit", dailyHit.status === 402 && dailyHit.json?.reason === "daily_job_limit", `got ${dailyHit.status} ${JSON.stringify(dailyHit.json?.reason || "")}`);
-await setQuotaLimit(vScope, "max_jobs_per_day", null); // unlimited again for other lanes
+await setQuotaLimit(vScope, "max_jobs_per_day", null); // unlimited again
+
+// concurrent limit: hold the only slot (simulates a running job), HTTP POST → 429
+await setQuotaLimit(vScope, "max_concurrent_jobs", 1);
+const heldKey = `lane3-held-${Date.now()}`;
+const held = await reserveJobSlot(vScope, heldKey, { userId: quotaUser.userId });
+check("direct reserveJobSlot holds the slot", !!held.reservationId);
+const qHit = await api(platform, "POST", "/api/tasks", { body: { url: "https://example.com/lane3" }, headers: Q });
+check("held concurrent slot → POST /api/tasks 429 concurrent_job_limit", qHit.status === 429 && qHit.json?.reason === "concurrent_job_limit", `got ${qHit.status} ${JSON.stringify(qHit.json?.reason || "")}`);
+await releaseReservation(vScope, heldKey, { userId: quotaUser.userId, outcome: "cancelled" });
 await setQuotaLimit(vScope, "max_concurrent_jobs", null);
 
 // anonymous quota bypass probe (documented posture): anonymous POST must NOT

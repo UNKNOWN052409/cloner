@@ -576,7 +576,13 @@ export function startPlatform({ port = 4180 } = {}) {
   const at = () => `+${((Date.now() - T0) / 1000).toFixed(1)}s`;
   for (const evt of ["step", "log", "tabs:found", "assets:progress", "assets:done", "page:goto", "run:done", "run:error", "polish:round"]) {
     bus.on(evt, (e) => {
-      broadcast({ type: evt, task: currentTaskId || null, data: e });
+      // 4.0.12 QA fix: the event's OWN job tag wins over the shared v1
+      // currentTaskId global — a stale v1 id (set by the last legacy runTask)
+      // used to hijack attribution of every later bus emission, breaking
+      // delivery of correctly-tagged v2 org-job events (fail-closed, but the
+      // owner got nothing). v1 engine emissions carry no tag (null) and fall
+      // back to currentTaskId, exactly as before.
+      broadcast({ type: evt, task: e?.job || currentTaskId || null, data: e });
       // events.js wraps payloads as {type, data, t} — read from e.data
       const d = e?.data || {};
       if (evt === "step") console.log(`[${at()}][${currentTaskId || "-"}] ${d.status || ""} ${d.msg || d.id || ""}`);

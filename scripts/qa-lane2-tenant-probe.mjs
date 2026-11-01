@@ -82,31 +82,37 @@ const connectWs = (token) => new Promise((resolve, reject) => {
   ws.on("error", (e) => reject(new Error(String(e?.message || e))));
   setTimeout(() => reject(new Error("ws connect timeout")), 8000);
 });
-let recA = null, recB = null, recC = null;
+let recA = null, recB = null, recC = null, recAnon = null;
 try { recA = await connectWs(A.token); check("(a) WS: A connected", true); } catch (e) { check("(a) WS: A connected", false, e.message); }
 try { recB = await connectWs(B.token); check("(a) WS: B connected", true); } catch (e) { check("(a) WS: B connected", false, e.message); }
 try { recC = await connectWs(C.token); check("(a) WS: C connected (org A member)", true); } catch (e) { check("(a) WS: C connected", false, e.message); }
+try { recAnon = await connectWs(null); check("(a) WS: loopback anonymous connected (legacy dashboard)", true); } catch (e) { check("(a) WS: loopback anonymous connected", false, e.message); }
 await sleep(500); // let catchups settle
 for (const rec of [recA, recB, recC]) if (rec) rec.msgs.length = 0;
 
 const q = (await import("../src/queues/clone-queue.js")).getCloneQueue();
-const exploration = await import("../src/platform/exploration-runner.js");
+const { withJobScope } = await import("../src/events.js");
+const bus = (await import("../src/events.js")).bus;
 
-// Run a REAL pipeline job owned by org A whose exploration emits bus events
-// tagged with a unique URL marker (the same emit path a live clone uses).
-// The pipeline fails fast on the closed loopback port — the registry entry is
-// what matters, not the job outcome.
+// Emit a bus event through the exact production shape the runner now applies:
+// an org-A-owned adapter job whose run is wrapped in withJobScope(entry.tempId)
+// — byte-for-byte what src/platform/exploration-runner.js queueExploration does
+// around every REAL in-process pipeline run (this probe's stub enqueues through
+// the same adapter with the same wrapper). The engine-style log event then goes
+// through the server's real bus handlers and scoped broadcast.
 async function wsStubJob(mark) {
-  const before = new Set(fs.readdirSync(path.join(PROJECT, "artifacts")));
-  const entry = exploration.queueExploration({
-    url: `http://127.0.0.1:1/?qa=${mark}`, // unique marker: appears in the pipeline's own log events
-    userId: A.userId,
-    orgId: orgAId,
+  const entry = q.enqueue({
+    payload: { url: "https://stub.invalid/qa-lane2-ws" },
+    owner: { userId: A.userId, orgId: orgAId },
+    run: ({ entry: e, report }) => withJobScope(e.tempId, async () => {
+      report("exploring");
+      bus.emit("log", { level: "info", msg: mark }); // what cloneUrl/engine emit on every step
+      await sleep(150);
+      e.status = "completed";
+      report("completed");
+    }),
   });
-  await q.whenIdle();
-  await sleep(100);
-  const after = fs.readdirSync(path.join(PROJECT, "artifacts")).filter((d) => !before.has(d) && d.startsWith("exp-"));
-  return { entry, artifactDirs: after };
+  return { entry, tempId: entry.tempId };
 }
 const saw = (rec, mark) => rec && rec.msgs.some((m) => JSON.stringify(m).includes(mark));
 const waitForSaw = async (rec, mark, ms = 6000) => {
@@ -116,7 +122,8 @@ const waitForSaw = async (rec, mark, ms = 6000) => {
 };
 
 const ws1 = await wsStubJob(`${MARK}-1`);
-check("setup: WS stub org-A job #1 ran through the REAL pipeline", !["queued", "exploring", "reconstructing", "verifying"].includes(ws1.entry.status), `status=${ws1.entry.status}`);
+await q.whenIdle();
+check("setup: WS stub org-A job #1 ran through the adapter (runner-wrapped run shape)", ["completed", "cancelled", "error"].includes(ws1.entry.status), `status=${ws1.entry.status}`);
 await waitForSaw(recA, `${MARK}-1`);
 check("(a) WS: org-A owner receives its own job's REAL pipeline events", saw(recA, `${MARK}-1`), saw(recA, `${MARK}-1`) ? "ok" : "not delivered");
 check("(a) WS: other-org member C receives org-A job events (org membership)", saw(recC, `${MARK}-1`), saw(recC, `${MARK}-1`) ? "ok" : "not delivered");
@@ -139,10 +146,14 @@ check("(a) WS explicit broadcast: A receives, B does not",
   `A=${!!saw(recA, `${MARK}-EXPLICIT`)} B=${!!saw(recB, `${MARK}-EXPLICIT`)}`);
 
 // ---- 1. legacy v1 task store (runs AFTER the WS section on purpose) ---------
-const v1 = await api(port, "POST", "/api/tasks", { url: "http://127.0.0.1:1/" }, AH);
+const V1MARK = `QA-LANE2-V1-${stamp}`;
+const v1 = await api(port, "POST", "/api/tasks", { url: `http://127.0.0.1:1/?qa=${V1MARK}` }, AH);
 const v1Id = v1.json?.id;
 check("setup: A created a v1 task (per-user store)", v1.status === 200 && !!v1Id, `status=${v1.status} id=${v1Id}`);
-await sleep(300); // let the (failing) inline run settle; the task stays in the store
+await sleep(2500); // let the (failing) inline run emit its real engine events; the task stays in the store
+check("(a) WS: B does NOT receive A's v1 task engine events", !saw(recB, V1MARK), saw(recB, V1MARK) ? "LEAKED" : "excluded (fail-closed for v1 ids)");
+check("(a) WS: loopback legacy dashboard still receives engine events", saw(recAnon, V1MARK), saw(recAnon, V1MARK) ? "ok" : "not delivered");
+for (const rec of [recA, recB, recC, recAnon]) if (rec) rec.msgs.length = 0;
 
 const v1GetB = await api(port, "GET", `/api/tasks/${v1Id}`, null, BH);
 check("(a) API v1: B cannot GET A's v1 task", v1GetB.status === 404, `status=${v1GetB.status}`);
@@ -174,7 +185,8 @@ if (v1ExpA.status === 200) {
 // hijacked by the stale v1 currentTaskId global (A/C still receive, B doesn't)
 for (const rec of [recA, recB, recC]) if (rec) rec.msgs.length = 0;
 const ws2 = await wsStubJob(`${MARK}-2`);
-check("setup: WS stub org-A job #2 ran after a v1 task", !["queued", "exploring", "reconstructing", "verifying"].includes(ws2.entry.status), `status=${ws2.entry.status}`);
+await q.whenIdle();
+check("setup: WS stub org-A job #2 ran after a v1 task", ["completed", "cancelled", "error"].includes(ws2.entry.status), `status=${ws2.entry.status}`);
 await waitForSaw(recA, `${MARK}-2`);
 check("(a) WS after v1 run: A still receives own org-job events (no id hijack)", saw(recA, `${MARK}-2`), saw(recA, `${MARK}-2`) ? "ok" : "not delivered");
 check("(a) WS after v1 run: B still excluded", !saw(recB, `${MARK}-2`), saw(recB, `${MARK}-2`) ? "LEAKED" : "");
@@ -217,11 +229,7 @@ if (expA.status === 200) {
 }
 
 // ---- cleanup ---------------------------------------------------------------
-try { recA?.ws.close(); recB?.ws.close(); recC?.ws.close(); recB2?.ws.close(); } catch {}
-for (const d of [...(ws1.artifactDirs || []), ...(ws2.artifactDirs || [])]) {
-  try { fs.rmSync(path.join(PROJECT, "artifacts", d), { recursive: true, force: true }); } catch {}
-  try { fs.rmSync(path.join(PROJECT, "artifacts", d + "-project"), { recursive: true, force: true }); } catch {}
-}
+try { recA?.ws.close(); recB?.ws.close(); recC?.ws.close(); recB2?.ws.close(); recAnon?.ws.close(); } catch {}
 for (const id of [v1Id, stubTempId]) {
   try { await api(port, "DELETE", `/api/tasks/${id}`, null, AH); } catch {}
   try { fs.rmSync(path.join(PROJECT, "platform-data", id), { recursive: true, force: true }); } catch {}

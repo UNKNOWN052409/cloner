@@ -55,7 +55,7 @@ check("pages explored >= 3", manifest.pages.length >= 3, manifest.pages.map((p) 
 check("states recorded (graph nodes >= pages + modal/tab)", manifest.discoveredStates >= 5, manifest.discoveredStates + " states");
 check("interactions recorded (edges >= 3)", manifest.discoveredInteractions >= 3, manifest.discoveredInteractions + " edges");
 check("manifest schemaVersion", manifest.schemaVersion === "1.0.0", manifest.schemaVersion);
-check("no credentials in manifest", !JSON.stringify(manifest).match(/"password"|qo2w|sk-[a-z0-9]{20}/i), "redacted/clean");
+check("no credentials in manifest", !JSON.stringify(manifest).match(/"password"|ZZCRED-FRAGMENT|sk-[a-z0-9]{20}/i), "redacted/clean");
 check("coverage report exists", fs.existsSync(path.join(artifactsDir, "reports", "coverage-report.json")));
 check("graph files exist", ["routes.json", "states.json", "transitions.json"].every((f) => fs.existsSync(path.join(artifactsDir, "graph", f))));
 check("page-1 dom.json exists", fs.existsSync(path.join(artifactsDir, "pages", "page-001", "dom.json")));

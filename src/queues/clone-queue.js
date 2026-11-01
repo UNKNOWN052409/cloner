@@ -22,6 +22,12 @@ import { EventEmitter } from "node:events";
 
 export const QUEUE_NAME = "clone-jobs";
 
+// dead-letter queue (task 4.0.3): jobs that exhaust every attempt land here on
+// the bullmq backend (same Redis, own queue) so operators can inspect/replay
+// them; the memory backend records the same shape in the in-memory
+// `deadLetter` list (see listDeadLetter()).
+export const DLQ_NAME = QUEUE_NAME + "-dead";
+
 // total attempts per job (1 initial + 2 retries with exponential backoff)
 export const JOB_ATTEMPTS = 3;
 
@@ -71,6 +77,8 @@ class CloneQueue extends EventEmitter {
     retryBackoffMs = defaultRetryBackoff(),
     redisUrl = resolveRedisUrl(),
     queueName = QUEUE_NAME,
+    deadLetterCapacity = 100,
+    bullmqFactory = null,
   } = {}) {
     super();
     this.setMaxListeners(100);
@@ -79,9 +87,16 @@ class CloneQueue extends EventEmitter {
     this.retryBackoffMs = retryBackoffMs;
     this.redisUrl = redisUrl;
     this.queueName = queueName;
+    // test-only injection hook (task 4.0.3): replaces #connectBullmq with a
+    // factory returning { connection, eventsConnection, queue, dlq, events }
+    // so tests can drive the REAL bullmq dispatch/QueueEvents code path over a
+    // local mock transport (null = the real ioredis+bullmq connection)
+    this.bullmqFactory = bullmqFactory;
     this.backend = "memory"; // provisional until the (async) Redis probe settles
     this.entries = new Map(); // key (tempId | jobId) → entry — the registry the API polls
     this.aliases = new Map(); // tempId → jobId (clients poll the temp handle)
+    this.deadLetterCapacity = deadLetterCapacity;
+    this.deadLetter = []; // memory-backend dead letters (bounded; newest last)
     this.#mem = { running: new Set(), pending: [] };
     this.#idleWaiters = [];
     this.#pendingDispatch = [];
@@ -103,8 +118,19 @@ class CloneQueue extends EventEmitter {
 
   // ---- enqueue (synchronous entry creation, buffered dispatch) ----
 
-  enqueue({ payload = {}, run = null, jobId = null } = {}) {
-    const entry = this.#createEntry(payload, jobId);
+  enqueue({ payload = {}, run = null, jobId = null, owner = null } = {}) {
+    // idempotent duplicate-submission guard (plan 4.0.3 step 6): the SAME
+    // explicit jobId resubmitted while an entry already exists returns THAT
+    // entry — no second entry, no second dispatch, no double execution. Both
+    // the memory and the bullmq backend take the guard (bullmq itself ignores
+    // same-id adds while the first job is active, but the registry would
+    // otherwise grow a second, forever-"queued" entry).
+    if (jobId && this.entries.has(jobId)) {
+      const existing = this.entries.get(jobId);
+      existing.history?.push({ at: nowIso(), event: "duplicate submission ignored (idempotent enqueue)" });
+      return existing;
+    }
+    const entry = this.#createEntry(payload, jobId, owner);
     const dispatch = { payload, run, jobId: entry.jobId || null, entry };
     this.#statusEvent(entry, "queued");
     if (!this.#resolvedFlag) this.#pendingDispatch.push(dispatch);
@@ -114,8 +140,12 @@ class CloneQueue extends EventEmitter {
 
   #resolvedFlag = false;
 
-  #createEntry(payload, jobId) {
-    // entry shape carried over verbatim from exploration-runner.queueExploration
+  #createEntry(payload, jobId, owner = null) {
+    // entry shape carried over verbatim from exploration-runner.queueExploration.
+    // `owner` (4.0.12 quality gate): { userId, orgId } — established by the
+    // API layer that accepted the request, so every read surface (task list,
+    // task detail, artifacts, export, WS fan-out) can gate on it. null means
+    // legacy/anonymous (local dashboard), which keeps the pre-Phase-4 posture.
     const tempId = "pending-" + Date.now().toString(36);
     const entry = {
       tempId,
@@ -126,6 +156,7 @@ class CloneQueue extends EventEmitter {
       sessionId: payload.sessionId !== undefined ? payload.sessionId : "local",
       credentialsProvided: !!(payload.username && payload.password),
       hasCookies: !!payload.cookies,
+      owner: owner && (owner.userId || owner.orgId) ? { userId: owner.userId || null, orgId: owner.orgId || null } : null,
       history: [],
     };
     this.entries.set(tempId, entry);
@@ -143,8 +174,16 @@ class CloneQueue extends EventEmitter {
       // The job id is decided HERE (producer side) so the job data can carry it
       // and QueueEvents map back onto the registry entry.
       if (!d.jobId) this.#attachJobId(d);
+      // task metadata rides in the job data (plan 4.0.3 step 3: task id, user
+      // id, tenant id) — the worker uses meta.taskId to persist progress into
+      // task_stages; all optional, absent payloads simply carry undefined
+      const meta = {
+        taskId: d.payload?.taskId ?? null,
+        userId: d.payload?.userId ?? null,
+        tenantId: d.payload?.tenantId ?? null,
+      };
       this.#bull.queue
-        .add("clone", { payload: d.payload, jobId: d.jobId }, {
+        .add("clone", { payload: d.payload, jobId: d.jobId, meta }, {
           jobId: d.jobId,
           attempts: JOB_ATTEMPTS, // exponential backoff; the worker classifies transient errors
           backoff: { type: "exponential", delay: this.retryBackoffMs },
@@ -173,7 +212,12 @@ class CloneQueue extends EventEmitter {
 
   #memDispatch(d) {
     const mem = this.#mem;
+    // duplicate-execution guard (plan 4.0.3 steps 6+10): an entry may only be
+    // dispatched once while it is still "queued" — a replayed dispatch (or a
+    // cancelled entry) can never start a second execution
+    if (d.entry.status !== "queued") return;
     const start = () => {
+      if (d.entry.status === "cancelled") { this.#memDone(d.entry); return; } // cancelled while queued
       const report = (status, data) => this.#statusEvent(d.entry, status, data);
       let p;
       try {
@@ -187,7 +231,20 @@ class CloneQueue extends EventEmitter {
       }
       Promise.resolve(p)
         .catch((e) => this.#fail(d.entry, String(e?.message || e)))
-        .finally(() => this.#memDone(d.entry));
+        .finally(() => {
+          // cancel wins over whatever the run closure set afterwards: a job
+          // cancelled mid-run stays "cancelled" instead of flipping back to
+          // completed/error when the underlying pipeline finishes
+          if (d.entry.cancelRequested) {
+            d.entry.status = "cancelled";
+            d.entry.finishedAt = d.entry.finishedAt || nowIso();
+            delete d.entry.error; // an intentional cancel is not an error
+            // an intentional cancel must not sit in the dead-letter list
+            const key = d.entry.jobId || d.entry.tempId;
+            this.deadLetter = this.deadLetter.filter((x) => x.jobId !== key);
+          }
+          this.#memDone(d.entry);
+        });
     };
     if (mem.running.size < this.maxConcurrent) {
       mem.running.add(d.entry);
@@ -226,11 +283,33 @@ class CloneQueue extends EventEmitter {
   // ---- failure handling + 30-min failed-job eviction (short-circuitable for tests) ----
 
   #fail(entry, error) {
+    // a cancelled job must not flip back to "error" if its underlying run
+    // later throws (memory path) or reports a failure (QueueEvents path)
+    if (entry.status === "cancelled") return;
     entry.status = "error";
     entry.error = String(error).slice(0, 300);
     entry.history?.push({ at: nowIso(), event: "failed: " + entry.error });
+    this.#recordDeadLetter(entry, entry.error);
     this.#statusEvent(entry, "error", { error: entry.error });
     this.#scheduleEviction(entry);
+  }
+
+  // dead-letter bookkeeping for the memory backend (bounded, newest last) —
+  // the bullmq backend additionally copies the job into the "-dead" Redis
+  // queue (see #attachQueueEvents). Both paths feed the same shape:
+  // { jobId, url, error, failedAt }
+  #recordDeadLetter(entry, error) {
+    this.deadLetter.push({
+      jobId: entry.jobId || entry.tempId,
+      url: entry.url,
+      error: String(error).slice(0, 300),
+      failedAt: nowIso(),
+    });
+    while (this.deadLetter.length > this.deadLetterCapacity) this.deadLetter.shift();
+  }
+
+  listDeadLetter() {
+    return this.deadLetter.slice();
   }
 
   #scheduleEviction(entry) {
@@ -272,6 +351,7 @@ class CloneQueue extends EventEmitter {
     for (const e of this.entries.values()) {
       if (seen.has(e)) continue; // same entry keyed under tempId + jobId
       seen.add(e);
+      // `owner` is INTERNAL access metadata — never shipped to API clients
       out.push({ jobId: e.jobId || e.tempId, url: e.url, status: e.status, queuedAt: e.queuedAt, finishedAt: e.finishedAt });
     }
     return out;
@@ -296,6 +376,56 @@ class CloneQueue extends EventEmitter {
     }
   }
 
+  // ---- cancellation (plan 4.0.3: task cancellation) ----
+  //
+  // Contract expected by src/platform/admin-service.js createQueueAdapter:
+  // once the queue grows cancel(), the admin adapter delegates to it. Returns
+  // true when a non-terminal entry was cancelled, false otherwise.
+  //
+  //   • memory path: a PENDING job is removed from the FIFO queue and never
+  //     executes; a RUNNING job is flagged — the pipeline finishes naturally
+  //     (no unsafe browser teardown) but the entry stays "cancelled" and its
+  //     late completion/failure events can no longer overwrite that state.
+  //   • bullmq path: a WAITING job is removed from the Redis queue (never
+  //     executes); an ACTIVE job is flagged the same way — its worker-side
+  //     completion event keeps arriving but cannot overwrite "cancelled".
+  async cancel(jobId) {
+    const entry = this.getEntry(jobId);
+    if (!entry) return false;
+    if (["completed", "completed_with_limitations", "error", "cancelled"].includes(entry.status)) return false;
+    entry.cancelRequested = true;
+
+    if (this.backend === "bullmq" && this.#bull) {
+      try {
+        const job = await this.#bull.queue.getJob(entry.jobId || jobId);
+        if (job) {
+          const state = await job.getState().catch(() => null);
+          if (state === "waiting" || state === "delayed") await job.remove().catch(() => {});
+          // active/completed jobs cannot be force-removed by the producer —
+          // the registry flip below is the source of truth for the API
+        }
+      } catch {}
+    } else {
+      // pending FIFO entry → drop it so it never starts
+      const idx = this.#mem.pending.findIndex((p) => p.entry === entry);
+      if (idx >= 0) {
+        const [removed] = this.#mem.pending.splice(idx, 1);
+        removed.entry.status = "cancelled";
+        removed.entry.finishedAt = nowIso();
+        removed.entry.history?.push({ at: nowIso(), event: "cancelled before start" });
+        this.#statusEvent(removed.entry, "cancelled", { reason: "cancel" });
+        this.#memDone(removed.entry); // frees waiters if the queue is now empty
+        return true;
+      }
+    }
+
+    entry.status = "cancelled";
+    entry.finishedAt = entry.finishedAt || nowIso();
+    entry.history?.push({ at: nowIso(), event: "cancelled" });
+    this.#statusEvent(entry, "cancelled", { reason: "cancel" });
+    return true;
+  }
+
   // ---- backend resolution (BullMQ probe, buffered replay) ----
 
   async #resolveBackend() {
@@ -306,7 +436,9 @@ class CloneQueue extends EventEmitter {
     }
     let bull = null;
     try {
-      bull = await this.#connectBullmq();
+      bull = this.bullmqFactory
+        ? await this.bullmqFactory(this.redisUrl, this.queueName)
+        : await this.#connectBullmq();
     } catch (e) {
       console.warn(`[clone-queue] redis unreachable (${e?.code || e?.message || e}) — falling back to in-process queue`);
     }
@@ -353,9 +485,12 @@ class CloneQueue extends EventEmitter {
       throw e;
     }
     const queue = new bullmq.Queue(this.queueName, { connection });
+    // dead-letter queue shares the plain (non-blocking) queue connection —
+    // Queues never issue blocking commands, so sharing is safe
+    const dlq = new bullmq.Queue(DLQ_NAME, { connection });
     const events = new bullmq.QueueEvents(this.queueName, { connection: eventsConnection });
     await (events.waitUntilReady?.() ?? Promise.resolve());
-    return { connection, eventsConnection, queue, events, bullmq };
+    return { connection, eventsConnection, queue, dlq, events, bullmq };
   }
 
   // producer-side status sync: worker-side progress lands on the local registry
@@ -363,6 +498,7 @@ class CloneQueue extends EventEmitter {
     events.on("active", ({ jobId }) => {
       const entry = this.entries.get(jobId);
       if (!entry) return;
+      if (entry.status === "cancelled") return; // cancel wins even if the job is picked up later
       entry.status = "exploring";
       entry.startedAt = nowIso();
       this.#statusEvent(entry, "exploring");
@@ -379,6 +515,7 @@ class CloneQueue extends EventEmitter {
     events.on("completed", ({ jobId, returnvalue }) => {
       const entry = this.entries.get(jobId);
       if (!entry) return;
+      if (entry.status === "cancelled") return; // cancel wins over late completion events
       let result = null;
       try { result = typeof returnvalue === "string" ? JSON.parse(returnvalue) : returnvalue; } catch {}
       if (result && typeof result === "object") {
@@ -395,6 +532,7 @@ class CloneQueue extends EventEmitter {
     events.on("failed", async ({ jobId, failedReason }) => {
       const entry = this.entries.get(jobId);
       if (!entry) return;
+      if (entry.status === "cancelled") return; // cancel wins over late failure events
       // BullMQ emits "failed" per attempt — only treat the terminal failure
       // (no attempt left, or job actually reached the failed state, which also
       // covers UnrecoverableError short-circuits) as a registry error
@@ -406,6 +544,19 @@ class CloneQueue extends EventEmitter {
           let state = null;
           try { state = await job.getState(); } catch {}
           if (made < attempts && state !== "failed") return; // another attempt is coming
+          // dead-letter (plan 4.0.3): the job exhausted every attempt — copy it
+          // into the "-dead" queue (same Redis, own queue) for inspection and
+          // replay. Best-effort: a DLQ failure must not mask the registry error.
+          await this.#bull.dlq
+            .add("clone", {
+              jobId,
+              payload: job.data?.payload ?? null,
+              meta: job.data?.meta ?? null,
+              failedReason: String(failedReason || "unknown error"),
+              failedAt: nowIso(),
+              attemptsMade: made,
+            }, { jobId })
+            .catch(() => {});
         }
       } catch {}
       this.#fail(entry, failedReason || "unknown error");
@@ -424,6 +575,7 @@ class CloneQueue extends EventEmitter {
     if (this.backend === "bullmq") this.backend = "memory";
     try { await bull.events.close(); } catch {}
     try { await bull.queue.close(); } catch {}
+    try { await bull.dlq?.close(); } catch {}
     try { bull.connection.quit(); } catch {}
     try { bull.eventsConnection.quit(); } catch {}
   }

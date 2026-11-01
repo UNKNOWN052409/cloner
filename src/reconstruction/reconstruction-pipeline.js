@@ -17,6 +17,12 @@ import { buildResponsiveCss, augmentProjectWithResponsive } from "./responsive-a
 import { buildStreamPlan } from "./stateful-widget-builder.js"; // task 3.4.4
 import { buildStreamRuntime } from "./data-stream-replayer.js"; // task 3.4.4
 import { createVisionClientForConfig } from "../platform/vision-client.js"; // task 3.4.6
+// task 3.5.2: cross-page reusable-component patterns (documented hook in
+// component-evidence.js — annotate AFTER the per-page understanding fan-out)
+import { buildComponentRegistry, annotateUnderstanding, registrySummary } from "./component-evidence.js";
+// task 3.5.3: deep application-state reconstruction (documented hook in
+// application-state-builder.js — plan + augment once, after the round loop)
+import { buildAppStatePlan, augmentProjectWithAppState, summarizeAppStatePlan } from "./application-state-builder.js";
 
 const MAX_ROUNDS = 2;
 
@@ -408,6 +414,32 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     if (report.passed || round === MAX_ROUNDS) break;
   }
 
+  // ---- task 3.5.2: cross-page reusable-component pattern annotation ----
+  // Runs ONCE after the per-page understanding fan-out (all pages are memoized
+  // by now): group instances across pages, split by behavior + context, and link
+  // only subgroups recurring on >= 2 pages. annotateUnderstanding returns a NEW
+  // model (pure, additive — component.pattern carries the shared patternId
+  // without touching instance evidence/provenance/interactions), so the memoized
+  // models are reassigned and each annotated model is persisted back next to the
+  // artifacts for verification. Never blocks reconstruction.
+  try {
+    const built = [...understandingByPage.entries()].filter(([, u]) => u && Array.isArray(u.components));
+    if (built.length) {
+      const registry = buildComponentRegistry(built.map(([pageId, u]) => ({ pageId, understanding: u })));
+      report.componentPatterns = registrySummary(registry);
+      for (const [pageId, u] of built) {
+        const annotated = annotateUnderstanding(u, registry);
+        understandingByPage.set(pageId, annotated);
+        try { fs.writeFileSync(path.join(artifactsDir, "pages", pageId, "understanding.json"), JSON.stringify(annotated, null, 2)); } catch {}
+        if (report.understanding?.[pageId]) {
+          report.understanding[pageId] = summarizeUnderstanding(annotated);
+        }
+      }
+    }
+  } catch (e) {
+    report.limitations.push(`component pattern annotation skipped: ${String(e?.message || e).slice(0, 100)}`);
+  }
+
   // ---- one-call project augmentations (tasks 3.4.2 + 3.4.7) ----
   // Applied ONCE after the round loop: regeneration in a later round would
   // discard augmentations applied mid-loop. Both are honest no-ops when their
@@ -444,6 +476,18 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     report.responsiveAugmentation = augmentProjectWithResponsive(outDir, resp.analysis, { pages: genFiles });
   } catch (e) {
     report.limitations.push(`responsive augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
+  }
+
+  // task 3.5.3: deep application-state reconstruction — analyze the captured
+  // application-state.json fixtures (URL deep links, nested controls, storage)
+  // and augment the generated project with runtime/app-state.js. Empty capture
+  // → inert no-op runtime by construction; never blocks reconstruction.
+  try {
+    const appPlan = buildAppStatePlan(artifactsDir, {});
+    report.appState = summarizeAppStatePlan(appPlan);
+    report.appStateAugmentation = augmentProjectWithAppState(outDir, appPlan, { pages: genFiles });
+  } catch (e) {
+    report.limitations.push(`app-state augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
   }
 
   // ---- success contract (spec §7) ----

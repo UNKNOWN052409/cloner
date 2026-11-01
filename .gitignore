@@ -14,6 +14,9 @@ exports/
 # exploration job artifacts (site content + session data)
 artifacts/
 
+# backup dumps (DB snapshots carry user password/key hashes — never commit)
+backups/
+
 # logs
 *.log
 
@@ -25,3 +28,4 @@ artifacts/
 Thumbs.db
 .DS_Store
 nul
+.serena/

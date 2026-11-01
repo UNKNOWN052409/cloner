@@ -17,6 +17,10 @@ import { withJobScope } from "../events.js";
 // string value redacted (numbers kept per the ticker contract), query values
 // stripped from URLs, credential-named keys collapsed
 import { attachWebSocketCapture, createWebSocketSink, exportWebSocketSink } from "../exploration/websocket-session-capture.js";
+// task 3.5.3: application-state capture (URL hash/query, storage, marked
+// controls) — one observation per explored route, same sink/export pattern as
+// the WebSocket capture
+import { createApplicationStateSink, attachApplicationStateCapture, exportApplicationState } from "../exploration/application-state-capture.js";
 
 function makeJobId() {
   return "exp-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -90,6 +94,11 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     // initial upgrade is captured; handlers are defensive and never throw
     const wsSink = createWebSocketSink();
     attachWebSocketCapture(page, wsSink);
+
+    // task 3.5.3: application-state sink — reset per page, exported after the
+    // page's captures so pages/<pageId>/application-state.json carries only the
+    // states observed while exploring THAT page
+    const appStateSink = createApplicationStateSink();
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     try { await page.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
@@ -220,9 +229,21 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       wsSink.dropped = 0;
       wsSink.startedAt = null;
 
+      // task 3.5.3: application-state fixture for THIS page, then reset the sink
+      store.writeJson(`pages/${pageId}/application-state.json`, exportApplicationState(appStateSink));
+      appStateSink.events = [];
+      appStateSink.dropped = 0;
+
       // harvest THIS page's SPA transitions before navigating away — the
       // recorder buffer is per-document and resets on every navigation (spec §7A)
       await discovery.fromSpaEvents(maxRoutes);
+
+      // task 3.5.3: one application-state observation for THIS page — after all
+      // interactions (so controls carry their post-interaction values) but
+      // before navigation away. Never throws (honest { error } event on probe
+      // failure); the artifact always exists via exportApplicationState.
+      const appState = await attachApplicationStateCapture(page, appStateSink, { phase: "route", label: pageId });
+      if (appState) logger.info("app-state", `captured ${appState.probe ? "probe + " : ""}${Object.keys(appState.storage || {}).filter((ns) => Object.keys(appState.storage[ns] || {}).length).length} storage ns`, { url: page.url() });
 
       // graph: root state + one node/edge per recorded interaction, with
       // evidence wired to the artifacts that actually exist (spec §8)
@@ -246,6 +267,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       }
       const pn = safePathname(page.url());
       if (pn) exploredPaths.add(pn);
+      discovery.markExplored(page.url()); // task 3.5.5: keep the dedup index in sync for planNavigations()
       pages.push({ pageId, url: page.url(), route, records: records.length, domSampled: domIntel ? domIntel.sampled : 0 });
       logger.info("explore", `page ${pageId} done`, { records: records.length, domSampled: domIntel ? domIntel.sampled : 0 });
     };
@@ -253,7 +275,11 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     // exploration set is fixed when the loop starts (bounded budget); SPA routes
     // discovered while exploring are harvested per page below and picked up by
     // the second pass if they are genuinely new documents
-    const plannedRoutes = discovery.routes.slice(0, maxRoutes);
+    // exploration set: planNavigations (task 3.5.5) — score-ordered (seed pinned,
+    // query-variant duplicates skipped pre-navigation) and capped. Completeness
+    // mode (policy.routes.prioritize:false) returns the raw discovered order —
+    // identical to the pre-3.5.5 `discovery.routes.slice(0, maxRoutes)` behavior.
+    const plannedRoutes = discovery.planNavigations({ max: maxRoutes, explored: [...exploredPaths].map((pn) => pn) });
     for (let pi = 0; pi < plannedRoutes.length && pages.length < maxRoutes; pi++) {
       if (Date.now() > deadline) { warnings.push("total exploration time budget exhausted — remaining routes skipped"); break; }
       await exploreRoute(plannedRoutes[pi], "page-" + String(pages.length + 1).padStart(3, "0"), { navigate: pi > 0 });
@@ -326,6 +352,9 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       coveragePct: discovery.routes.length ? Math.round((pages.length / discovery.routes.length) * 100) : 100,
       statesRecorded: graphData.stats.nodes,
       budget: policy.budgets,
+      // task 3.5.5 step 8: exploration efficiency counters (redundant routes,
+      // duplicates skipped pre-navigation, saved navigations, planner totals)
+      efficiency: { routes: discovery.stats(), states: graph.stats() },
     });
     store.writeJson("reports/failures.json", redact({
       errors, warnings,

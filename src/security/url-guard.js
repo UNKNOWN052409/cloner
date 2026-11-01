@@ -29,6 +29,34 @@ function isPrivateLiteralIp(host) {
   }
   if (net.isIPv6(ip)) {
     const v = ip.toLowerCase();
+    // IPv4-mapped IPv6 literals (::ffff:127.0.0.1, ::ffff:7f00:1) are loopback /
+    // RFC1918 to the OS and browser — evaluate the embedded IPv4 address instead
+    // of letting the IPv6 fallthrough below mark them public (SSRF bypass).
+    const mappedDotted = v.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+    if (mappedDotted) return isPrivateLiteralIp(mappedDotted[1]);
+    const mappedHex = v.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1], 16), lo = parseInt(mappedHex[2], 16);
+      return isPrivateLiteralIp(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
+    }
+    // NAT64 well-known prefix (64:ff9b::/96) and 6to4 (2002::/16) embed an
+    // IPv4 address: a gateway/CLAT translates them to the embedded target, so a
+    // browser can reach loopback/RFC1918 through them (SSRF bypass pattern).
+    const nat64 = v.match(/^64:ff9b::([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?$/);
+    if (nat64) {
+      if (nat64[2]) {
+        const hi = parseInt(nat64[1], 16), lo = parseInt(nat64[2], 16);
+        return isPrivateLiteralIp(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
+      }
+      // single-hextet low bits → embedded 0.0.0.N/16 (reserved — guarded as private)
+      const g = parseInt(nat64[1], 16);
+      return isPrivateLiteralIp(`0.0.${(g >> 8) & 255}.${g & 255}`);
+    }
+    const six4 = v.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/);
+    if (six4) {
+      const hi = parseInt(six4[1], 16), lo = parseInt(six4[2], 16);
+      return isPrivateLiteralIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
     if (v === "::" || v === "::1") return true; // unspecified, loopback
     if (/^f[cd]/.test(v)) return true; // unique-local fc00::/7
     if (/^fe[89ab]/.test(v)) return true; // link-local fe80::/10

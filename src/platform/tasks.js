@@ -4,14 +4,28 @@
 // the task and are deleted at export (see exporter.js).
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 const ROOT = path.join(process.cwd(), "platform-data");
 
+// Task ids come straight from untrusted URLs (:id params — Express decodes
+// %2f into them), so every path builder validates the id. Engine-generated ids
+// are [A-Za-z0-9_-]+. Anything else (../, ..\, absolute, empty, separators) is
+// rejected and mapped to a deterministic sandbox INSIDE platform-data/ — fail
+// closed without crashing the request path: reads there 404 (no task.json),
+// deletes no-op, and no path can escape the store (unauthenticated rm-rf /
+// file-read traversal class found by the 4.0.12 security probe).
+function safeId(id) {
+  if (typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id)) return id;
+  const h = crypto.createHash("sha256").update(String(id)).digest("hex").slice(0, 16);
+  return `_rejected-${h}`;
+}
+
 export function taskDir(id) {
-  return path.join(ROOT, id);
+  return path.join(ROOT, safeId(id));
 }
 export function outDir(id) {
-  return path.join(ROOT, id, "out");
+  return path.join(ROOT, safeId(id), "out");
 }
 
 export function createTask({ url, mode = "url", username, password, cookies, storage, instructions = "", userId = "local" }) {

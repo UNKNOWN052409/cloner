@@ -596,14 +596,27 @@ async function explorePass(page, { max, waitMs, triggerMax, deadline, label, see
         page
           .evaluate((s) => {
             const el = document.querySelector(s);
-            if (!el) return false;
+            if (!el) return { found: false, visible: false };
             el.scrollIntoView({ block: "center" });
-            return true;
+            // visibility probe (same basics Playwright's actionability check waits
+            // for): an earlier trigger's click can legitimately hide this one
+            // (e.g. a pane collapse display:none's its sibling ✕ button) — the
+            // click could only ever burn its full timeout, so report it instead.
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return {
+              found: true,
+              visible: r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden",
+            };
           }, sel),
         5000,
         "explorePass.scroll",
       ).catch(() => false);
-      if (!opened) continue;
+      if (!opened || !opened.found) continue;
+      if (!opened.visible) {
+        bus.emit("log", { level: "info", msg: `trigger ${m.id} hidden by a previous interaction — skipped (no click timeout)` });
+        continue;
+      }
       await page.click(sel, { timeout: 3000 }).catch((e) =>
         bus.emit("log", { level: "warn", msg: `click failed on ${m.id}: ${e.message.slice(0, 70)}` }),
       );

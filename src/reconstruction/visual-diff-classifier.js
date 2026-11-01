@@ -3,7 +3,9 @@
 // missing-asset, missing-component, stacking — instead of a single pixel count.
 //
 // Each defect carries:
-//  - kind            one of DEFECT_KINDS
+//  - kind            one of DEFECT_KINDS, or VISUAL_DEFECT_KIND ("visual-region",
+//                    task 3.5.4 — complex-visual repair targets carrying a
+//                    visualKind/strategy payload)
 //  - severity        0-1, AREA-WEIGHTED (element/region coverage × mismatch
 //                    intensity — large-area problems rank first)
 //  - salience        0-1, the pixel grid score of the affected region (high-
@@ -16,7 +18,10 @@
 //  - original/clone  the compared values (element defects) or null
 //  - action          suggested repair: { kind, target, ... } — action kinds:
 //                    geometry-fix, typography-override, color-token-fix,
-//                    restore-asset, add-component, stacking-fix
+//                    restore-asset, add-component, stacking-fix,
+//                    visual-region-repair (3.5.4: { visualKind, strategy, rect,
+//                    payload } — payload is a bounded geometry-fix spec when
+//                    the region's clone box measurably drifted, else null)
 //
 // Output is sorted large-area + high-salience first (severity desc → salience
 // desc → deterministic tiebreaks), so a consumer repairing defects head-down
@@ -40,6 +45,27 @@ import {
 export const DEFECT_KINDS = Object.freeze([
   "geometry", "typography", "color", "missing-asset", "missing-component", "stacking",
 ]);
+
+// task 3.5.4: complex-visual defects carry kind "visual-region" (with a
+// visualKind/strategy payload) IN ADDITION to the six core kinds above — kept
+// out of DEFECT_KINDS because that list is the pre-3.5.4 vocabulary core
+// consumers assert on (scripts/test-visual-fidelity.mjs:192 requires every kind
+// in DEFECT_KINDS to appear in a visual-free fixture). Visual-region defects are
+// emitted only when the fidelity report carries visualRegions (additive input),
+// so existing behavior is byte-identical when no complex visuals are present.
+export const VISUAL_DEFECT_KIND = "visual-region";
+
+// task 3.5.4: strategy → severity multiplier for visual-region defects. Canvas
+// snapshot replacements (the data-cloner-snap img treatment) are the most
+// reliable fallback (identical pixels, zero interactivity); preserved svg markup
+// is next; rebuilt charts/maps carry the most reconstruction risk.
+export const VISUAL_STRATEGY_SEVERITY = Object.freeze({
+  "snap-image": 0.5,        // canvas → data-cloner-snap img: pixels guaranteed, behavior lost
+  "preserve-markup": 0.45,  // svg structure kept verbatim
+  "rebuild-from-data": 0.7, // chart rebuilt from captured data — geometry can drift
+  "rebuild-structure": 0.6, // map structure/markers rebuilt
+  "fallback-screenshot": 0.8, // visual-only fallback — no data, no behavior (3.5.4 risk note)
+});
 
 // Area-ratio → severity multiplier. A full-intensity mismatch covering 12.5%
 // of the viewport reaches severity 1; small chrome elements land well below.
@@ -182,6 +208,57 @@ export function classifyDefects(fidelity, opts = {}) {
       action: isAsset
         ? { kind: "restore-asset", target: `.cx-${el.i}`, tag: el.tag, src: el.src || null }
         : { kind: "add-component", target: `.cx-${el.i}`, tag: el.tag, cls: el.cls || null, rect: el.rect || null },
+    });
+  }
+
+  // ---- visual regions (task 3.5.4): complex-visual repair targets ----
+  // Every classified region (chart/canvas/svg/map/custom-widget) becomes a
+  // defect tagged with its reconstruction strategy so the repair pipeline can
+  // target it: canvas → snap-image, chart → rebuild-from-data, svg →
+  // preserve-markup, map → rebuild-structure. The action carries a
+  // planner-executable geometry-fix payload ONLY when the fidelity report
+  // measured a real box drift for that element (f.geometry.deltas) — a region
+  // the clone renders at its captured size gets payload: null (no bounded
+  // repair; the defect stays a strategy tag). Region defects are emitted
+  // REGARDLESS of pixel score (a visually-identical snapshot still lost the
+  // chart's underlying data and behavior — the 3.5.4 risk note demands the two
+  // fidelities stay separate metrics).
+  const driftByIndex = new Map((f.geometry?.deltas || []).map((d) => [d.i, d]));
+  for (const vr of f.visualRegions || []) {
+    const areaRatio = areaRatioOf(vr.rect, pageArea);
+    const cell = vr.cell ?? cellOf(vr.rect, dims);
+    const delta = vr.i !== null && vr.i !== undefined ? driftByIndex.get(vr.i) : null;
+    const drifted = !!(delta && (Math.abs(delta.dw) > GEOMETRY_TOLERANCE_PX || Math.abs(delta.dh) > GEOMETRY_TOLERANCE_PX)
+      && Number(vr.rect?.w) > 0 && Number(vr.rect?.h) > 0);
+    defects.push({
+      kind: VISUAL_DEFECT_KIND,
+      visualKind: vr.kind,
+      strategy: vr.strategy,
+      severity: severityFor(areaRatio, VISUAL_STRATEGY_SEVERITY[vr.strategy] ?? 0.6),
+      salience: salienceOf(cell),
+      confidence: clamp01(vr.confidence ?? 0.6),
+      refs: vr.i !== null && vr.i !== undefined ? [vr.i] : [],
+      region: cell ?? null,
+      original: { kind: vr.kind, strategy: vr.strategy, rect: vr.rect, ariaName: vr.ariaName || null, tag: vr.tag },
+      clone: delta ? { dx: delta.dx, dy: delta.dy, dw: delta.dw, dh: delta.dh } : null,
+      action: {
+        // action.kind speaks the PLANNER's vocabulary directly (repair-planner.js
+        // mapDefect default branch passes through only REPAIR_KINDS members):
+        // a drifted region emits a bounded geometry-fix restoring the captured
+        // dimensions; an undrifted region emits the descriptive tag only (the
+        // planner skips it — recorded, never invented).
+        kind: drifted ? "geometry-fix" : "visual-region-repair",
+        target: vr.i !== null && vr.i !== undefined ? `.cx-${vr.i}` : "index.html",
+        visualKind: vr.kind,
+        strategy: vr.strategy,
+        rect: vr.rect,
+        payload: drifted
+          ? {
+              selector: `.cx-${vr.i}`,
+              props: { width: `${vr.rect.w}px`, height: `${vr.rect.h}px` },
+            }
+          : null,
+      },
     });
   }
 

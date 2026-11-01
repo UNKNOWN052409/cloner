@@ -8,11 +8,13 @@
 // keeps working through the server's "legacy" room; remote ones are refused
 // with 401 during the handshake.
 //
-// Task scoping: ownership is resolved per (task, user) through
+// Task scoping: DB task ids resolve ownership through
 // task-repository.getTask(taskId, userId) — a non-null row means the user owns
-// the task. v2 exploration jobs (exploration-runner registry) are per-process
-// and single-tenant, so the registry answers directly and those tasks are
-// treated as public to authenticated users.
+// the task. v2 exploration jobs (exploration-runner registry) carry an owner
+// ({ userId, orgId }) set by the API layer at enqueue time (4.0.12 quality
+// gate): org-owned jobs are visible to current org members only, user-owned
+// to their owner, and ownerless legacy entries keep the authenticated-users
+// posture.
 import * as exploration from "./exploration-runner.js";
 import * as taskRepo from "../database/task-repository.js";
 import { validateSession } from "../auth/auth-service.js";
@@ -96,8 +98,15 @@ async function userCanAccess(taskId, userId) {
   let ok = false;
   let cacheable = true;
   try {
-    if (isExplorationTask(taskId)) ok = true; // single-tenant registry → public
-    else if (UUID_RE.test(taskId)) ok = !!(await taskRepo.getTask(taskId, userId));
+    if (isExplorationTask(taskId)) {
+      // 4.0.12 quality gate: registry jobs carry an owner ({ userId, orgId })
+      // — org-owned jobs are visible only to CURRENT org members (re-checked
+      // live), user-owned only to that user, platform-admin sees everything.
+      // Ownerless legacy entries keep the authenticated-users posture.
+      ok = await exploration.identityCanAccessJob(taskId, { userId, role: undefined });
+      cacheable = !ok; // only positive verdicts are cached — a membership
+                       // revocation must take effect immediately
+    } else if (UUID_RE.test(taskId)) ok = !!(await taskRepo.getTask(taskId, userId));
     // anything else is outside the DB id namespace → not a DB-owned task
   } catch {
     ok = false;        // DB unavailable → fail closed for this user …
@@ -113,14 +122,15 @@ export async function canAccessTask(taskId, identity) {
   return userCanAccess(taskId, identity.userId);
 }
 
-// Set of userIds (from the given candidates) authorized for a task. For
-// registry tasks every authenticated user is authorized; otherwise each
-// candidate is checked against the task repository.
+// Set of userIds (from the given candidates) authorized for a task. Registry
+// tasks resolve through identityCanAccessJob (owner-aware, 4.0.12); DB tasks
+// are checked against the task repository.
 export async function authorizedUserIds(taskId, userIds) {
   const out = new Set();
   if (!taskId || !Array.isArray(userIds) || !userIds.length) return out;
   if (isExplorationTask(taskId)) {
-    for (const id of userIds) out.add(id);
+    const verdicts = await Promise.all(userIds.map((u) => userCanAccess(taskId, u)));
+    userIds.forEach((u, i) => { if (verdicts[i]) out.add(u); });
     return out;
   }
   const verdicts = await Promise.all(userIds.map((u) => userCanAccess(taskId, u)));

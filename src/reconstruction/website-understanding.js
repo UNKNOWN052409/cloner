@@ -34,6 +34,11 @@ import { makeEvidence, mergeEvidenceLists, aggregateConfidence, electKind } from
 import { repeatedGroups, classifyAmbiguous, mergeVerdicts } from "./vision-assist.js";
 import { analyzeLayout } from "./analysis/layout-analyzer.js";
 import { loadArtifacts } from "./artifact-loader.js";
+// task 3.5.6 (F2/F3): card classification gains a token-less path — repetition +
+// geometry agree without requiring a class-name hit (unfamiliar vocabulary still
+// classifies); the token path keeps its existing semantics inside the hook. The
+// hint vocabularies themselves live in the detector's extensible registry.
+import { cardPatternVotes, regionTokenHints } from "./component-pattern-detector.js";
 
 // Region-kind vocabulary this engine emits (deterministic side). The vision
 // vocabulary (vision-assist.COMPONENT_KINDS) is narrower; vision verdicts are
@@ -58,21 +63,10 @@ const REGION_TO_VISION_KIND = {
 };
 
 // ---- token hint lists (class/id tokens; tokenized on non-alphanumerics) ----
-const TOKENS = {
-  header: ["header", "topbar", "masthead", "appbar", "titlebar", "banner"],
-  navigation: ["nav", "navbar", "navigation", "menu", "topnav", "mainnav", "navlinks", "breadcrumbs"],
-  sidebar: ["sidebar", "sidepanel", "sidenav", "aside", "dock", "rail", "leftpanel", "rightpanel"],
-  toolbar: ["toolbar", "actionbar", "buttonbar", "controlsbar"],
-  workspace: ["workspace", "workarea", "canvas", "stage", "editor", "content", "main", "mainarea"],
-  splitter: ["splitter", "gutter", "resizer", "sash", "divider", "separator"],
-  card: ["card", "tile", "product", "listing", "thumbnail"],
-  cardGrid: ["grid", "cards", "cardgrid", "gallery", "feed", "mosaic", "listings", "tiles"],
-  table: ["table", "datatable", "datagrid", "datagridview"],
-  chart: ["chart", "graph", "plot", "sparkline", "viz", "visualization"],
-  modal: ["modal", "dialog", "popup", "overlay", "lightbox", "drawer"],
-  form: ["form", "signup", "login", "signin", "checkout", "fieldset"],
-  footer: ["footer", "bottombar", "colophon"],
-};
+// task 3.5.6 (F3): the vocabulary lives in component-pattern-detector's
+// extensible registry (same values, same shape — every probe()/hasToken use is
+// unchanged); registerRegionHints() extends it additively as weak votes.
+const TOKENS = regionTokenHints();
 
 const clsTokens = (s) => String(s || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 const hasToken = (tokens, words) => tokens.some((t) => words.includes(t));
@@ -294,14 +288,17 @@ function collectVotes(el, ctx) {
     if (splitterKids >= 1 && paneKids >= 2) kind("workspace", "geometry", `elements[${i}].rect`, `${paneKids} panes + ${splitterKids} splitter(s)`, 0.55);
   }
 
-  // ---- card (member) — class/id hint REQUIRED so plain repeated blocks never
-  // become cards on repetition alone ----
-  if (probe(TOKENS.card)) {
-    for (const p of probes.splice(0)) votes.push({ kind: "card", evidence: [p] });
-    const rep = ctx.repeated.get(i);
-    if (rep) kind("card", "repetition", `elements[${i}].repetition`, `repeated group "${rep.sig}" ×${rep.siblings}`, 0.5);
-    if (sameSizeSiblings(el, ctx)) kind("card", "geometry", `elements[${i}].rect`, `≥3 same-size siblings (~${r.w}x${r.h})`, 0.45);
-  } else probes.length = 0;
+  // ---- card (member) — task 3.5.6 F2 hook: token path OR cross-source
+  // repetition+geometry path (unfamiliar vocabulary still classifies; plain
+  // repeated blocks still never become cards on repetition alone — the hook
+  // requires BOTH sources to agree when no token matched) ----
+  {
+    votes.push(...cardPatternVotes(el, {
+      repeated: ctx.repeated.get(i) || null,
+      sameSizeSiblings: sameSizeSiblings(el, ctx),
+      siblingsRects: (ctx.childrenOf.get(el.parent === null || el.parent === undefined ? -1 : el.parent) || []).map((c) => c.rect || {}),
+    }));
+  }
 
   // ---- card-grid (container) ----
   if (probe(TOKENS.cardGrid)) for (const p of probes.splice(0)) votes.push({ kind: "card-grid", evidence: [p] });

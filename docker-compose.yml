@@ -1,4 +1,7 @@
-version: "3.8"
+# Cloner dev stack (Phase 4.0 integration): PostgreSQL + Redis. The API runs
+# in-process (`npm run platform`); a Redis-connected worker joins via
+# `npm run worker` (src/workers/clone-worker.js) and consumes the "clone-jobs"
+# BullMQ queue when REDIS_URL is set. Production stack: docker-compose.prod.yml.
 services:
   postgres:
     image: postgres:16-alpine
@@ -28,6 +31,35 @@ services:
       timeout: 3s
       retries: 5
 
+  # Optional dedicated worker against the compose Redis. Start with:
+  #   docker compose --profile worker up -d worker
+  # (behind the "worker" profile so plain `docker compose up` keeps the
+  # in-process memory queue as the dev default; the adapter switches to the
+  # bullmq backend only when REDIS_URL is set, src/queues/clone-queue.js)
+  worker:
+    profiles: ["worker"]
+    image: node:24-alpine
+    working_dir: /app
+    command: sh -c "npm install --no-audit --no-fund && node src/workers/clone-worker.js"
+    environment:
+      REDIS_URL: redis://redis:6379
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: cloner
+      PGUSER: cloner
+      PGPASSWORD: cloner_dev_password
+      MAX_CONCURRENT: "2"
+    volumes:
+      - .:/app
+      - artifacts:/app/artifacts
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    init: true
+
 volumes:
   pgdata:
   redisdata:
+  artifacts:

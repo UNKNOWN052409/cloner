@@ -1,0 +1,148 @@
+# Production deployment for the cloner platform (task 4.0.10).
+#
+# Difference from docker-compose.yml (dev: postgres + redis only):
+#   • api / worker / migrator application processes (separate containers)
+#   • migrations run ONCE in a dedicated one-shot "migrator" service that
+#     fails loudly — api and worker only start after it exited successfully
+#     (startup never silently applies unexpected migrations)
+#   • env validation via src/config-schema.js runs before every process boot
+#   • healthchecks on every service; named volumes for all persistent state
+#
+# Usage:
+#   cp .env.example .env   # fill in POSTGRES_PASSWORD / PGPASSWORD etc.
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Required .env entries (see .env.example "Deployment" section):
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB   (postgres service)
+#   PGPASSWORD                                      (must match POSTGRES_PASSWORD)
+#   optional: PORT (host mapping, default 4180), MAX_CONCURRENT, RETENTION_DAYS
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [cloner]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [cloner]
+
+  # One-shot: validates env, then applies forward-only migrations with
+  # explicit version tracking (src/config-schema.js runMigrator). Exits
+  # non-zero on failure — api/worker are gated on its success.
+  migrator:
+    build:
+      context: .
+      target: runtime
+    image: cloner-platform:latest
+    restart: "no"
+    init: true
+    command: ["node", "src/config-schema.js", "migrator"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PGHOST: postgres
+      PGPORT: "5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [cloner]
+
+  api:
+    build:
+      context: .
+      target: runtime
+    image: cloner-platform:latest
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    command:
+      - sh
+      - -c
+      - node src/config-schema.js api && exec node bin/platform.js --port 4180
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PGHOST: postgres
+      PGPORT: "5432"
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${PORT:-4180}:4180"
+    volumes:
+      - artifacts:/app/artifacts
+      - platform-data:/app/platform-data
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4180/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks: [cloner]
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    image: cloner-platform:latest
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    command:
+      - sh
+      - -c
+      - node src/config-schema.js worker && exec node src/workers/clone-worker.js
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PGHOST: postgres
+      PGPORT: "5432"
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - artifacts:/app/artifacts
+      - platform-data:/app/platform-data
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [cloner]
+
+networks:
+  cloner:
+
+volumes:
+  pgdata:
+  redisdata:
+  artifacts:
+  platform-data:

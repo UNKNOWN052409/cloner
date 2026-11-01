@@ -72,6 +72,10 @@
 //                        thickness).
 
 import { makeEvidence, aggregateConfidence } from "./component-evidence.js";
+// task 3.5.6 (F1): active-tab resolution moves to the target-independent
+// detector — accessibility evidence (aria-selected) outranks class tokens,
+// GoldenLayout vocabulary demoted to an evidence-gated compat adapter.
+import { resolveActiveTabIndex } from "./component-pattern-detector.js";
 
 export const WORKSPACE_NODE_KINDS = ["row", "column", "tabs", "stack", "pane"];
 
@@ -363,7 +367,7 @@ function detectTabs(container, tree, cfg, notes) {
       if (st && (cand.rect?.w ?? 0) >= (strip.rect?.w ?? 0) * 0.5) { stack = cand; stacked = st; break; }
     }
     if (!stack || !stacked) continue;
-    const aIdx = activeTabIndex(tabs);
+    const aIdx = resolveActiveTabIndex(tabs); // task 3.5.6 F1 swap (was: activeTabIndex)
     const strict = stacked.length >= 2;
     const stackH = stack.rect?.h ?? 0, stripH = strip.rect?.h ?? 0;
     const relaxedOk =

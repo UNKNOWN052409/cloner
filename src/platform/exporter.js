@@ -79,9 +79,25 @@ const SESSIONY_EXT = /\.(json|txt|db|sqlite3?|dat|log|xml|ya?ml|ini|cfg|state)$/
 export function isSensitiveName(name) {
   const n = name.toLowerCase();
   if (n === "private" || n === "export-staging") return true;
+  if (/^private([-_. ]|$)/.test(n)) return true; // private/, private_backup, private-old …
   if (n.includes("cookie")) return true;
+  // credential-shaped DIRECTORY names ship their whole subtree — block the
+  // strong vocabulary regardless of extension (a "secrets/" or "credentials/"
+  // folder is a credential store even when its children are .json/.txt/…).
+  // Weak tokens (auth, token, storage, session) stay legal as directory names:
+  // real sites serve /auth/ or /token/ route dirs (high false-positive risk).
+  const hasFileExt = /\.[a-z0-9]+$/.test(n);
+  if (!hasFileExt && /(^|[-_. ])(secret|credential|password|passwd|vault|private)(s|[-_. ]|$)/.test(n)) return true;
   if (CODE_FILE.test(n)) return false; // site source/assets are never credentials
   if (n === ".env" || n.startsWith(".env.")) return true;
+  // "design-tokens.json" (measured colors/fonts/spacing) is a DESIGN artifact,
+  // not auth material — allowlist it ahead of the weak "token" vocabulary,
+  // whose substring match otherwise false-positives on "design-tokens".
+  if (/(^|[-_. ])design[-_. ]tokens?($|\.)/.test(n)) return false;
+  // data files whose NAME announces session/credential material — vocabulary
+  // widened beyond storage/session/credential/secret: passwords.json,
+  // token.json, api-token.txt, vault.txt … (data-file extensions only)
+  if (/password|passwd|token|apikey|api-key|api_key|vault/.test(n) && SESSIONY_EXT.test(n)) return true;
   return /storage|session|credential|secret/.test(n) && SESSIONY_EXT.test(n);
 }
 

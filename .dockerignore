@@ -1,0 +1,15 @@
+# Build context for the production Dockerfile (task 4.0.10).
+# Keeps the context small and stops host state leaking into the image.
+node_modules
+.git
+.gitignore
+artifacts
+platform-data
+nonexistent-probe-dir
+output
+docs
+*.log
+.env
+.env.*
+cloner.config.json
+.playwright

@@ -1,0 +1,49 @@
+{
+  "schema": "benchmark-manifest",
+  "version": "1.0.0",
+  "task": "3.5.7 — Multi-Site Benchmark and Repeatable Scoring",
+  "description": "Versioned benchmark dataset manifest. Every scored property of the benchmark that must not drift between runs is pinned here: the fixture set (sites.json), the scoring contract (rubric.json), the capture viewport and the exploration budgets. Change any of these and you MUST bump `version` and re-seed fixtures/benchmark/baseline.json.",
+  "fixtureSet": {
+    "file": "sites.json",
+    "version": "1.0.0",
+    "sites": 7,
+    "categories": ["navigation", "e-commerce", "documentation", "portal", "stateful", "workspace", "visual-heavy"],
+    "complexityClasses": ["simple", "medium", "complex"],
+    "sources": {
+      "phase1": "scripts/fixtures/index.mjs (known regression fixtures)",
+      "phase35-coverage": "scripts/fixtures/category-index.mjs (task 3.5.1 category fixtures)",
+      "phase35-state": "scripts/fixtures/stateful-app.mjs (task 3.5.3)",
+      "phase34-workspace": "scripts/fixtures/workspace-dock.mjs (task 3.4.2)",
+      "phase35-visual": "scripts/fixtures/visual-heavy.mjs (task 3.5.4)"
+    }
+  },
+  "rubric": {
+    "file": "rubric.json",
+    "version": "1.0.0"
+  },
+  "baseline": {
+    "file": "baseline.json",
+    "policy": "Scores from an accepted run are stored per site. A later run flags (and fails on) a per-site drop larger than rubric.regressionTolerance. Improvements are reported but never written back automatically — re-seeding the baseline is a deliberate act (delete baseline.json, rerun, commit the new file together with the rubric/fixture version bump that justified it)."
+  },
+  "capture": {
+    "viewport": { "width": 1440, "height": 900 },
+    "deviceScaleFactor": 1,
+    "fidelityPage": "page-001 (the site entry route, captured pristine before interaction exploration)"
+  },
+  "budgets": {
+    "maxRoutes": 8,
+    "maxStatesPerPage": 6,
+    "maxInteractionsPerState": 8,
+    "maxTotalTimeMs": 90000
+  },
+  "environment": {
+    "engine": "package.json version recorded per run into the report (engineVersion)",
+    "runtime": "node version + platform recorded per run into the report",
+    "network": "zero external network — every site is a local fixture server; live-site testing is a separate, manual contract and never part of this benchmark"
+  },
+  "outputs": {
+    "report": "output/benchmark-3-5.md",
+    "machineResult": "artifacts/benchmark-3-5-result.json"
+  },
+  "integration": "Wire-ready for package.json scripts: \"test:benchmark\": \"node scripts/test-multisite-benchmark.mjs\""
+}

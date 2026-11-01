@@ -339,6 +339,210 @@ async function pixelDiff(page, aData, bData) {
 }
 
 // ---------------------------------------------------------------------------
+// complex-visual region classification (task 3.5.4)
+// ---------------------------------------------------------------------------
+
+// The closed vocabulary of complex visual regions a capture can classify.
+// These are exactly the defect-repair targets 3.4.5's repair pipeline keys off:
+// canvas regions expect the data-cloner-snap image treatment (src/browser.js:339),
+// chart regions get chart repairs, svg regions are reconstructed as real SVG
+// markup (NOT div placeholders), map regions carry marker evidence.
+export const VISUAL_REGION_KINDS = Object.freeze(["chart", "canvas", "svg", "map", "custom-widget"]);
+
+// CLASS hints — literal substrings matched against the element's lowercased
+// class/id TOKENS (whitespace-split, hyphens kept: "main-chart" matches the
+// "chart" hint, "map-marker" matches "marker"). Order inside each list is
+// irrelevant; scoring counts the number of DISTINCT matching hints. Note: "icon"
+// is deliberately NOT a positive hint — icon-named elements are EXCLUDED below.
+const KIND_CLASS_HINTS = {
+  chart: ["chart", "sparkline", "graph", "series", "plot", "trend"],
+  canvas: ["canvas", "webgl", "draw"],
+  svg: ["logo", "glyph", "vector", "hero-art", "illustration"],
+  map: ["map", "maplibre", "mapbox", "leaflet", "gmap", "marker", "pin"],
+  "custom-widget": ["widget", "gauge", "dial", "meter", "viz", "heatmap", "candles", "ladder"],
+};
+
+// data-* hooks recorded by the complex-visual capture (documented contract the
+// capture writes into dom.json elements):
+//  data-visual-kind  — explicit kind override ("chart"|"canvas"|"svg"|"map"|...)
+//  data-visual-category — same vocabulary, alternate naming
+const KIND_DATA_ATTRS = ["dataVisualKind", "dataVisualCategory"];
+
+// TAG votes — a canvas element is inherently a canvas-kind region; inline svg is
+// inherently svg-kind. Everything else needs class/data hints (an <svg class="map">
+// is a map region, not a plain svg icon).
+const KIND_TAG_HINTS = { canvas: ["canvas"], svg: ["svg"] };
+
+// CHART_LIBRARY_LIBRARY — chart engines detected from class tokens; their
+// presence alone (any descendant class token) upgrades a region to "chart".
+export const CHART_LIBRARIES = Object.freeze([
+  "chartjs", "chart-js", "highcharts", "echarts", "recharts", "c3-chart", "nvd3", "apexcharts",
+  "dygraph", "uPlot", "plotly", "d3-", "victory-chart", "billboard.js", "dc-chart", "morris-chart",
+  "pq-grid", "ta-charts", "chart-container", "chart-area", "chart-body",
+]);
+
+// VISUAL_REGION_FLOOR — a region shorter/thinner than this (either dimension, in
+// CSS px) is decoration/chrome, not a complex visual worth a repair target.
+export const VISUAL_REGION_FLOOR = 40;
+
+// lowerTokens(v): lowercased class/id tokens, whitespace-split, hyphens KEPT
+// ("main-chart" stays one token so substring hints match inside it).
+const lowerTokens = (v) => String(v ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+// tokenMatches(token, hint): hint "chart" matches token "main-chart" (substring
+// either direction for hints ≥4 chars; short hints need exact equality so the
+// word "a" never matches inside "canvas").
+function tokenMatches(token, hint) {
+  if (!token || !hint) return false;
+  if (token === hint) return true;
+  if (hint.length >= 4) return token.includes(hint);
+  return false;
+}
+
+// scoreKinds(tokens, tag): kind → score. Hints count DOUBLE (a class hint is
+// semantic intent: ".main-chart" svg is a CHART, not a bare svg region), the
+// tag hint counts single (a <canvas> is canvas-kind even with no classes).
+// Deterministic; the double-weighting makes hint kinds win tag ties.
+function scoreKinds(tokens, tag) {
+  const scores = {};
+  for (const kind of VISUAL_REGION_KINDS) scores[kind] = 0;
+  const tokenSet = new Set(tokens);
+  for (const kind of VISUAL_REGION_KINDS) {
+    for (const hint of KIND_CLASS_HINTS[kind] || []) {
+      if ([...tokenSet].some((tok) => tokenMatches(tok, hint))) scores[kind] += 2;
+    }
+    for (const t of KIND_TAG_HINTS[kind] || []) {
+      if (tag === t) scores[kind] += 1;
+    }
+  }
+  // chart-library class fragments: substring match on any token (e.g. "highcharts-main")
+  for (const lib of CHART_LIBRARIES) {
+    const frag = lib.toLowerCase();
+    if ([...tokenSet].some((tok) => tok.includes(frag))) { scores.chart += 2; break; }
+  }
+  return scores;
+}
+
+// classifyVisualRegion(el, opts?) → region record | null.
+// Reads ONE dom.json element (the dom-extractor shape: tag/cls/rect, plus the
+// additive capture fields style.position, role, ariaName, id, dataVisualKind,
+// dataVisualCategory, visualMeta). Returns null for everything that is not a
+// complex-visual candidate (ordinary divs, headings, buttons…). Deterministic.
+export function classifyVisualRegion(el, opts = {}) {
+  if (!el || typeof el !== "object") return null;
+  const tag = String(el.tag || "").toLowerCase();
+  const rect = el.rect && Number.isFinite(el.rect.w) && Number.isFinite(el.rect.h) ? el.rect : null;
+  if (!rect) return null;
+  if (rect.w < VISUAL_REGION_FLOOR || rect.h < VISUAL_REGION_FLOOR) return null;
+  const tokens = [...lowerTokens(el.cls), ...lowerTokens(el.id)];
+  // ASSET EXCLUSION: <img> elements are captured assets the asset-mapping
+  // pipeline owns (project-generator.js:81-88) — never complex-visual regions,
+  // whatever their class says ("badge" on an img is an asset, not svg markup).
+  if (tag === "img") return null;
+  // ICON EXCLUSION: an element named "icon"/"icons" is chrome decoration, not a
+  // complex-visual region — icons are ordinary DOM the generator already renders
+  // (the 44×44 gear svg in the 3.5.4 fixture is the regression case). The
+  // explicit data-visual-kind override still wins over the exclusion.
+  if (/^icon|^icons-|icon$|-icon-|-icon$/.test((tokens[0] || "")) && !(el.dataVisualKind || el.dataVisualCategory)) {
+    return null;
+  }
+  const explicit =
+    (el.dataVisualKind || el.dataVisualCategory || "").toString().trim().toLowerCase();
+  const scores = scoreKinds(tokens, tag);
+  // descendant-class evidence (opts.descendantClasses: array of class strings
+  // captured inside the region — e.g. a chart region containing
+  // ".highcharts-container" or canvas ".chartjs-render-monitor"): every distinct
+  // matching library fragment votes for "chart".
+  for (const dcls of opts.descendantClasses || []) {
+    for (const tok of lowerTokens(dcls)) {
+      for (const lib of CHART_LIBRARIES) {
+        if (tok.includes(lib.toLowerCase())) { scores.chart += 1; break; }
+      }
+    }
+  }
+  let kind = null;
+  if (explicit && VISUAL_REGION_KINDS.includes(explicit)) {
+    kind = explicit;
+  } else {
+    let best = 0;
+    for (const k of VISUAL_REGION_KINDS) {
+      if (scores[k] > best) { best = scores[k]; kind = k; }
+    }
+    if (best === 0) return null; // no positive evidence — honestly not classified
+  }
+  const strategy =
+    kind === "canvas" ? "snap-image"
+    : kind === "svg" ? "preserve-markup"
+    : kind === "chart" ? "rebuild-from-data"
+    : kind === "map" ? "rebuild-structure"
+    : "fallback-screenshot";
+  return {
+    kind,
+    strategy,
+    i: Number.isFinite(el.i) ? el.i : null,
+    tag,
+    cls: el.cls || null,
+    rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
+    role: el.role || null,
+    ariaName: el.ariaName || null,
+    cell: cellOf(rect, opts.dims || null),
+    confidence: Math.min(0.99, 0.35 + 0.15 * (explicit ? 3 : Math.min(scores[kind] || 1, 4))),
+    evidence: explicit
+      ? [{ source: "data-attr", note: `data-visual-kind=${explicit}` }]
+      : [{ source: "class", note: `tokens=${[...tokens].filter(Boolean).slice(0, 6).join(",") || tag}` }],
+  };
+}
+
+// findVisualRegions(elements, opts?) → region[] sorted by area desc then capture
+// order — the ONE-CALL hook a classifier/planner consumes.
+// opts: {
+//   dims?,
+//   descendantClassesOf?: (el) => string[]  — classes captured INSIDE the region
+//     (chart-library fragments upgrade the region to "chart"),
+//   dataByIndex?: Map|Object  — element index → captured data series (step 4:
+//     associate chart visuals with available data evidence). A region whose
+//     chart data was captured carries dataAssociated: true + dataKeys.
+//   interactionsByIndex?: Map|Object — element index → interaction record ids
+//     resolved to the region (step 4: associate interaction evidence). Regions
+//     with recorded interactions carry interactionsAssociated: true + ids.
+// }
+export function findVisualRegions(elements, opts = {}) {
+  const els = (Array.isArray(elements) ? elements : []).filter((e) => e && typeof e === "object");
+  const dataByIndex = opts.dataByIndex instanceof Map ? opts.dataByIndex : (opts.dataByIndex && typeof opts.dataByIndex === "object" ? opts.dataByIndex : null);
+  const interByIndex = opts.interactionsByIndex instanceof Map ? opts.interactionsByIndex : (opts.interactionsByIndex && typeof opts.interactionsByIndex === "object" ? opts.interactionsByIndex : null);
+  const regions = [];
+  for (const el of els) {
+    const region = classifyVisualRegion(el, {
+      dims: opts.dims || null,
+      descendantClasses: typeof opts.descendantClassesOf === "function" ? opts.descendantClassesOf(el) : [],
+    });
+    if (!region) continue;
+    // step 4 — data + interaction association (additive fields, honestly absent
+    // when the caller supplied no such evidence maps)
+    const i = Number.isFinite(el.i) ? el.i : null;
+    if (dataByIndex && i !== null && dataByIndex[i] !== undefined) {
+      const d = dataByIndex[i];
+      region.dataAssociated = true;
+      region.dataKeys = Array.isArray(d) ? d.map((_, k) => String(k)) : Object.keys(d || {});
+    } else {
+      region.dataAssociated = false;
+    }
+    if (interByIndex && i !== null && interByIndex[i] !== undefined) {
+      const ids = interByIndex[i];
+      region.interactionsAssociated = true;
+      region.interactionIds = (Array.isArray(ids) ? ids : [ids]).map(String);
+    } else {
+      region.interactionsAssociated = false;
+    }
+    regions.push(region);
+  }
+  // deterministic: larger first, then capture index (stable)
+  regions.sort((a, b) =>
+    (b.rect.w * b.rect.h) - (a.rect.w * a.rect.h) || (a.i ?? 0) - (b.i ?? 0) || a.kind.localeCompare(b.kind));
+  return regions;
+}
+
+// ---------------------------------------------------------------------------
 // analyzeFidelity — the one-call report
 // ---------------------------------------------------------------------------
 
@@ -353,9 +557,12 @@ async function pixelDiff(page, aData, bData) {
 //     color: { mismatchCount, mismatches },
 //     stacking: { mismatchCount, mismatches },
 //     missing: { count, elements }, extra: { count, elements },
+//     visualRegions: classified complex-visual regions (task 3.5.4) —
+//       [{ kind: chart|canvas|svg|map|custom-widget, strategy, i, tag, cls,
+//          rect, cell, confidence, evidence }]
 //   }
-// opts: { page?, viewport?, headless? } — page injectable; a launched browser is
-// always closed by this call, an injected page is left open.
+// opts: { page?, viewport?, headless?, descendantClassesOf? } — page injectable;
+// a launched browser is always closed by this call, an injected page is left open.
 export async function analyzeFidelity(originalPng, clonePng, originalElements, cloneElements, opts = {}) {
   const { page, owned } = await acquirePage(opts);
   try {
@@ -390,6 +597,7 @@ export async function analyzeFidelity(originalPng, clonePng, originalElements, c
       geometryPairs: 0,
       typographyMismatches: 0,
       colorMismatches: 0,
+      visualKind: null, // task 3.5.4: chart/canvas/svg/map/custom-widget label
     }));
     for (const d of deltas) {
       const r = d.rect;
@@ -407,6 +615,36 @@ export async function analyzeFidelity(originalPng, clonePng, originalElements, c
     }
     for (const m of typo) if (m.cell !== null && regions[m.cell]) regions[m.cell].typographyMismatches++;
     for (const m of color) if (m.cell !== null && regions[m.cell]) regions[m.cell].colorMismatches++;
+
+    // task 3.5.4: complex-visual region classification — every grid cell an
+    // original canvas/svg/chart/map box intersects gets its visualKind; when two
+    // kinds overlap in one cell the LARGER area wins (deterministic tiebreak:
+    // higher-confidence kind wins on equal area).
+    const visualRegions = findVisualRegions(originalElements, {
+      dims,
+      descendantClassesOf: typeof opts.descendantClassesOf === "function" ? opts.descendantClassesOf : null,
+      dataByIndex: opts.dataByIndex,
+      interactionsByIndex: opts.interactionsByIndex,
+    });
+    for (const vr of visualRegions) {
+      const r = vr.rect;
+      const c0 = Math.max(0, Math.min(GRID_X - 1, Math.floor((Math.max(0, r.x) / dims.w) * GRID_X)));
+      const c1 = Math.max(0, Math.min(GRID_X - 1, Math.floor((Math.max(0, r.x + r.w - 1) / dims.w) * GRID_X)));
+      const r0 = Math.max(0, Math.min(GRID_Y - 1, Math.floor((Math.max(0, r.y) / dims.h) * GRID_Y)));
+      const r1 = Math.max(0, Math.min(GRID_Y - 1, Math.floor((Math.max(0, r.y + r.h - 1) / dims.h) * GRID_Y)));
+      const newArea = r.w * r.h;
+      for (let row = r0; row <= r1; row++) {
+        for (let col = c0; col <= c1; col++) {
+          const reg = regions[row * GRID_X + col];
+          const cur = reg.visualRegion;
+          const curArea = cur ? cur.rect.w * cur.rect.h : -1;
+          if (!cur || newArea > curArea || (newArea === curArea && vr.confidence > cur.confidence)) {
+            reg.visualKind = vr.kind;
+            reg.visualRegion = vr;
+          }
+        }
+      }
+    }
 
     const mismatchedDeltas = deltas.filter((d) => d.errorPx > GEOMETRY_TOLERANCE_PX);
     const errors = mismatchedDeltas.map((d) => d.errorPx);
@@ -441,6 +679,10 @@ export async function analyzeFidelity(originalPng, clonePng, originalElements, c
         })),
       },
       extra: { count: extra.length, elements: extra.map((el) => ({ i: el.i, tag: el.tag, cls: el.cls || null, rect: el.rect || null })) },
+      // task 3.5.4: classified complex-visual regions (chart/canvas/svg/map/
+      // custom-widget) from the ORIGINAL capture — the repair targets for the
+      // 3.5.4 repairs and the per-region visualKind labels on `regions`.
+      visualRegions,
     };
   } finally {
     if (owned) await owned.close().catch(() => {});

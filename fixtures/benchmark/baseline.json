@@ -1,0 +1,131 @@
+{
+  "rubricVersion": "1.0.0",
+  "fixtureVersion": "1.0.0",
+  "perSite": {
+    "multi-route": {
+      "overall": 78.24,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 55
+        },
+        "structuralAccuracy": {
+          "score": 80
+        },
+        "interactionPassRate": {
+          "score": 100
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    },
+    "e-commerce": {
+      "overall": 74.71,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 40
+        },
+        "structuralAccuracy": {
+          "score": 100
+        },
+        "interactionPassRate": {
+          "score": 82.5
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    },
+    "documentation": {
+      "overall": 96.86,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 91.11
+        },
+        "structuralAccuracy": {
+          "score": 100
+        },
+        "interactionPassRate": {
+          "score": 100
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    },
+    "portal": {
+      "overall": 84.12,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 55
+        },
+        "structuralAccuracy": {
+          "score": 100
+        },
+        "interactionPassRate": {
+          "score": 100
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    },
+    "stateful-app": {
+      "overall": 97.78,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 92.6
+        },
+        "structuralAccuracy": {
+          "score": 100
+        },
+        "interactionPassRate": {
+          "score": 100
+        },
+        "stateRestoration": {
+          "score": 100
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    },
+    "workspace-dock": {
+      "overall": 91.52,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 95.05
+        },
+        "structuralAccuracy": {
+          "score": 100
+        },
+        "interactionPassRate": {
+          "score": 65
+        },
+        "stateRestoration": {
+          "score": 100
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    },
+    "visual-heavy": {
+      "overall": 93.76,
+      "dimensions": {
+        "visualSimilarity": {
+          "score": 82.32
+        },
+        "structuralAccuracy": {
+          "score": 100
+        },
+        "interactionPassRate": {
+          "score": 100
+        },
+        "runtimeRobustness": {
+          "score": 100
+        }
+      }
+    }
+  }
+}

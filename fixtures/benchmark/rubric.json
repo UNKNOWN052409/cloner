@@ -1,0 +1,88 @@
+{
+  "schema": "benchmark-rubric",
+  "version": "1.0.0",
+  "task": "3.5.7 — Multi-Site Benchmark and Repeatable Scoring",
+  "scoreScale": "0-100",
+  "comment": [
+    "The scoring contract. Every site score is computed by ONE generic evaluator from the raw metrics the engine's own suite outputs expose (exploration manifest, dom.json, understanding models, reconstruction report, asset manifest, analyzeFidelity, the live clone's runtime state). No judgment, no per-site code paths.",
+    "Component metric -> score: direction=higher maps [floor,target] linearly onto [0,100] (values below floor score 0, at/above target score 100); direction=lower maps the other way (a metric of target or less scores 100, at/above floor scores 0). Bands are DATA so calibration is a versioned change, not a code edit.",
+    "Risk note (plan 3.5.7): a single aggregate must never hide a broken dimension. A site fails outright when ANY applicable dimension scores below criticalDimensionFloor, even if its weighted total clears the site floor — a strong visual score can never compensate for broken interactions."
+  ],
+  "dimensions": {
+    "visualSimilarity": {
+      "weight": 0.30,
+      "source": "analyzeFidelity(originalPng=page-001 screenshot-viewport.png, clonePng, originalElements=page-001 dom.json, cloneElements=DOM_EXTRACTOR_SCRIPT)",
+      "components": {
+        "pixelSimilarityPct": { "direction": "higher", "floor": 75, "target": 96, "weight": 0.45, "metric": "fidelity.pixel.similarityPct" },
+        "geometryMatchRatio": { "direction": "higher", "floor": 0.7, "target": 0.98, "weight": 0.25, "metric": "fidelity.geometry.matched / fidelity.geometry.paired" },
+        "missingRatio": { "direction": "lower", "floor": 0.2, "target": 0.02, "weight": 0.15, "metric": "fidelity.missing.count / original element count" },
+        "typographyMismatchRatio": { "direction": "lower", "floor": 0.2, "target": 0.02, "weight": 0.1, "metric": "fidelity.typography.mismatchCount / fidelity.typography.compared" },
+        "colorMismatchRatio": { "direction": "lower", "floor": 0.2, "target": 0.02, "weight": 0.05, "metric": "fidelity.color.mismatchCount / fidelity.typography.compared" }
+      }
+    },
+    "structuralAccuracy": {
+      "weight": 0.25,
+      "source": "exploration manifest + reports + per-page artifacts + understanding models + reconstruction report + asset manifest (route coverage, page evidence, component coverage, validation, asset completeness)",
+      "components": {
+        "routeCoverage": { "direction": "higher", "floor": 0.6, "target": 1, "weight": 0.25, "metric": "distinct explored routes / sites.expectedRoutes" },
+        "pageEvidenceRatio": { "direction": "higher", "floor": 0.8, "target": 1, "weight": 0.2, "metric": "pages with dom.json(elements>0)+styles.json+screenshot / explored pages" },
+        "componentCoverage": { "direction": "higher", "floor": 0.8, "target": 1, "weight": 0.2, "metric": "understanding models with >= 3 components / explored pages" },
+        "reconstructionValidationRatio": { "direction": "higher", "floor": 0.8, "target": 1, "weight": 0.25, "metric": "rec.report.validation entries ok / total" },
+        "assetCompleteness": { "direction": "higher", "floor": 0.6, "target": 1, "weight": 0.1, "metric": "network-captured images copied into public/assets / captured (1.0 when none captured)" }
+      }
+    },
+    "interactionPassRate": {
+      "weight": 0.2,
+      "source": "understanding triggers + derived replay records + the live clone (data-cloner-trigger attrs, __CLONER_INTERACTIONS records)",
+      "components": {
+        "triggerCaptureRatio": { "direction": "higher", "floor": 0.5, "target": 1, "weight": 0.35, "metric": "distinct captured trigger ids / sites.minTriggers (1.0 when minTriggers=0)" },
+        "cloneWiringRatio": { "direction": "higher", "floor": 0.5, "target": 1, "weight": 0.35, "metric": "[data-cloner-trigger] elements in the live clone / distinct captured trigger ids (1.0 when none captured)" },
+        "runtimeRecordRatio": { "direction": "higher", "floor": 0.5, "target": 1, "weight": 0.3, "metric": "window.__CLONER_INTERACTIONS records / derived replay records (1.0 when none derived)" }
+      }
+    },
+    "stateRestoration": {
+      "weight": 0.15,
+      "source": "application-state capture + plan + augmentation (profile app-state) OR workspace augmentation + live clone reload (profile workspace); only scored for sites that declare the dimension",
+      "profiles": {
+        "app-state": {
+          "components": {
+            "planSources": { "direction": "higher", "floor": 0.25, "target": 1, "weight": 0.3, "metric": "plan sources present: deepLink 0.5 + storage 0.25 + controls 0.25" },
+            "runtimeLinked": { "direction": "higher", "floor": 0.5, "target": 1, "weight": 0.2, "metric": "generated pages linking runtime/app-state.js / generated pages" },
+            "cloneUrlRestore": { "direction": "higher", "floor": 0, "target": 1, "weight": 0.3, "metric": "bare clone load: __APP_STATE_APPLIED.url === true AND captured hash+query restored" },
+            "persistenceRestore": { "direction": "higher", "floor": 0, "target": 1, "weight": 0.2, "metric": "fresh clone context: captured localStorage entries present after load" }
+          }
+        },
+        "workspace": {
+          "components": {
+            "workspaceAugmentation": { "direction": "higher", "floor": 0, "target": 1, "weight": 0.3, "metric": "reconstruction report workspaceAugmentation applied" },
+            "cloneDockStructure": { "direction": "higher", "floor": 0, "target": 1, "weight": 0.3, "metric": "live clone: [data-ws-root] + >=2 [data-ws-tab] + >=2 [data-ws-splitter] + >=2 [data-ws-panel]" },
+            "reloadPersistence": { "direction": "higher", "floor": 0, "target": 1, "weight": 0.4, "metric": "pane geometry identical across clone reload" }
+          }
+        }
+      }
+    },
+    "runtimeRobustness": {
+      "weight": 0.1,
+      "source": "live clone over file:// : page errors, console errors, __CLONER_RUNTIME.errors, path hygiene, referenced local assets on disk",
+      "components": {
+        "pageErrors": { "direction": "lower", "floor": 3, "target": 0, "weight": 0.4, "metric": "uncaught pageerror count on load" },
+        "consoleErrors": { "direction": "lower", "floor": 6, "target": 0, "weight": 0.2, "metric": "console error count on load" },
+        "runtimeErrors": { "direction": "lower", "floor": 3, "target": 0, "weight": 0.2, "metric": "window.__CLONER_RUNTIME.errors.length" },
+        "relativePathsOnly": { "direction": "higher", "floor": 0, "target": 1, "weight": 0.1, "metric": "1 when generated HTML references no absolute filesystem/engine paths" },
+        "localAssetsPresent": { "direction": "higher", "floor": 0.8, "target": 1, "weight": 0.1, "metric": "referenced relative asset files existing on disk / referenced (1.0 when none referenced)" }
+      }
+    }
+  },
+  "criticalDimensionFloor": 40,
+  "floorsByComplexity": {
+    "simple": 70,
+    "medium": 68,
+    "complex": 65
+  },
+  "regressionTolerance": 3,
+  "aggregation": {
+    "siteScore": "weighted mean of the site's applicable dimension scores (weights renormalized over requiredDimensions), rounded to 2 decimals",
+    "aggregate": "unweighted mean of per-site overall scores — site-level rates, never route- or component-weighted, so categories with more pages cannot dominate",
+    "categoryAggregate": "unweighted mean of per-site scores within one category"
+  }
+}

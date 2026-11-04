@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Phase-3.5 deep application-state reconstruction e2e (task 3.5.3):
 // stateful fixture (URL-hash filters + nested state + localStorage) →
 // application-state capture → plan → reconstruction → project augmentation →

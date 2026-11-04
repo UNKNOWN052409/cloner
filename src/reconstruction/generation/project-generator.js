@@ -3,7 +3,7 @@
 // interactions, maps assets, and preserves geometry — all verified on output.
 import fs from "node:fs";
 import path from "node:path";
-import { buildRuntime } from "../../runtimeTemplate.js";
+import { buildRuntime, withAdSlots } from "../../runtimeTemplate.js";
 // Phase 3.4 integrations (wired by the integration agent):
 import { extendRuntimeWorkspace } from "../docking-layout-builder.js"; // task 3.4.2
 import { buildStreamRuntime } from "../data-stream-replayer.js"; // task 3.4.4
@@ -28,7 +28,23 @@ export function buildComponentCss(elements, layoutByIndex, opts = {}) {
   for (const el of elements) {
     const i = el.i;
     const st = el.style || {};
-    const lay = layoutByIndex.get(i);
+    // task 3.4.x fix: analyzeLayout misses elements (sampling/geometry edge cases);
+    // the fallback `st.display` is ALSO missing because the extractor captures
+    // display in `el.layout`, not `el.style` — so flex/grid containers collapsed
+    // to block and their children stacked vertically (Tradovate layout drift).
+    // Fall back to the element's OWN captured layout when analyzeLayout missed it.
+    const ownLay = el.layout && el.layout.display && el.layout.display !== "block"
+      ? {
+          kind: el.layout.display.includes("flex") ? "flex" : el.layout.display.includes("grid") ? "grid" : el.layout.display,
+          display: el.layout.display,
+          flexDirection: el.layout.flexDirection || null,
+          gridTemplateColumns: el.layout.gridTemplateColumns || null,
+          justifyContent: el.layout.justifyContent || null,
+          alignItems: el.layout.alignItems || null,
+          gapPx: el.layout.gap ? parseFloat(el.layout.gap) || null : null,
+        }
+      : null;
+    const lay = layoutByIndex.get(i) || ownLay;
     const scoped = scopeOf ? scopeOf(el) : "";
     const rect = el.rect || el.getBoundingClientRect?.() || null;
     const props = [];
@@ -45,6 +61,18 @@ export function buildComponentCss(elements, layoutByIndex, opts = {}) {
     if (st.padding && st.padding !== "0px") props.push(`padding:${st.padding}`);
     if (st.margin && st.margin !== "0px") props.push(`margin:${st.margin}`);
     if (st.backgroundColor && st.backgroundColor !== "rgba(0, 0, 0, 0)") props.push(`background:${st.backgroundColor}`);
+    // task 3.4.x fix: lazy-loaded hero/carousel art is CSS background-image, not <img> —
+    // without this the clone paints the capture-time fallback color (flat blue) instead
+    // of the real art. Emit the captured URL; assetMap rewrites it to the downloaded copy.
+    if (st.backgroundImage && st.backgroundImage !== "none") {
+      const mapUrl = typeof opts.assetMap === "function" ? opts.assetMap : opts.assetMap instanceof Map ? (u) => opts.assetMap.get(u) : null;
+      const mapped = st.backgroundImage.replace(/url\((['"]?)([^)'"]+)\1\)/g, (m, _q, u) => {
+        if (typeof mapUrl !== "function") return m;
+        const local = mapUrl(u);
+        return local ? `url('${local}')` : m;
+      });
+      props.push(`background-image:${mapped.replace(/"/g, "'")}`);
+    }
     if (st.color) props.push(`color:${st.color}`);
     if (st.fontFamily) props.push(`font-family:${st.fontFamily}`);
     if (st.fontSize) props.push(`font-size:${st.fontSize}`);
@@ -53,6 +81,9 @@ export function buildComponentCss(elements, layoutByIndex, opts = {}) {
     if (st.border && !st.border.startsWith("0px")) props.push(`border:${st.border}`);
     if (st.borderRadius && st.borderRadius !== "0px") props.push(`border-radius:${st.borderRadius}`);
     if (st.opacity && st.opacity !== "1") props.push(`opacity:${st.opacity}`);
+    // task 3.4.x fix: carousels position slides via transform (translate3d offscreen);
+    // without emitting it every slide stacks vertically and paints the page solid blue
+    if (st.transform && st.transform !== "none") props.push(`transform:${st.transform}`);
     if (st.overflow && st.overflow !== "visible") props.push(`overflow:${st.overflow}`);
     if (st.zIndex && st.zIndex !== "auto") props.push(`z-index:${st.zIndex}`);
     if (rect && rect.w > 2 && rect.h > 2) {
@@ -140,7 +171,7 @@ export function buildLayoutCss(elements, layoutByIndex) {
   return lines.join("\n");
 }
 
-export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, componentsCss, assetMap, assetRoot, interactionRecords = [], streamPlan = null }) {
+export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, componentsCss, assetMap, assetRoot, interactionRecords = [], streamPlan = null, adConfig = null }) {
   const dirs = ["styles", "runtime", "public/assets"];
   for (const d of dirs) fs.mkdirSync(path.join(outDir, d), { recursive: true });
   fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({
@@ -172,13 +203,28 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
     }
   }
   // pages — p.file (pipeline-assigned, page-001 → index.html) wins; the route
-  // fallback must not double-append .html to routes that already carry it
+  // fallback must not double-append .html to routes that already carry it.
+  // Trailing-slash directory routes ("/guide/") have an empty basename after
+  // the extension strip — fall back to "index" so the slug is a real FILE name
+  // (basename "guide/.html" is empty and un-writable, and ENOENT'd the whole
+  // reconstruction on vite.dev), matching the pipeline-side slug logic.
   const files = [];
   for (const p of pageHtmls) {
-    const rel = p.file || (p.route === "/" ? "index.html" : p.route.replace(/^\//, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_") + ".html");
+    let rel = p.file;
+    if (!rel) {
+      if (p.route === "/") rel = "index.html";
+      else {
+        const base = p.route.replace(/^\//, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_").replace(/\/+$/, "");
+        rel = (base || "index") + ".html";
+      }
+    }
     const safe = rel.replace(/[^a-zA-Z0-9_./-]/g, "_");
     if (safe.includes("..")) { failed++; continue; }
-    fs.writeFileSync(path.join(outDir, safe), p.html);
+    // task 4.5.5: ad-slot emission hook — adConfig is non-null ONLY for a clone
+    // whose owner opted in (monetize) AND has official zones configured; null
+    // leaves the page byte-identical to the pre-4.5.5 output
+    const pageHtml = withAdSlots(p.html, adConfig, { page: safe });
+    fs.writeFileSync(path.join(outDir, safe), pageHtml);
     const size = fs.statSync(path.join(outDir, safe)).size;
     files.push({ route: p.route, file: safe, size });
   }

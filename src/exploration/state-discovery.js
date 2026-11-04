@@ -82,6 +82,7 @@ export function createStateGraph({ restore = null } = {}) {
   const nodes = new Map();
   const edges = [];
   const byFingerprint = new Map();
+  const byContent = new Map(); // contentKey → node (same view re-queued under a new query)
   const candidates = new Map(); // id -> candidate (pending = not yet explored)
   const knownContentKeys = new Set(); // equivalence keys of explored nodes + queued candidates
   const counters = {
@@ -100,6 +101,7 @@ export function createStateGraph({ restore = null } = {}) {
     for (const n of restore.nodes) {
       if (!n || !n.fingerprint) continue;
       byFingerprint.set(n.fingerprint, { ...n, restored: true });
+      if (n.domSig) byContent.set(contentKey(n.url, n.domSig), { ...n, restored: true });
       counters.restoredStates++;
       if (n.domSig) knownContentKeys.add(contentKey(n.url, n.domSig));
     }
@@ -123,6 +125,14 @@ export function createStateGraph({ restore = null } = {}) {
       if (byFingerprint.has(fp)) {
         return { node: byFingerprint.get(fp), duplicate: true };
       }
+      // task 3.4.x fix: content-equivalent states (same pathname + DOM signature —
+      // e.g. GA rewriting ?_gl per click) must NOT become new documented pages.
+      // The equivalence set existed for pre-navigation candidates only; consult
+      // it here so interaction-driven captures dedupe too.
+      const ck = contentKey(url, domSig);
+      if (byContent.has(ck)) {
+        return { node: byContent.get(ck), duplicate: true };
+      }
       const id = nextId("s", nodes.size);
       const node = {
         id,
@@ -139,7 +149,8 @@ export function createStateGraph({ restore = null } = {}) {
       };
       nodes.set(id, node);
       byFingerprint.set(fp, node);
-      knownContentKeys.add(contentKey(url, domSig));
+      byContent.set(ck, node);
+      knownContentKeys.add(ck);
       return { node, duplicate: false };
     },
     // record a transition edge between states

@@ -64,7 +64,25 @@ const AUDIT_ADVISORY_KEY = 1097857385; // serializes hash-chain appends
 export { AUDIT_ADVISORY_KEY }; // so maintenance scripts (test cleanup) share the same lock
 
 const sha256 = (s) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
-const cap = (v, n) => (typeof v === "string" ? v.slice(0, n) : v ?? null);
+
+// Symmetric TEXT coercion (G5.4 fix): every hashed field must produce EXACTLY
+// the TEXT PostgreSQL stores, because verifyAuditChain() re-reads that TEXT and
+// re-hashes the string form. The old cap() passed non-strings through, so a
+// caller-controlled number/object/email (server.js:86 feeds raw req.body.email
+// into loginFailure) hashed the OBJECT form at write time while the stored
+// TEXT column got pg's JSON.stringify(number/object) — the stored hash could
+// then never verify again (dev-db rows 858-860: actor_email '42', '{"x"}',
+// '{"toString":1}' — permanent false breaks found by the G5.4 hostile hunt).
+// pg's TEXT serialization: string → as-is; Buffer → utf8 bytes;
+// number/boolean/bigint → String(v); object/array → JSON.stringify(v).
+const cap = (v, n) => {
+  if (v == null) return null;
+  let s;
+  if (typeof v === "string") s = v;
+  else if (typeof v === "object") s = Buffer.isBuffer(v) ? v.toString("utf8") : JSON.stringify(v);
+  else s = String(v);
+  return s == null ? null : s.slice(0, n);
+};
 
 // Deterministic JSON: recursively sorted object keys, compact separators.
 // Arrays keep their order. Used both when writing (hash input) and when
@@ -257,8 +275,13 @@ export async function queryAuditEvents(f = {}) {
     throw new Error("unscoped audit query refused — pass orgId/actorId/apiKeyId/correlationId, or platformWide:true for admin queries");
   }
   const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
-  const limit = Math.min(Math.max(Number(f.limit ?? 100), 1), 1000);
-  const offset = Math.max(Number(f.offset ?? 0), 0);
+  // G5.1 hunt fix: a garbage ?limit=abc / ?offset=abc produced NaN, and NaN is
+  // truthy-stringified into the SQL as `LIMIT nan` → Postgres parsed it as a
+  // column reference → 500 "column \"nan\" does not exist". NaN (or any
+  // non-numeric input) now falls back to the default, and the values stay
+  // integer-clamped before interpolation.
+  const limit = Math.min(Math.max(Number(f.limit ?? 100) || 100, 1), 1000);
+  const offset = Math.max(Number(f.offset ?? 0) || 0, 0);
   const sql = `SELECT id, ts, schema_version, actor_type, actor_id, actor_email, org_id, api_key_id, session_id,
     action, outcome, target_type, target_id, metadata, correlation_id, ip, prev_hash, payload_hash
     FROM audit_events ${whereSql} ORDER BY ts DESC, id DESC LIMIT ${limit} OFFSET ${offset}`;

@@ -15,6 +15,8 @@ import path from "node:path";
 import { getCloneQueue } from "../queues/clone-queue.js";
 import { runPipelineJob } from "../queues/pipeline-job.js";
 import { withJobScope } from "../events.js";
+import { requestMonetizeOptIn } from "./ads-optin.js"; // task 4.5.5
+import { withSpan, injectTraceparent } from "../observability/trace-context.js"; // task 4.2.10
 
 const ROOT = path.join(process.cwd(), "artifacts");
 
@@ -22,29 +24,40 @@ const ROOT = path.join(process.cwd(), "artifacts");
 // registry entry carries its owner ({ userId, orgId }) — every read surface
 // gates on it. userId/orgId may be null (anonymous local dashboard, legacy
 // posture: personal scope, no org).
-export function queueExploration({ url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], userId = null, orgId = null }) {
-  const payload = { url, username, password, cookies, storage, policy, sessionId, interactionRecords };
+export function queueExploration({ url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], monetize, userId = null, orgId = null }) {
+  // task 4.5.5: monetize is a PER-TASK OWNER OPT-IN (policy-safe default OFF).
+  // Callers may pass it explicitly; otherwise the task-creation request scope
+  // captured by ads-optin.js monetizeOptInMiddleware() supplies it. The flag
+  // rides the payload, so it also survives the BullMQ worker process hop.
+  const optedIn = monetize === true || requestMonetizeOptIn() === true;
   const queue = getCloneQueue();
-  // returns the entry synchronously (status "queued"; with a free slot the job
-  // is already "exploring" by the time this returns — same as before the
-  // adapter rewiring)
-  return queue.enqueue({
-    payload,
-    owner: { userId: userId || null, orgId: orgId || null },
-    // 4.0.12 QA fix: tag every bus emission of an IN-PROCESS run with this
-    // job's handle. The BullMQ worker path applies withJobScope in the worker
-    // process (clone-worker.js); without the same tag here, memory-backend
-    // exploration events went out over the WS broadcast with NO task id —
-    // fanning out to every authenticated socket (cross-tenant leak, live AND
-    // via catchup replay) and depending on the stale v1 currentTaskId global.
-    // The registry resolves both the tempId (before linkJobId) and the real
-    // jobId (after), so the WS gate can always resolve ownership.
-    run: ({ entry, report }) => withJobScope(entry.tempId, () => runPipelineJob(payload, {
-      entry,
-      report,
-      artifactsRoot: ROOT,
-      linkJobId: (tempId, jobId) => queue.linkJobId(tempId, jobId),
-    })),
+  // task 4.2.10 tracing: the producer span opens HERE (the API enqueue point)
+  // and the job continues the trace on the worker side through
+  // payload.traceparent (injected below) → tracedExecutor (clone-worker.js).
+  // A null sink (CLONER_TRACING=0) degrades to zero-op spans.
+  return withSpan("api.enqueue-clone-task", { "job.url": url || null }, (span) => {
+    const payload = { url, username, password, cookies, storage, policy, sessionId, interactionRecords, monetize: optedIn, ...injectTraceparent() };
+    // returns the entry synchronously (status "queued"; with a free slot the job
+    // is already "exploring" by the time this returns — same as before the
+    // adapter rewiring)
+    return queue.enqueue({
+      payload,
+      owner: { userId: userId || null, orgId: orgId || null },
+      // 4.0.12 QA fix: tag every bus emission of an IN-PROCESS run with this
+      // job's handle. The BullMQ worker path applies withJobScope in the worker
+      // process (clone-worker.js); without the same tag here, memory-backend
+      // exploration events went out over the WS broadcast with NO task id —
+      // fanning out to every authenticated socket (cross-tenant leak, live AND
+      // via catchup replay) and depending on the stale v1 currentTaskId global.
+      // The registry resolves both the tempId (before linkJobId) and the real
+      // jobId (after), so the WS gate can always resolve ownership.
+      run: ({ entry, report }) => withJobScope(entry.tempId, () => runPipelineJob(payload, {
+        entry,
+        report,
+        artifactsRoot: ROOT,
+        linkJobId: (tempId, jobId) => queue.linkJobId(tempId, jobId),
+      })),
+    });
   });
 }
 

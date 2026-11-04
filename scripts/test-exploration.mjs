@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Phase-1 exploration pipeline test: multi-route fixture site (home + SPA-ish
 // pages + modal + tabs) → runExplorationJob → assert the §15 artifact contract.
 import fs from "node:fs";

@@ -96,6 +96,7 @@ export function createWorkerHealth({
   heartbeatTtlMs = defaultHeartbeatTtl(),
   getQueueCounts = null,
   register = true,
+  region = process.env.CLONER_WORKER_REGION || null, // G2.2: per-worker deployment region
 } = {}) {
   const state = {
     workerId,
@@ -115,8 +116,16 @@ export function createWorkerHealth({
   let lastError = "";
 
   async function ensureRedis() {
-    if (redis || state.redisTried) return redis;
-    state.redisTried = true;
+    // G5.1 hunt fix (BUG #11): a FAILED first connect used to disable the
+    // heartbeat store for the WHOLE worker lifetime (state.redisTried was
+    // never reset) — a child spawned while the platform/queue saturates Redis
+    // connections at boot (reproduced in the G5.5 journey: worker processed
+    // jobs for 4+ minutes with ZERO heartbeat keys, so /api/admin/workers
+    // reported no workers) stayed invisible to the operator forever. The
+    // connection attempt is now retried on the NEXT beat (one attempt per
+    // beat, 15s apart — bounded by the beat interval, no hot loop).
+    if (redis) return redis;
+    if (ownRedis) return ownRedis;
     if (!redisUrl) return null;
     try {
       const mod = await import("ioredis");
@@ -129,6 +138,8 @@ export function createWorkerHealth({
       return client;
     } catch (e) {
       lastError = String(e?.message || e);
+      try { if (ownRedis) { await ownRedis.quit().catch(() => ownRedis.disconnect()); } } catch { /* best-effort */ }
+      ownRedis = null;
       return null;
     }
   }
@@ -141,6 +152,9 @@ export function createWorkerHealth({
       startedAt: state.startedAt,
       pid: process.pid,
       host: os.hostname(),
+      // G2.2: deployment region for the admin workers panel (optional; unset
+      // regions surface as "(unspecified)" rollups in /api/admin/workers)
+      region,
       concurrency,
       drainingSince: state.drainingSince,
     };

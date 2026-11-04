@@ -50,7 +50,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY src ./src
 COPY bin ./bin
-COPY platform-ui ./platform-ui
+# headless backend (G7.1): the platform's own UI was removed — the image ships
+# src/ + bin/ only and serves /api/* and /preview/:id, no static UI.
 # writable application state, pre-created so named volumes inherit node ownership
 RUN mkdir -p artifacts platform-data && chown -R node:node /app
 USER node

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Task 3.5.8 — generated runtime robustness e2e.
 //
 // Builds a minimal but realistic generated project (the exact composition the

@@ -183,7 +183,9 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
         domIntel.typography = analyzeTypography(domIntel.elements);
         store.writeJson(`pages/${pageId}/dom.json`, { pageId, url: page.url(), total: domIntel.total, sampled: domIntel.sampled, elements: domIntel.elements, repeated: domIntel.repeated, fixed: domIntel.fixed, sticky: domIntel.sticky, typography: domIntel.typography });
         store.writeJson(`pages/${pageId}/geometry.json`, { pageId, containers: domIntel.elements.slice(0, 60).map((e) => ({ i: e.i, tag: e.tag, cls: e.cls, rect: e.rect, layout: e.layout })), fixed: domIntel.fixed, sticky: domIntel.sticky, repeated: domIntel.repeated });
-        store.writeJson(`pages/${pageId}/styles.json`, { pageId, typography: domIntel.typography, elements: domIntel.elements.map((e) => ({ i: e.i, tag: e.tag, cls: e.cls, style: e.style })) });
+        // bodyStyle/htmlStyle (G4.1): the page-root computed styles the element
+        // loop can never capture — the token builder's body rule reads these
+        store.writeJson(`pages/${pageId}/styles.json`, { pageId, typography: domIntel.typography, bodyStyle: domIntel.bodyStyle || null, htmlStyle: domIntel.htmlStyle || null, elements: domIntel.elements.map((e) => ({ i: e.i, tag: e.tag, cls: e.cls, style: e.style })) });
       }
 
       // responsive captures (first explored page only, spec §10)
@@ -364,6 +366,14 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     }));
 
     logger.info("pipeline", "exploration job finished", { status: manifest.status });
+    // G5.4: freeze the byte-level integrity manifest AFTER the last artifact
+    // write — export later refuses to ship a tree that no longer matches it.
+    try {
+      const { writeIntegrityManifest } = await import("../storage/artifact-lifecycle.js");
+      writeIntegrityManifest(store.dirs.root);
+    } catch (e) {
+      logger.warn?.("pipeline", `integrity manifest not written: ${String(e?.message || e).slice(0, 120)}`);
+    }
     return { jobId: id, artifactsDir: store.dirs.root, manifest };
   } catch (e) {
     logger.error("pipeline", `exploration job failed: ${String(e?.message || e).slice(0, 200)}`);

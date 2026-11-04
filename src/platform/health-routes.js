@@ -93,7 +93,21 @@ export function healthRoutes({ registry = null } = {}) {
   });
 
   // ---- metrics: Prometheus text format ----
-  router.get("/metrics", (_req, res) => {
+  // G5.2 hunt hardening: /metrics used to be readable by ANY remote caller —
+  // queue depth, task counts and worker topology are reconnaissance for an
+  // attacker sizing the deployment. Loopback-only by default (load balancers
+  // and dashboards scrape from the host or the same netns); a deployment that
+  // deliberately exposes it sets CLONER_METRICS_REMOTE=1. /healthz and /readyz
+  // stay open (LB probes are their purpose and they carry no topology).
+  const loopbackAddr = (a) => {
+    let s = String(a || "").toLowerCase();
+    if (s.startsWith("::ffff:")) s = s.slice(7);
+    return s === "::1" || s.startsWith("127.");
+  };
+  router.get("/metrics", (req, res) => {
+    if (process.env.CLONER_METRICS_REMOTE !== "1" && !loopbackAddr(req.socket?.remoteAddress)) {
+      return res.status(403).json({ error: "metrics are loopback-only (set CLONER_METRICS_REMOTE=1 to expose them remotely)" });
+    }
     res.type("text/plain; version=0.0.4; charset=utf-8").send(metrics.render());
   });
 

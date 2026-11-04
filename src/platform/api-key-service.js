@@ -32,10 +32,19 @@ export async function createKey(userId, { name = "api key", scopes = ["read:task
   if (!userId) throw new Error("userId required");
   const normalized = normalizeScopes(scopes);
   if (!normalized.length) throw new Error("at least one scope required");
+  // G5.2 hunt fix: validate expiry input — a garbage value ("abc") used to
+  // reach the INSERT as an Invalid Date and die with a 500, and a negative
+  // value minted an already-expired key. A present expiry must be a positive
+  // number of days.
+  let expiresAt = null;
+  if (expiresInDays !== undefined && expiresInDays !== null && expiresInDays !== "") {
+    const days = Number(expiresInDays);
+    if (!Number.isFinite(days) || days <= 0) throw new Error("expiresInDays must be a positive number of days");
+    expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  }
   // 32 random bytes = 256 bits; hex-encoded so the whole key is header-safe.
   const raw = "ck_" + crypto.randomBytes(32).toString("hex");
   const prefix = raw.slice(0, PREFIX_LEN);
-  const expiresAt = expiresInDays ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000) : null;
   const result = await query(
     `INSERT INTO api_keys (user_id, name, key_hash, prefix, scopes, expires_at)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -162,7 +171,7 @@ keysRouter.post("/", authRequired, async (req, res) => {
     });
     res.status(201).json({ key: created });
   } catch (e) {
-    const bad = e.message.startsWith("invalid scope") || /required/.test(e.message);
+    const bad = e.message.startsWith("invalid scope") || /required|positive number/.test(e.message);
     res.status(bad ? 400 : 500).json({ error: e.message });
   }
 });

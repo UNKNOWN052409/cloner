@@ -1,0 +1,66 @@
+# Task 4.2.5 — non-secret configuration for every cloner process.
+#
+# Keys here are exactly the NON-SECRET entries of the environment schema in
+# src/config-schema.js (SCHEMA map). Secrets (PGPASSWORD, REDIS_URL, AI
+# provider keys) are deliberately NOT in this ConfigMap — the schema marks
+# them secret:true, so they belong in the "cloner-secrets" Secret that every
+# workload references via envFrom.secretRef (template: 20-secrets.yaml.example).
+#
+# Every workload (api Deployment, worker Deployments, migrator Job) mounts
+# this whole ConfigMap via envFrom.configMapRef, mirroring the .env-file
+# behavior of docker-compose.prod.yml. The test suite
+# (scripts/test-k8s-manifests.mjs) assembles configmap + secret keys and runs
+# them through the REAL src/config-schema.js validateEnv() to prove the
+# manifest env surface boots api/worker/migrator in production mode.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloner-config
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+data:
+  # ── runtime ────────────────────────────────────────────────────────────────
+  # production makes src/config-schema.js treat the DB credentials as REQUIRED
+  # (fail-loud at boot instead of silent dev fallbacks).
+  NODE_ENV: "production"
+  # API/UI listen port inside the container (bin/platform.js). Service
+  # cloner-api targets this exact port; do not change without updating
+  # 30-control-plane.yaml.
+  PORT: "4180"
+
+  # ── PostgreSQL (endpoints only — credentials live in cloner-secrets) ───────
+  # PGHOST must point at a postgres Service reachable from the cluster:
+  #   • in-cluster postgres:  the Service name of your postgres deployment
+  #     (e.g. "postgres" if postgres itself runs in this namespace)
+  #   • managed postgres:     the cloud DNS endpoint
+  # The platform ships NO postgres manifest (task scope: control-plane +
+  # regional workers + HPA); see k8s/README.md for two supported options.
+  PGHOST: "postgres"
+  PGPORT: "5432"
+  PGDATABASE: "cloner"
+  PGUSER: "cloner"
+
+  # ── retention / hygiene (src/platform/tasks.js) ────────────────────────────
+  RETENTION_DAYS: "15"
+  PURGE_CREDS_ON_DONE: "1"
+
+  # ── worker tuning (src/workers/clone-worker.js, src/queues/clone-queue.js) ─
+  # Chromium in the worker pod is the memory hog: 1 concurrent exploration per
+  # worker pod, scaled out horizontally by the HPA (50-hpa.yaml) instead of
+  # vertically. MAX_CONCURRENT must stay within 1..32 (config-schema).
+  MAX_CONCURRENT: "2"
+  # Heartbeat liveness (src/workers/worker-health.js): Redis key
+  # cloner:worker:heartbeat:<CLONER_WORKER_ID>, TTL = 3 missed beats.
+  # Keep TTL >= 3x the interval, and both comfortably above pod scheduling
+  # jitter so restarts are not misreported as stalls.
+  CLONER_HEARTBEAT_MS: "15000"
+  CLONER_HEARTBEAT_TTL: "45000"
+  # BullMQ stall detection: must exceed the slowest legitimate stage (browser
+  # launch on a cold node is the slowest observed one). Values mirror the
+  # in-code defaults so operators see them explicitly next to MAX_CONCURRENT.
+  CLONER_STALLED_INTERVAL_MS: "30000"
+  CLONER_LOCK_DURATION_MS: "30000"
+  CLONER_MAX_STALLED_COUNT: "2"

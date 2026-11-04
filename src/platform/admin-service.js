@@ -292,7 +292,7 @@ export function createAdminService({
     params.push(lim, off);
     const rows = await store.query(
       `SELECT t.id, t.user_id, u.email AS owner_email, t.source_url, t.status, t.current_stage,
-              t.progress, t.error, t.retry_count, t.created_at, t.started_at, t.completed_at, t.updated_at
+              t.progress, t.error, t.retry_count, t.options, t.created_at, t.started_at, t.completed_at, t.updated_at
        FROM tasks t JOIN users u ON u.id = t.user_id
        ${where} ORDER BY t.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params

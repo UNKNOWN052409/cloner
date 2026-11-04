@@ -5,6 +5,33 @@
 // element) and page (generated file of its page) drive the runtime's exact
 // element matching, with the text signature kept as last resort.
 //
+// Task 4.5.5 ad-slot emission hook (all additive — replay behavior unchanged).
+// The generators (cloneUrl.js v1 + generation/project-generator.js v2) call:
+//
+//   const adConfig = resolveCloneAdConfig();   // null unless ad zones are
+//                                              // configured AND monetize is on
+//   html = withAdSlots(html, adConfig, { page });
+//
+// Policy (task 4.5.5):
+//   • monetize is a PER-TASK OWNER OPT-IN (default OFF) — captured at task
+//     creation by src/platform/ads-optin.js and threaded through the job
+//     payload (v2) / the request scope (v1). The generators only emit slots
+//     when the caller passes a non-null adConfig; callers only resolve one
+//     when the task opted in. An opted-out clone is byte-identical to the
+//     pre-4.5.5 output — ZERO ad markup anywhere.
+//   • slots carry the OFFICIAL ad-network tags only (Monetag / Adsterra,
+//     built by src/monetization/ad-providers.js from env zone ids). We never
+//     wrap, rewrite or simulate network code; each zone is an inert, clearly
+//     labelled <aside> wrapper (no buttons/links/inputs, no pointer capture
+//     on the wrapper itself) matching the 4.5.4 .cloner-ad-slot contract.
+//   • designated clone zones: "header" (directly after <body>) and "footer"
+//     (directly before </body>) — CLONE_AD_ZONES. Mid-content/sidebar zones
+//     are deliberately NOT emitted into clones: there is no safe structural
+//     anchor inside arbitrary captured DOM.
+//   • withAdSlots is idempotent (a page already carrying data-cloner-ad-zone
+//     is returned unchanged) and fail-safe (any error returns the ORIGINAL
+//     html — ad emission can never break a clone).
+//
 // Task 3.5.8 hardening (all additive — existing replay behavior unchanged):
 //   - error isolation: every delegated handler runs inside try/catch; failures
 //     are recorded on window.__CLONER_RUNTIME.errors instead of breaking the page
@@ -423,3 +450,123 @@ const IIFE = String.raw`(function () {
     rtError("boot", err); // a boot failure must not break the generated page itself
   }
 })();`;
+
+// ---------------------------------------------------------------------------
+// Task 4.5.5 — ad-slot emission hook (see the module header for the contract).
+// Dependency-light on purpose: only ad-providers.js (pure env + string work,
+// no database) is imported, so every existing runtimeTemplate consumer stays
+// dependency-free.
+// ---------------------------------------------------------------------------
+import { buildOfficialTag, escapeHtmlAttr } from "./monetization/ad-providers.js";
+
+// The designated zones a generated clone may carry. header sits directly
+// after <body …>, footer directly before </body>.
+export const CLONE_AD_ZONES = ["header", "footer"];
+
+// Zone wrapper styles — same class contract as ADS_CSS in
+// src/monetization/ad-slots.js, inlined here so clone pages are fully
+// self-contained (no platform CSS dependency in an exported artifact).
+const CLONE_ZONE_CSS = `
+.cloner-ad-slot { display: block; margin: 10px auto; max-width: 100%; pointer-events: none; clear: both; }
+.cloner-ad-slot__label {
+  display: block; font: 400 10px/1.2 system-ui, sans-serif;
+  letter-spacing: .08em; text-transform: uppercase; color: #8a8f98; margin: 0 0 4px;
+}
+.cloner-ad-slot__body { pointer-events: auto; min-height: 0; }
+`.trim();
+
+// Which clone zones have a REAL configured official tag right now (env read
+// per call — buildOfficialTag returns null for unset/incomplete zones).
+// Returns [{ key, env }] in CLONE_AD_ZONES order.
+export function configuredCloneAdZones() {
+  const out = [];
+  for (const key of CLONE_AD_ZONES) {
+    if (buildOfficialTag("monetag", key) || buildOfficialTag("adsterra", key)) out.push({ key });
+  }
+  return out;
+}
+
+// Resolve the generation-time ad config for ONE clone. Returns null whenever
+// the task must NOT carry ads (nothing configured) — the generators treat
+// null as "emit zero ad markup". Each zone carries the OFFICIAL tag html from
+// the 4.5.4 provider module plus the provider id for honest logging.
+export function resolveCloneAdConfig() {
+  try {
+    const zones = [];
+    for (const { key } of configuredCloneAdZones()) {
+      const tag = buildOfficialTag("monetag", key) || buildOfficialTag("adsterra", key);
+      if (!tag) continue; // race between the check above and now — skip honestly
+      zones.push({ key, provider: tag.html.match(/data-ad-provider="([^"]+)"/)?.[1] || "unknown", tagHtml: tag.html });
+    }
+    if (!zones.length) return null;
+    return { zones, css: CLONE_ZONE_CSS, source: "official-tag", resolvedAt: new Date().toISOString() };
+  } catch (e) {
+    console.warn(`[ads] clone ad config resolution failed (emitting zero ad markup): ${String(e?.message || e).slice(0, 160)}`);
+    return null;
+  }
+}
+
+// Inverse of withAdSlots: remove every node this module injects — the
+// <style data-cloner-ad-css> block and every <aside class="cloner-ad-slot"
+// data-cloner-ad-zone=…> wrapper. Only nodes carrying BOTH cloner-namespaced
+// markers (data-cloner-ad-zone + cloner-ad-slot) are touched, so the source
+// site's own markup can never be stripped by a marker coincidence. Idempotent
+// and fail-safe: any internal error returns the ORIGINAL html.
+// Used by the ad-config API (src/monetization/ad-config-api.js) when a task
+// owner flips the per-task monetize flag OFF after the clone was generated.
+export function withoutAdSlots(html) {
+  if (typeof html !== "string" || !html) return html;
+  try {
+    let out = html.replace(/<style[^>]*\bdata-cloner-ad-css[^>]*>[\s\S]*?<\/style>\s*/gi, "");
+    out = out.replace(
+      /<aside\b(?=[^>]*\bdata-cloner-ad-zone=)(?=[^>]*\bcloner-ad-slot)[^>]*>[\s\S]*?<\/aside>\s*/gi,
+      ""
+    );
+    return out;
+  } catch (e) {
+    console.warn(`[ads] withoutAdSlots failed (leaving html untouched): ${String(e?.message || e).slice(0, 160)}`);
+    return html;
+  }
+}
+
+// Inject the designated ad zones into one generated page.
+//   html       the page HTML (v1 captured markup or v2 generated markup)
+//   adConfig   resolveCloneAdConfig() result, or null → html returned unchanged
+//   opts.page  generated file name (logging only)
+// Idempotent + fail-safe: an already-injected page and any internal error
+// both return the ORIGINAL html.
+export function withAdSlots(html, adConfig, opts = {}) {
+  if (!adConfig || typeof html !== "string" || !html) return html;
+  try {
+    if (html.includes("data-cloner-ad-zone")) return html; // idempotent — never double-inject
+    const zone = (z) =>
+      `<aside class="cloner-ad-slot" data-cloner-ad-zone="${escapeHtmlAttr(z.key)}" data-ad-slot="${escapeHtmlAttr(z.key)}" role="complementary" aria-label="Advertisement">\n` +
+      `  <span class="cloner-ad-slot__label">Advertisement</span>\n` +
+      `  <div class="cloner-ad-slot__body" data-ad-provider="${escapeHtmlAttr(z.provider)}">\n` +
+      `    ${z.tagHtml}\n` +
+      `  </div>\n` +
+      `</aside>`;
+    const header = adConfig.zones.find((z) => z.key === "header");
+    const footer = adConfig.zones.find((z) => z.key === "footer");
+    let out = html;
+    const styleTag = `<style data-cloner-ad-css>${adConfig.css || CLONE_ZONE_CSS}</style>`;
+
+    // CSS goes into <head> when the page has one; else at the very top
+    if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, `${styleTag}\n</head>`);
+    else out = styleTag + "\n" + out;
+
+    if (header) {
+      const m = out.match(/<body[^>]*>/i);
+      if (m) out = out.slice(0, m.index + m[0].length) + "\n" + zone(header) + out.slice(m.index + m[0].length);
+      else out = zone(header) + "\n" + out; // headless fragment — prepend honestly
+    }
+    if (footer) {
+      if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${zone(footer)}\n</body>`);
+      else out = out + "\n" + zone(footer);
+    }
+    return out;
+  } catch (e) {
+    console.warn(`[ads] withAdSlots failed for ${opts.page || "page"} (emitting zero ad markup): ${String(e?.message || e).slice(0, 160)}`);
+    return html;
+  }
+}

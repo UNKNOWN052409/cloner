@@ -314,10 +314,64 @@ async function stage2Optimization(out, task = null, artifactsDir = null) {
   let behaviors = 0, explMissing = false;
   const explFile = artifactsDir ? path.join(artifactsDir, "exploration.json") : path.join(out, "exploration.json");
   try { behaviors = (JSON.parse(fs.readFileSync(explFile, "utf8")).behaviors || []).length; } catch { explMissing = true; }
+  // workspace parity (G4.2, evidence-gated FAIL-CLOSED): dock-native app pages
+  // legitimately record ZERO overlay behaviors — their controls (tabs/splitters/
+  // close/collapse) belong to the workspace runtime, and the explorer's
+  // exploration.json only carries overlay records (src/interactions.js:766-768).
+  // When ALL of the following evidence is present, the documented dock coverage
+  // (manifest statesRecorded) counts toward completeness; any missing/weak
+  // evidence keeps today's strict gate. The existing overlay path above is
+  // byte-identical — this branch only adds the workspace evidence source.
+  let workspaceEvidence = null;
+  if (explMissing && artifactsDir) {
+    try {
+      const wsCss = fs.existsSync(path.join(out, "styles", "workspace.css"));
+      const wsRuntime = /__CLONER_WORKSPACE_RUNTIME__/.test(fs.readFileSync(path.join(out, "runtime", "interactions.js"), "utf8"));
+      const summary = JSON.parse(fs.readFileSync(path.join(artifactsDir, "reports", "exploration-summary.json"), "utf8"));
+      const manifest = JSON.parse(fs.readFileSync(path.join(artifactsDir, "manifest.json"), "utf8"));
+      const statesRecorded = Number((manifest.coverage || {}).statesRecorded) || 0;
+      if (wsCss && wsRuntime && summary.status === "completed" && (summary.errors || []).length === 0 && statesRecorded > 0) {
+        behaviors += statesRecorded;
+        workspaceEvidence = `workspace runtime owns the dock controls (styles/workspace.css + __CLONER_WORKSPACE_RUNTIME__): ${statesRecorded} recorded dock state(s) from reports/exploration-summary.json (status completed, 0 errors), no overlay behaviors to explore`;
+        explMissing = false;
+      }
+    } catch { /* weak/missing evidence → keep the strict gate below */ }
+  }
+  // G4.1 self-reverse: control-free SOURCE pages. A static page with zero
+  // interactive controls (example.com, a plain document) legitimately produces
+  // no exploration.json — the explorer sampled every page and recorded nothing
+  // (src/interactions.js writes the behavior report only when behaviors.length
+  // > 0). Stage 1 already treats "no recorded interactions on this page" as a
+  // pass; this branch gives stage 2 the same honest treatment for that one
+  // shape, evidenced by manifest.pages[].records === 0 on EVERY explored page
+  // (the explorer's own per-page capture counts). Strict default preserved:
+  // without CLONER_VERIFY_REQUIRE_INTERACTIONS=0 the gate is byte-identical to
+  // the overlay/workspace paths above — real app clones still need behavior +
+  // replay data.
+  let controlFreeEvidence = null;
+  if (explMissing && artifactsDir) {
+    try {
+      const man = JSON.parse(fs.readFileSync(path.join(artifactsDir, "manifest.json"), "utf8"));
+      if (Array.isArray(man.pages) && man.pages.length > 0 && man.pages.every((p) => (p.records || 0) === 0)) {
+        controlFreeEvidence = `source pages carry zero interactive controls — the explorer sampled ${man.pages.length} page(s) and recorded no interactions to document or replay`;
+      }
+    } catch { /* no/invalid manifest → keep the strict gate */ }
+  }
+  const requireInteractions = process.env.CLONER_VERIFY_REQUIRE_INTERACTIONS !== "0";
+  const controlFreePass = controlFreeEvidence !== null && !requireInteractions;
+  // The workspace parity branch also covers the "replayable records" half: a
+  // dock-native page records ZERO overlay replay records by construction (the
+  // explorer's own summary documents interactions: 0), and the clone's replay
+  // engine for its controls is the workspace runtime itself — which the
+  // evidence gate above already verified is present. Same fail-closed gate:
+  // without the full workspace evidence, records.length > 0 stays required.
+  const workspacePass = workspaceEvidence !== null;
   checks.push({
     name: "exploration + replay data complete",
-    ok: !explMissing && behaviors > 0 && records.length > 0,
-    detail: explMissing ? "exploration.json missing" : `${behaviors} documented behaviors, ${records.length} replayable records`,
+    ok: (!explMissing && behaviors > 0 && (records.length > 0 || workspacePass)) || controlFreePass,
+    detail: controlFreePass ? `0 interactive controls on the source — nothing to explore or replay (${controlFreeEvidence})` : workspacePass
+      ? `${behaviors} documented behaviors, ${records.length} overlay replay record(s) — ${workspaceEvidence}; dock controls replay via the workspace runtime`
+      : explMissing ? "exploration.json missing" : `${behaviors} documented behaviors, ${records.length} replayable records`,
   });
 
   // no unnecessary elements: dead trigger attrs (no runtime record) + empty modules
@@ -367,7 +421,11 @@ function stage3Visual(out, artifactsDir = null) {
       // EXACT HEX comparison: live tokens (design-tokens.json) vs re-measured clone
       const hexReport = await hexTokenComparison(out, artifactsDir);
       const pct = cmp.pct;
-      const tokenOk = cmp.tokens.length > 0 && cmp.tokens.every((t) => !t.error && t.total > 0 && t.matched / t.total >= 0.5);
+      // a category with zero captured evidence can't drift — the same
+      // absence-is-not-failure rule the EXACT HEX comparison below applies
+      // (before G4.1 this demanded total > 0, so a page with no captured
+      // background colors failed the token check at a perfect 0/0 match)
+      const tokenOk = cmp.tokens.length > 0 && cmp.tokens.every((t) => !t.error && (t.total === 0 || t.matched / t.total >= 0.5));
       // total=0 = no captured evidence for that category — absence can't fail
       const hexOk = hexReport.error ? false : hexReport.categories.every((c) => c.total === 0 || c.matched / c.total >= 0.7);
       resolve({
@@ -569,6 +627,18 @@ export async function verifyTask(outDirPath, task = null) {
   const v2Clone = v2Layout(outDirPath);
   const rounds = [];
   let report = null;
+  // G5.1 hunt fix: the round loop is now wall-clock bounded. Each round runs
+  // three REAL-browser stages plus optional repair loops with fidelity
+  // screenshots — on a loaded host one round can take several minutes, so the
+  // old unbounded "up to MAX_ROUNDS" schedule left a clone in "verifying" for
+  // 10+ minutes with no terminal state (reproduced: run 4's clone finished
+  // exploration in 30s, then the poll exhausted while verification round 2+
+  // was still cycling). The budget (CLONER_VERIFY_BUDGET_MS, default 8 min)
+  // stops NEW rounds once spent; the round in flight always finishes so the
+  // report is complete, and the result is an honest completed_with_limitations
+  // instead of an endless pipeline.
+  const verifyBudgetMs = Number(process.env.CLONER_VERIFY_BUDGET_MS || 8 * 60_000);
+  const verifyDeadline = Date.now() + (Number.isFinite(verifyBudgetMs) && verifyBudgetMs > 0 ? verifyBudgetMs : 8 * 60_000);
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     // stage order per spec: 1 functional → 2 optimization/completeness → 3 visual
     const s1 = await stage1Functional(v2Clone || outDirPath);
@@ -583,6 +653,11 @@ export async function verifyTask(outDirPath, task = null) {
     };
     rounds.push({ round, passed: report.passed, failed: report.stages.filter((s) => !s.passed).map((s) => s.stage) });
     if (report.passed || round === MAX_ROUNDS) break;
+    if (Date.now() >= verifyDeadline) {
+      report.limitations = (report.limitations || []).concat([`verification stopped at the ${Math.round(verifyBudgetMs / 1000)}s wall-clock budget after round ${round}`]);
+      report.fixes = (report.fixes || []).concat([`round ${round}: verification budget exhausted — remaining rounds skipped`]);
+      break;
+    }
     const fixes = autoRemediate(report, v2Clone || outDirPath, outDirPath);
     if (fixes.length) {
       report.fixes = (report.fixes || []).concat(fixes.map((f) => `round ${round}: ${f}`));

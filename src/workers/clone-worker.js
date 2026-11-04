@@ -41,6 +41,7 @@ import { withJobScope } from "../events.js";
 import { runPipelineJob } from "../queues/pipeline-job.js";
 import { QUEUE_NAME, isTransientError, resolveRedisUrl } from "../queues/clone-queue.js";
 import { createWorkerHealth, defaultWorkerId } from "./worker-health.js";
+import { tracedExecutor } from "../observability/trace-context.js"; // task 4.2.10
 
 const workerConcurrency = () =>
   Number(process.env.MAX_CONCURRENT || process.env.MAX_EXPLORATION_JOBS || 2);
@@ -136,7 +137,12 @@ export function startCloneWorker({
 } = {}) {
   if (!connection && !redisUrl && !workerFactory) throw new Error("clone-worker: no REDIS_URL / CLONER_REDIS_URL configured");
   const conc = Number(concurrency || workerConcurrency());
-  const runJob = executor || defaultExecutor;
+  // task 4.2.10 tracing: the DEFAULT executor continues the producer's trace
+  // (payload.traceparent, W3C) and derives a stage span per report() transition
+  // (stage.exploration / reconstruction / verification). A caller-injected
+  // executor (tests) is NOT wrapped here — callers that want tracing wrap
+  // their own (double-wrapping would emit every span twice).
+  const runJob = executor || defaultExecutorTraced;
   // connection is built lazily: with a workerFactory (mock transport) no
   // ioredis client is ever created
   let ownConnection = null;
@@ -278,7 +284,29 @@ export function startCloneWorker({
   return { worker, close, concurrency: conc, workerId, health, stalledCount };
 }
 
+// task 4.2.10: the traced default — startCloneWorker falls back to this so the
+// production worker path always continues the producer trace + emits stage
+// spans, while injected test executors stay unwrapped.
+const defaultExecutorTraced = tracedExecutor(defaultExecutor);
+
 async function defaultExecutor(payload, { jobId, report }) {
+  // G5.5 human-journey fix (the worker-side executor hook documented in
+  // artifact-lifecycle.js enqueueSweep): the boot/hourly artifact-lifecycle
+  // sweep travels as { kind:"artifact-sweep", root, execute } — the old code
+  // fed it into the CLONE pipeline (runExplorationJob on url=undefined), so on
+  // a bullmq deployment every sweep dead-lettered and retention never ran.
+  if (payload && payload.kind === "artifact-sweep") {
+    report("sweeping", { kind: "artifact-sweep" });
+    const { sweep } = await import("../storage/artifact-lifecycle.js");
+    const result = sweep({
+      base: payload.root,
+      execute: payload.execute !== false,
+      allowLegacy: false,
+      orphanPolicy: "skip",
+    });
+    report("swept", { kind: "artifact-sweep" });
+    return result ?? { ok: true };
+  }
   return runPipelineJob(payload, { jobId, report });
 }
 

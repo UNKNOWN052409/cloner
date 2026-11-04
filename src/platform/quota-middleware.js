@@ -34,7 +34,7 @@ export function statusForReason(reason) {
   return REASON_STATUS[reason] || 429;
 }
 
-function sendQuotaError(res, err, includeAll = true) {
+function sendQuotaError(res, err, includeAll = true, req = null) {
   const status = statusForReason(err.reason);
   res.set("Retry-After", status === 429 ? "30" : "3600");
   const body = {
@@ -47,6 +47,21 @@ function sendQuotaError(res, err, includeAll = true) {
     requested: err.requested,
   };
   if (includeAll && Array.isArray(err.reasons) && err.reasons.length > 1) body.reasons = err.reasons;
+  // 4.2.14 plugin framework: the quota-deny hook fans out to registered
+  // plugins (events:quota.deny scope). Wired through globalThis.__clonerPlugins
+  // (set by server.js boot) to avoid an import cycle; never throws, never
+  // delays the rejection response.
+  try {
+    const plugins = globalThis.__clonerPlugins;
+    if (plugins && typeof plugins.notifyQuotaDeny === "function") {
+      plugins.notifyQuotaDeny({
+        scope: err.scope || req?.quotaScope || null,
+        userId: req?.userId || null,
+        orgId: req?.tenantScope?.orgId || null,
+        reason: err.reason, limit: err.limit, used: err.used, requested: err.requested,
+      });
+    }
+  } catch { /* hooks must never break a quota decision */ }
   return res.status(status).json(body);
 }
 
@@ -98,7 +113,7 @@ export function quotaGuard(opts = {}) {
       };
       next();
     } catch (e) {
-      if (e instanceof QuotaExceededError) return sendQuotaError(res, e);
+      if (e instanceof QuotaExceededError) return sendQuotaError(res, e, true, req);
       return res.status(500).json({ ok: false, error: "quota check failed: " + String(e?.message || e).slice(0, 160) });
     }
   };

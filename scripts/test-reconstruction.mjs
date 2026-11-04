@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Phase-2 reconstruction e2e: exploration job → reconstruct → assert the
 // generated project contract (editable pages, tokens, assets, runtime, report).
 import fs from "node:fs";

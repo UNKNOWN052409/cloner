@@ -373,8 +373,12 @@ async function sectionPostgres() {
     ok(apiUp && api.exitCode === null, "postgres/API boot (listens on :4199)", apiUp ? "" : apiOut.slice(-300));
 
     if (apiUp) {
-      const http = await fetch("http://127.0.0.1:4199/").then((r) => r.status).catch(() => 0);
-      ok(http === 200, "postgres/API serves UI over HTTP", `GET / → ${http}`);
+      // G7.1: the platform ships HEADLESS — "/" must 404 (no UI is served),
+      // while the API surface stays reachable on the same port.
+      const rootHttp = await fetch("http://127.0.0.1:4199/").then((r) => r.status).catch(() => 0);
+      const apiHttp = await fetch("http://127.0.0.1:4199/healthz").then((r) => r.status).catch(() => 0);
+      ok(rootHttp === 404 && apiHttp === 200, "postgres/API serves API over HTTP, headless root 404s",
+         `GET / → ${rootHttp} (404 expected, no UI since G7.1) · GET /healthz → ${apiHttp}`);
       api.kill("SIGTERM");
       const exited = await Promise.race([
         new Promise((r) => api.on("exit", r)),
@@ -385,7 +389,7 @@ async function sectionPostgres() {
       ok(exited !== false, "postgres/API shutdown on SIGTERM",
          process.platform === "win32" ? "signal emulated on win32" : "graceful exit within 10s");
     } else {
-      skip("postgres/API serves UI over HTTP", "API did not come up");
+      skip("postgres/API serves API over HTTP, headless root 404s", "API did not come up");
       skip("postgres/API shutdown on SIGTERM", "API did not come up");
     }
 

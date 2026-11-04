@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Autonomous visual & functional repair e2e (task 3.4.5) — deterministic, zero
 // network, zero browser: the repair loop's checks are INJECTED checkFns that
 // measure the specific synthetic defects from file content (the exact contract

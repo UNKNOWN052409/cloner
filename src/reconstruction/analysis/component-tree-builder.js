@@ -5,12 +5,53 @@ export function buildComponentTree(dom, pageId) {
   const els = dom.elements || [];
   if (!els.length) return { name: pageId + "-empty", kind: "empty", children: [], evidence: "no elements" };
   const byIndex = new Map(els.map((e, i) => [i, { ...e, __i: i, children: [] }]));
+  // G4.1 self-reverse (vite.dev): the extractor resolves parents by geometric
+  // containment (src/intelligence/dom-extractor.js), and real-world DOMs carry
+  // equal-rect element pairs (overlay wrappers, styled twins) — each then
+  // "contains" the other, forming a parent cycle. The old loop dropped every
+  // cycle member from roots, so the ENTIRE subtree became unreachable and the
+  // page rendered as an empty shell (99.69% pixel drift). Deterministic repair:
+  // elect the smallest-index member of each cycle as the root (capture order),
+  // ignore that one parent link, and the whole cycle hangs beneath it.
+  // Non-cyclic inputs produce byte-identical output — this only changes inputs
+  // that previously yielded an empty tree.
+  const onCycle = new Set();
+  for (const start of els) {
+    const startParent = start.parent;
+    if (startParent === null || startParent === undefined || !byIndex.has(startParent)) continue;
+    const seen = new Set([start.i]);
+    let cur = els[startParent];
+    let returned = false;
+    while (cur && cur.parent !== null && cur.parent !== undefined && byIndex.has(cur.parent)) {
+      if (cur.i === start.i) { returned = true; break; } // back to start after ≥1 hop — start is on a cycle
+      if (seen.has(cur.i)) break;                        // entered a cycle that does not include start
+      seen.add(cur.i);
+      cur = els[cur.parent];
+    }
+    if (returned || (cur && cur.i === start.i)) onCycle.add(start.i);
+  }
+  const cycleRoots = new Set();
+  const done = new Set();
+  for (const i of onCycle) {
+    if (done.has(i)) continue;
+    const members = [];
+    const seen = new Set();
+    let cur = els[i];
+    while (cur && !seen.has(cur.i) && cur.parent !== null && cur.parent !== undefined && byIndex.has(cur.parent)) {
+      seen.add(cur.i);
+      members.push(cur.i);
+      cur = els[cur.parent];
+    }
+    for (const m of members) done.add(m);
+    if (members.length) cycleRoots.add(Math.min(...members));
+  }
   const roots = [];
   for (const el of els) {
     const node = byIndex.get(el.__i ?? els.indexOf(el));
     if (!node) continue;
     const p = el.parent;
-    if (p !== null && p !== undefined && byIndex.has(p)) byIndex.get(p).children.push(node);
+    if (cycleRoots.has(el.i)) roots.push(node); // elected root: parent link ignored
+    else if (p !== null && p !== undefined && byIndex.has(p)) byIndex.get(p).children.push(node);
     else roots.push(node);
   }
   // semantic naming

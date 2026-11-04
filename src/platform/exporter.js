@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { taskDir, outDir, loadTask, updateTask, purgeCredentials } from "./tasks.js";
+import { verifyArtifactIntegrity } from "../storage/artifact-lifecycle.js";
 
 // v2 pipeline export: exploration artifacts + the reconstructed project tree.
 // The clone lives in the SIBLING <jobId>-project/ dir — staged under project/
@@ -23,6 +24,18 @@ export async function exportV2Task(id) {
   const manifestFile = path.join(v2Dir, "manifest.json");
   if (!fs.existsSync(manifestFile)) throw new Error("not a v2 exploration job (manifest.json missing)");
   if (!fs.existsSync(path.join(projectDir, "index.html"))) throw new Error("v2 project dir missing (no -project/index.html) — reconstruction did not run");
+  // G5.4 fail-closed: when the job dir carries an integrity manifest, the tree
+  // on disk must still match it byte-for-byte (size + sha256) before anything
+  // is zipped or shredded. A modified/missing/extra file refuses the export.
+  const integrity = verifyArtifactIntegrity(v2Dir);
+  if (!integrity.ok) {
+    const bad = [
+      ...integrity.missing.map((m) => `missing:${m}`),
+      ...integrity.modified.map((m) => `modified:${m}`),
+      ...integrity.extra.map((m) => `extra:${m}`),
+    ].slice(0, 8).join(", ");
+    throw new Error(`artifact integrity check failed (${bad}) — export refused; fix the tree or re-record it with writeIntegrityManifest`);
+  }
   const staging = path.join(v2Dir, "export-staging");
   fs.rmSync(staging, { recursive: true, force: true });
   fs.mkdirSync(staging, { recursive: true });

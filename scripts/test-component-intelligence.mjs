@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Component-intelligence tests (task 3.5.2) — cross-page reusable-component
 // pattern detection + registry. ZERO NETWORK by default.
 //

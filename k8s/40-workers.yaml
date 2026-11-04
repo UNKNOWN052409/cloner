@@ -1,0 +1,249 @@
+# Task 4.2.5 — Kubernetes PROFILE: regional worker pools.
+#
+# One worker Deployment PER REGION. Every regional pool runs the same image
+# and consumes the SAME BullMQ queue ("clone-jobs", src/queues/clone-queue.js
+# — the queue name is fixed in product code; per-region queue routing is NOT a
+# product feature yet). What the region separation buys at this layer, and why
+# it is still worth having:
+#   • identity   — CLONER_WORKER_ID is the pod name (fieldRef), so Redis
+#                  heartbeats (cloner:worker:heartbeat:<id>,
+#                  src/workers/worker-health.js) are attributable per region;
+#   • scheduling — each pool prefers (preferred affinity — soft, so pools
+#                  never go unscheduled) nodes labeled
+#                  cloner.io/worker-region=<region>; tag your node pools
+#                  accordingly, e.g.:
+#                    kubectl label node <node> cloner.io/worker-region=us-east-1
+#   • scaling    — each region autoscales independently (50-hpa.yaml);
+#   • data       — region-specific REDIS_URL/PGHOST (edit the Secret /
+#                  ConfigMap per region) when you shard backends by geography.
+#
+# WORKER PROBES — deliberate absence, do not "fix":
+#   the worker process exposes no HTTP endpoint (no /healthz server exists in
+#   src/workers/clone-worker.js), so an httpGet probe here would probe
+#   nothing. Container-level exec probes can only detect "pid 1 is gone",
+#   which kubelet already handles by restarting the container. Worker-loop
+#   liveness is observed through the Redis heartbeat freshness
+#   (isHeartbeatFresh) surfaced by the admin surface — set
+#   CLONER_HEARTBEAT_MS/CLONER_HEARTBEAT_TTL in 10-configmap.yaml.
+#
+# Graceful drain: SIGTERM → worker.close() stops accepting, finishes active
+# explorations, force-exits (clone-worker.js registerSignals). Jobs orphaned
+# past the grace period are recovered by BullMQ stall detection
+# (CLONER_STALLED_INTERVAL_MS / CLONER_LOCK_DURATION_MS).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloner-worker-us-east-1
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: worker
+    cloner.io/region: us-east-1
+    cloner.io/managed-by: k8s-manifests
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloner-platform
+      app.kubernetes.io/component: worker
+      cloner.io/region: us-east-1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloner-platform
+        app.kubernetes.io/part-of: cloner-platform
+        app.kubernetes.io/component: worker
+        cloner.io/region: us-east-1
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        # Soft regional pinning: prefer this region's nodes, schedule anywhere
+        # rather than sit Pending when the region's pool is full/cordoned.
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: cloner.io/worker-region
+                    operator: In
+                    values:
+                      - us-east-1
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: cloner-platform
+                    app.kubernetes.io/component: worker
+                    cloner.io/region: us-east-1
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: worker
+          image: cloner-platform:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - node src/config-schema.js worker && exec node src/workers/clone-worker.js
+          # Per-pod heartbeat identity (src/workers/worker-health.js
+          # defaultWorkerId): the default clone-worker-<pid> would collide
+          # across pods and corrupt heartbeat freshness for every replica.
+          env:
+            - name: CLONER_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CLONER_WORKER_REGION
+              value: us-east-1
+          workingDir: /app
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - configMapRef:
+                name: cloner-config
+            - secretRef:
+                name: cloner-secrets
+          # Chromium is the consumer: request what one exploration needs, cap
+          # what one pod may take. MAX_CONCURRENT stays 2 (10-configmap.yaml).
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+            - name: platform-data
+              mountPath: /app/platform-data
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: cloner-artifacts
+        - name: platform-data
+          persistentVolumeClaim:
+            claimName: cloner-platform-data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloner-worker-eu-west-1
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: worker
+    cloner.io/region: eu-west-1
+    cloner.io/managed-by: k8s-manifests
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloner-platform
+      app.kubernetes.io/component: worker
+      cloner.io/region: eu-west-1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloner-platform
+        app.kubernetes.io/part-of: cloner-platform
+        app.kubernetes.io/component: worker
+        cloner.io/region: eu-west-1
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: cloner.io/worker-region
+                    operator: In
+                    values:
+                      - eu-west-1
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: cloner-platform
+                    app.kubernetes.io/component: worker
+                    cloner.io/region: eu-west-1
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: worker
+          image: cloner-platform:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - node src/config-schema.js worker && exec node src/workers/clone-worker.js
+          env:
+            - name: CLONER_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CLONER_WORKER_REGION
+              value: eu-west-1
+          workingDir: /app
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - configMapRef:
+                name: cloner-config
+            - secretRef:
+                name: cloner-secrets
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+            - name: platform-data
+              mountPath: /app/platform-data
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: cloner-artifacts
+        - name: platform-data
+          persistentVolumeClaim:
+            claimName: cloner-platform-data

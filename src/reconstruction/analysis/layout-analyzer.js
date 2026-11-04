@@ -46,7 +46,12 @@ export function analyzeLayout(elements, rectMap) {
 
 // token builder (spec §5): normalize captured values into a token layer with
 // EXACT original values (hex where possible) — no redesign, no substitutions.
-export function buildTokens(designTokensJson, stylesElements) {
+// pageRootStyle (G4.1, additive): { backgroundColor, color, fontFamily,
+// fontSize } computed from the live body (html fallback) — the element loop
+// samples `body *`, so without it the body rule inherited the most frequent
+// ELEMENT background (nginx's black banner → all-black clone). Transparent
+// root backgrounds arrive as null and fall back to the legacy var() defaults.
+export function buildTokens(designTokensJson, stylesElements, pageRootStyle = null) {
   const toHex = (rgb) => {
     const m = String(rgb || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+%?)\s*)?\)/);
     if (!m) return null;
@@ -80,11 +85,14 @@ export function buildTokens(designTokensJson, stylesElements) {
   // [value, count] pairs — the honest measured data (verification's HEX stage
   // consumes this shape; tokensCss destructures below)
   const top = (m, n = 10) => [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
+  const bodyBackground = pageRootStyle ? toHex(pageRootStyle.backgroundColor) || realColor(pageRootStyle.backgroundColor) : null;
+  const bodyColor = pageRootStyle ? toHex(pageRootStyle.color) || realColor(pageRootStyle.color) : null;
   return {
     colors: top(colors), backgrounds: top(bgs),
     fonts: top(fonts, 4), fontSizes: top(sizes, 8),
     spacing: top(spacing, 8), radii: top(radii, 6),
-    sourceEvidence: { stylesElements: (stylesElements || []).length, designTokens: !!designTokensJson },
+    bodyBackground, bodyColor,
+    sourceEvidence: { stylesElements: (stylesElements || []).length, designTokens: !!designTokensJson, pageRootStyle: !!pageRootStyle },
   };
 }
 
@@ -97,6 +105,13 @@ export function tokensCss(tokens) {
   lines.push(`  --font-primary: ${tokens.fonts?.[0]?.[0] || "system-ui, sans-serif"};`);
   if (tokens.fonts?.[1]) lines.push(`  --font-secondary: ${tokens.fonts[1][0]};`);
   lines.push("}");
-  lines.push(`body { margin: 0; background: var(--bg-1, #fff); color: var(--color-1, #111); font-family: var(--font-primary); }`);
+  // the body rule uses the page root's OWN measured background/color when the
+  // exploration captured them (G4.1) — when the body is transparent (the common
+  // marketing-page case), default to WHITE, never the element-frequency winner:
+  // a hero's 60+ colored elements win that vote and paint the whole canvas blue
+  // (Tradovate solid-blue clone bug — same class as the nginx black-banner bug)
+  const bg = tokens.bodyBackground ? tokens.bodyBackground : "#fff";
+  const fg = tokens.bodyColor ? tokens.bodyColor : "var(--color-1, #111)";
+  lines.push(`body { margin: 0; background: ${bg}; color: ${fg}; font-family: var(--font-primary); }`);
   return lines.join("\n");
 }

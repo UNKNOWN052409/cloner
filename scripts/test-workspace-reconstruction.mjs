@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Phase-3.4 workspace reconstruction e2e (task 3.4.2): a 3-pane dockable fixture
 // (left sidebar with collapse+close, center tab group with 2 panels, right
 // panel, two drag-resizable splitters) → exploration → workspace tree detection

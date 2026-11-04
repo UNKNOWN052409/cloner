@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Target-independent generalization test (task 3.5.6).
 //
 // Proves the reconstruction engine classifies and reconstructs from GENERIC

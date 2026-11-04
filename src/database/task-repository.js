@@ -30,9 +30,23 @@ export async function listTasks(userId, { status, limit = 50, offset = 0 } = {})
   return result.rows;
 }
 
+// hunt G5.3 fix: updateTask interpolated patch KEYS straight into SET ...
+// (keys are caller-controlled in JS) — an object like { "source_url = 'x',
+// status = 'hacked' WHERE id = 'y' --": 1 } would execute as SQL. Values were
+// always parameterized, but column NAMES must come from a fixed allowlist of
+// the tasks table.
+const TASKS_COLUMNS = new Set([
+  "user_id", "source_url", "options", "status", "current_stage",
+  "progress", "error", "retry_count",
+  "started_at", "completed_at", "updated_at", "created_at",
+]);
+
 export async function updateTask(taskId, userId, patch) {
-  const keys = Object.keys(patch);
+  const keys = Object.keys(patch || {});
   if (!keys.length) return getTask(taskId, userId);
+  for (const k of keys) {
+    if (!TASKS_COLUMNS.has(k)) throw new Error(`updateTask: unknown column "${k}" (not in tasks allowlist)`);
+  }
   const sets = keys.map((k, i) => `${k} = $${i + 3}`).join(", ");
   const values = keys.map((k) => patch[k]);
   const result = await query(

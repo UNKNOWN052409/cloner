@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Complex-visuals e2e (task 3.5.4 — Complex Visual Content Reconstruction).
 // Deterministic, zero external network.
 //

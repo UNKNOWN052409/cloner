@@ -4,8 +4,8 @@
 // `cloner_session` — is validated against the PostgreSQL sessions table via
 // auth-service.validateSession. A DB failure resolves to "unauthenticated"
 // (the upgrade never crashes). Unauthenticated upgrades are allowed only from
-// loopback — the local dashboard (platform-ui) connects with no token and
-// keeps working through the server's "legacy" room; remote ones are refused
+// loopback — local dashboard API clients connect with no token and
+// keep working through the server's "legacy" room; remote ones are refused
 // with 401 during the handshake.
 //
 // Task scoping: DB task ids resolve ownership through
@@ -63,6 +63,44 @@ export async function authenticateUpgrade(req) {
   }
 }
 
+// ---- cookie-only authentication for HTTP surfaces ---------------------------
+//
+// G5.5 human-journey hunt: browser NAVIGATIONS (preview loads, iframe clones,
+// image/favicon requests) cannot set an Authorization header — the same
+// physical limitation that justifies the ?token=/cookie path on WS upgrades
+// above. Surfaces that a human opens by URL (e.g. /preview/<id>/index.html)
+// authenticate through the `cloner_session` cookie that POST /api/auth/login
+// sets. Cookie-only on purpose: HTTP routes keep the G5.3 posture of NEVER
+// accepting ?token= (query tokens leak into logs), so this must not reuse
+// extractToken(), which still reads the query param for the WS path.
+export function extractCookieToken(req) {
+  const header = req?.headers?.cookie;
+  if (typeof header !== "string") return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== "cloner_session") continue;
+    const value = part.slice(eq + 1).trim();
+    try { return decodeURIComponent(value); } catch { return value; }
+  }
+  return null;
+}
+
+// Resolves { userId, email, role } from the request's cloner_session cookie,
+// else null. NEVER throws: a PostgreSQL outage is treated as
+// "unauthenticated" (callers keep whatever legacy posture they had).
+export async function authenticateCookie(req) {
+  const token = extractCookieToken(req);
+  if (!token) return null;
+  try {
+    const session = await validateSession(token);
+    if (!session) return null;
+    return { userId: session.userId, email: session.email, role: session.role };
+  } catch {
+    return null; // DB unavailable → unauthenticated, never crash the route
+  }
+}
+
 // True for 127.0.0.0/8, ::1 and IPv4-mapped IPv6 loopback forms.
 export function isLoopback(address) {
   if (!address) return false;
@@ -107,7 +145,19 @@ async function userCanAccess(taskId, userId) {
       cacheable = !ok; // only positive verdicts are cached — a membership
                        // revocation must take effect immediately
     } else if (UUID_RE.test(taskId)) ok = !!(await taskRepo.getTask(taskId, userId));
-    // anything else is outside the DB id namespace → not a DB-owned task
+    else {
+      // G5.1 hunt fix (BUG #10): v1 file-store tasks (id "t<base36>", NOT a
+      // UUID) fell through every branch → canAccessTask returned false for
+      // EVERY v1 task → a signed-in owner's WS "join" was silently ignored
+      // and the owner received ZERO live events for their own task
+      // (reproduced: g55 "WebSocket: B receives live events for HIS OWN
+      // task — 0 event(s)"). Resolve through the file store and check the
+      // owner exactly like the HTTP surface does.
+      const { loadTask } = await import("./tasks.js");
+      const meta = loadTask(taskId);
+      ok = !!meta && (meta.userId === userId || (meta.userId === "local" && false)); // "local" tasks stay loopback-dashboard territory
+      cacheable = !ok;
+    }
   } catch {
     ok = false;        // DB unavailable → fail closed for this user …
     cacheable = false; // …and re-check once the DB is back

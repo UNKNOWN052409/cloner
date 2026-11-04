@@ -129,10 +129,28 @@ export function createRouteDiscovery(page, policy, logger) {
     return routes.some((r) => pathnameOf(r.url) === pathname);
   }
 
+  // task 3.4.x fix: marketing/attributions params (_gl, _gcl_au, utm_*, gclid …)
+  // differ per click, so the SAME view used to be queued as N distinct routes
+  // (a live benchmark site's /welcome was captured 12×). Strip them before
+  // fingerprinting — the stripped URL is also the better canonical navigation
+  // target. (No fixture/brand names here: the generalization audit's static
+  // guard rejects target identifiers in engine code, comments included.)
+  const TRACKING_PARAM = /^(gclid|fbclid|msclkid|gclsrc|gcl_au|_gl|_gcl_au|dclid|wbraid|gbraid|mc_cid|mc_eid|utm_.+)$/i;
+  function stripTrackingParams(urlStr) {
+    try {
+      const u = new URL(urlStr);
+      if (![...u.searchParams.keys()].some((k) => TRACKING_PARAM.test(k))) return urlStr;
+      for (const k of [...u.searchParams.keys()]) if (TRACKING_PARAM.test(k)) u.searchParams.delete(k);
+      return u.origin + u.pathname + (u.search || "");
+    } catch {
+      return urlStr;
+    }
+  }
+
   async function add(url, source, meta = {}) {
     try {
       const u = new URL(url, page.url ? page.url() : url);
-      const clean = u.origin + u.pathname + u.search;
+      const clean = stripTrackingParams(u.origin + u.pathname + u.search);
       const origin = new URL(page.url() || url).origin;
       if (policy.routes.sameOriginOnly && u.origin !== origin) return false;
       if (/\.(png|jpe?g|webp|gif|svg|ico|css|js|mjs|json|woff2?|ttf|otf|mp4|webm|pdf|zip)$/i.test(u.pathname)) return false;

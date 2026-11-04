@@ -16,6 +16,10 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import { chromium } from "playwright";
+// G5.3 SSRF guard: this suite explores a LOOPBACK fixture server — the
+// documented opt-in (same pattern as scripts/test-exploration.mjs:1;
+// production default stays strict).
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1";
 import { runExplorationJob } from "../src/pipeline/exploration-pipeline.js";
 import { reconstructFromArtifacts } from "../src/reconstruction/reconstruction-pipeline.js";
 import {

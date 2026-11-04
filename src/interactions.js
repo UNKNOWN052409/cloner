@@ -18,6 +18,58 @@ import { bus } from "./events.js";
 
 const DANGEROUS = /(buy|sell|flatten|reverse|order|submit|confirm|logout|log\s?out|sign\s?out|close|remove|delete|cancel|deposit|withdraw|transfer|place|send|exit|cxl\b)/i;
 
+// Styled-HTML capture for overlays/modules: the clone page does NOT carry the
+// source app's stylesheet (hidden replay UI is absent from the static DOM
+// capture), so replayed overlays/modules would render as raw unstyled text.
+// This bakes computed styles into the captured HTML, making every replay
+// self-contained.
+//
+// Runs on a DETACHED CLONE parked off-screen — the live page is never mutated
+// (inlining styles on the live element would change the app's own layout for
+// every later recording step). Computed styles still resolve on the clone
+// because it IS in the document while being styled; it is removed immediately
+// after serialization. ROOT: positioning is neutralized (the replay wrapper
+// owns placement from the recorded box) so page-absolute offsets never
+// double-offset.
+const STYLED_HTML_SRC = `
+  (root) => {
+    if (!root || root.nodeType !== 1) return null;
+    const clone = root.cloneNode(true);
+    // park off-screen so computed styles resolve; the real page never changes
+    clone.setAttribute("style", "position:fixed;top:-10000px;left:-10000px;visibility:hidden;pointer-events:none;");
+    document.body.appendChild(clone);
+    const PROPS = ["boxSizing","display","position","top","right","bottom","left","zIndex",
+      "width","height","minWidth","minHeight","maxWidth","maxHeight",
+      "marginTop","marginRight","marginBottom","marginLeft",
+      "paddingTop","paddingRight","paddingBottom","paddingLeft",
+      "borderTop","borderRight","borderBottom","borderLeft","borderRadius",
+      "background","backgroundColor","backgroundImage","backgroundSize","backgroundRepeat",
+      "boxShadow","color","fontFamily","fontSize","fontWeight","fontStyle","lineHeight",
+      "textAlign","textTransform","letterSpacing","whiteSpace","textOverflow","textDecoration",
+      "opacity","overflow","gap","rowGap","columnGap","flexDirection","flexWrap","alignItems","justifyContent",
+      "flex","flexBasis","flexGrow","flexShrink","gridTemplateColumns","gridTemplateRows",
+      "transform","cursor","objectFit","verticalAlign","alignSelf","order"];
+    // NOTE: "visibility" is deliberately NOT baked — it inherits from the parked
+    // clone's hidden state and would freeze "hidden" into every descendant.
+    const walk = (el, isRoot) => {
+      const cs = getComputedStyle(el);
+      for (const p of PROPS) { try { el.style[p] = cs[p]; } catch (e) {} }
+      if (isRoot) {
+        el.style.position = "relative";
+        el.style.top = "0px"; el.style.right = "auto"; el.style.bottom = "auto"; el.style.left = "0px";
+        el.style.margin = "0px";
+        el.style.visibility = "visible";
+        el.style.pointerEvents = ""; // clear the parking guard — replay must be clickable
+      }
+      for (const k of el.children) walk(k, false);
+    };
+    try { walk(clone, true); } catch (e) {}
+    const html = clone.outerHTML;
+    clone.remove();
+    return html;
+  }
+`;
+
 // snapshot canvases inside a subtree → dataURL imgs (charts render in clones)
 const SNAP_CANVASES_SRC = `
   (root) => {
@@ -233,7 +285,7 @@ async function extractOverlay(page) {
       .evaluate(new Function(
         "return (" + SNAP_CANVASES_SRC + ")(document.querySelector('[data-cloner-live=\"1\"]') || document.body)," +
         " (function () { const t = document.querySelector('[data-cloner-live=\"1\"]'); if (!t) return null; const r = t.getBoundingClientRect();" +
-        " const out = { html: t.outerHTML.slice(0, 200000), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } };" +
+        " const out = { html: ((" + STYLED_HTML_SRC + ")(t) || t.outerHTML).slice(0, 200000), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } };" +
         " t.removeAttribute('data-cloner-live'); return out; })()",
       ))
       .catch(() => null),
@@ -360,7 +412,42 @@ async function pickerPass(page, { waitMs, deadline, statesDir, behaviors, seenSi
         if (out.length >= 14) break;
       }
       const box = root.getBoundingClientRect();
-      const html = root.outerHTML.slice(0, 200000);
+      // bake computed styles onto a detached clone — the live page is never
+      // mutated; helper body is INLINED literally because this evaluate body
+      // never sees Node-side constants
+      const styledRoot = (function captureStyledClone(src) {
+        const clone = src.cloneNode(true);
+        clone.setAttribute("style", "position:fixed;top:-10000px;left:-10000px;visibility:hidden;pointer-events:none;");
+        document.body.appendChild(clone);
+        const PROPS = ["boxSizing","display","position","top","right","bottom","left","zIndex",
+          "width","height","minWidth","minHeight","maxWidth","maxHeight",
+          "marginTop","marginRight","marginBottom","marginLeft",
+          "paddingTop","paddingRight","paddingBottom","paddingLeft",
+          "borderTop","borderRight","borderBottom","borderLeft","borderRadius",
+          "background","backgroundColor","backgroundImage","backgroundSize","backgroundRepeat",
+          "boxShadow","color","fontFamily","fontSize","fontWeight","fontStyle","lineHeight",
+          "textAlign","textTransform","letterSpacing","whiteSpace","textOverflow","textDecoration",
+          "opacity","overflow","gap","rowGap","columnGap","flexDirection","flexWrap","alignItems","justifyContent",
+          "flex","flexBasis","flexGrow","flexShrink","gridTemplateColumns","gridTemplateRows",
+          "transform","cursor","objectFit","verticalAlign","alignSelf","order"];
+        const walk = (el, isRoot) => {
+          const cs = getComputedStyle(el);
+          for (const p of PROPS) { try { el.style[p] = cs[p]; } catch (e) {} }
+          if (isRoot) {
+            el.style.position = "relative";
+            el.style.top = "0px"; el.style.right = "auto"; el.style.bottom = "auto"; el.style.left = "0px";
+            el.style.margin = "0px";
+            el.style.visibility = "visible";
+            el.style.pointerEvents = "";
+          }
+          for (const k of el.children) walk(k, false);
+        };
+        try { walk(clone, true); } catch (e) {}
+        const html = clone.outerHTML;
+        clone.remove();
+        return html;
+      })(root);
+      const html = (styledRoot || root.outerHTML).slice(0, 200000);
       root.removeAttribute("data-cloner-live");
       return { items: out, html, box: { x: Math.round(box.left), y: Math.round(box.top), w: Math.round(box.width), h: Math.round(box.height) } };
     }, counter.n),
@@ -397,8 +484,8 @@ async function pickerPass(page, { waitMs, deadline, statesDir, behaviors, seenSi
   }
   behaviors.push({
     trigger: { id: addId, label: "Add module (picker)" },
-    opens: cap?.box ? { kind: "overlay", w: cap.box.w, h: cap.box.h } : null,
-    childPanels: innerRecords.map((r) => ({ text: r.text, kind: r.kind, w: r.box?.w, h: r.box?.h })),
+    opens: cap?.box ? { kind: "overlay", x: cap.box.x, y: cap.box.y, w: cap.box.w, h: cap.box.h } : null,
+    childPanels: innerRecords.map((r) => ({ text: r.text, kind: r.kind, x: r.box?.x, y: r.box?.y, w: r.box?.w, h: r.box?.h })),
     screenshot: null,
   });
   if (statesDir) {
@@ -457,8 +544,8 @@ async function topbarPass(page, { waitMs, deadline, statesDir, behaviors, result
         results.push({ id: c.id, text: label, kind: "overlay", html: cap.html, box: cap.box });
         behaviors.push({
           trigger: { id: c.id, label },
-          opens: { kind: "overlay", w: cap.box.w, h: cap.box.h },
-          childPanels: innerRecords.map((r) => ({ text: r.text, kind: r.kind, w: r.box?.w, h: r.box?.h })),
+          opens: { kind: "overlay", x: cap.box.x, y: cap.box.y, w: cap.box.w, h: cap.box.h },
+          childPanels: innerRecords.map((r) => ({ text: r.text, kind: r.kind, x: r.box?.x, y: r.box?.y, w: r.box?.w, h: r.box?.h })),
           screenshot: null,
         });
         if (statesDir) {
@@ -529,11 +616,11 @@ async function captureInner(page, waitMs, reopen, counter, deadline, preItems = 
         " const panels = [...document.querySelectorAll('[class*=\"module\"],[class*=\"panel\"],[class*=\"window\"],[class*=\"grid-item\"]')]" +
         "  .filter(el => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 250 && r.height > 140 && cs.display !== 'none' && cs.visibility !== 'hidden' && !keys.has(el.outerHTML.length + '@' + Math.round(r.left) + ',' + Math.round(r.top)); });" +
         " if (panels.length) { const t = panels[panels.length - 1]; t.setAttribute('data-cloner-added','1'); const r = t.getBoundingClientRect();" +
-        "  return { kind: 'module', html: t.outerHTML.slice(0, 180000), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } }; }" +
+        "  return { kind: 'module', html: ((" + STYLED_HTML_SRC + ")(t) || t.outerHTML).slice(0, 180000), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } }; }" +
         " const overlays = [...document.querySelectorAll('[class*=\"modal\"],[class*=\"dialog\"],[role=\"dialog\"],[class*=\"picker\"],[class*=\"popup\"]')]" +
         "  .filter(el => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 300 && r.height > 200 && cs.display !== 'none' && cs.visibility !== 'hidden' && !keys.has(el.outerHTML.length + '@' + Math.round(r.left) + ',' + Math.round(r.top)); });" +
         " if (overlays.length) { const t = overlays[overlays.length - 1]; const r = t.getBoundingClientRect();" +
-        "  return { kind: 'overlay', html: t.outerHTML.slice(0, 120000), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } }; }" +
+        "  return { kind: 'overlay', html: ((" + STYLED_HTML_SRC + ")(t) || t.outerHTML).slice(0, 120000), box: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) } }; }" +
         " return null; })(" + JSON.stringify(before) + ")",
       )), 12000, "captureInner.cap")
       .catch(() => null);
@@ -687,8 +774,8 @@ async function explorePass(page, { max, waitMs, triggerMax, deadline, label, see
       if ((cap && cap.html && cap.html.length > 300) || innerRecords.length) {
         behaviors.push({
           trigger: { id: m.id, label: (m.text || sig || "").slice(0, 60) },
-          opens: cap?.box ? { kind: "overlay", w: cap.box.w, h: cap.box.h } : null,
-          childPanels: innerRecords.map((r) => ({ text: r.text, kind: r.kind, w: r.box?.w, h: r.box?.h })),
+          opens: cap?.box ? { kind: "overlay", x: cap.box.x, y: cap.box.y, w: cap.box.w, h: cap.box.h } : null,
+          childPanels: innerRecords.map((r) => ({ text: r.text, kind: r.kind, x: r.box?.x, y: r.box?.y, w: r.box?.w, h: r.box?.h })),
           screenshot: null,
         });
         if (statesDir) {

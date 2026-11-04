@@ -5,9 +5,10 @@
 export const DOM_EXTRACTOR_SCRIPT = `(() => {
   const MAX = 1200;
   const PROPS = ["display","position","flexDirection","justifyContent","alignItems","gap","gridTemplateColumns",
-    "padding","margin","backgroundColor","color","fontFamily","fontSize","fontWeight","lineHeight",
-    "border","borderRadius","opacity","overflow","zIndex"];
+    "padding","margin","backgroundColor","backgroundImage","color","fontFamily","fontSize","fontWeight","lineHeight",
+    "border","borderRadius","opacity","overflow","zIndex","transform"];
   const out = [];
+  const sources = []; // record index → source element (real-DOM parent resolution)
   const els = [...document.querySelectorAll("body *")];
   const total = els.length;
   const step = Math.max(1, Math.floor(els.length / MAX));
@@ -44,36 +45,67 @@ export const DOM_EXTRACTOR_SCRIPT = `(() => {
       style: {
         padding: cs.padding, margin: cs.margin,
         backgroundColor: cs.backgroundColor, color: cs.color,
+        backgroundImage: cs.backgroundImage && cs.backgroundImage !== "none" ? cs.backgroundImage.slice(0, 300) : null,
         fontFamily: cs.fontFamily.split(",")[0].replace(/["']/g, ""),
         fontSize: cs.fontSize, fontWeight: cs.fontWeight, lineHeight: cs.lineHeight,
         border: cs.borderTopWidth + " " + cs.borderTopStyle + " " + cs.borderTopColor,
         borderRadius: cs.borderRadius, opacity: cs.opacity,
         overflow: cs.overflow, zIndex: cs.zIndex,
+        transform: cs.transform && cs.transform !== "none" ? cs.transform : null,
       },
     };
     out.push(rec);
+    sources.push(el);
     if (cs.position === "fixed" && fixed.length < 20) fixed.push({ tag: rec.tag, cls: rec.cls, rect: rec.rect });
     if (cs.position === "sticky" && sticky.length < 20) sticky.push({ tag: rec.tag, cls: rec.cls });
     const sig = rec.tag + "|" + rec.cls;
     if (rec.cls) classSigCount[sig] = (classSigCount[sig] || 0) + 1;
   }
-  // resolve parents by containment
+  // resolve parents from the REAL DOM (nearest sampled ancestor), not geometric
+  // containment: transform-positioned subtrees (swiper wrappers translated
+  // -2000px+ offscreen) have screen rects OUTSIDE their true parents, so
+  // containment assigned children to wrong containers and the reconstruction
+  // scattered carousels/headers across the document (Tradovate tree-scatter bug).
+  const idxOfEl = new Map();
+  for (let a = 0; a < out.length; a++) idxOfEl.set(sources[a], a);
   for (let a = 0; a < out.length; a++) {
-    let best = null, bestArea = Infinity;
-    const ra = { x: out[a].rect.x, y: out[a].rect.y, w: out[a].rect.w, h: out[a].rect.h };
-    for (let b = 0; b < out.length; b++) {
-      if (a === b) continue;
-      const rb = out[b].rect;
-      if (rb.x <= ra.x && rb.y <= ra.y && rb.x + rb.w >= ra.x + ra.w && rb.y + rb.h >= ra.y + ra.h && rb.w * rb.h < bestArea) {
-        best = b; bestArea = rb.w * rb.h;
-      }
+    let p = sources[a] ? sources[a].parentElement : null;
+    let parent = null;
+    while (p && p !== document.body) {
+      if (idxOfEl.has(p)) { parent = idxOfEl.get(p); break; }
+      p = p.parentElement;
     }
-    out[a].parent = best;
+    out[a].parent = parent;
   }
   // repeated components: same tag+class signature appearing >= 3 times
   const repeated = Object.entries(classSigCount).filter(([, n]) => n >= 3).sort((a, b) => b[1] - a[1]).slice(0, 12)
     .map(([sig, n]) => ({ signature: sig.slice(0, 60), count: n }));
-  return { total, sampled: out.length, elements: out, repeated, fixed, sticky, sampledAt: new Date().toISOString() };
+  // G4.1 self-reverse (nginx.org): the element loop samples 'body *' — body
+  // and html THEMSELVES are never captured, so the token builder had no real
+  // page background and picked the most frequent non-transparent ELEMENT bg
+  // (nginx's 1440×29 black banner) for the body rule, rendering the whole
+  // clone black vs the original's white page (96.9% pixel drift). Capture the
+  // page-root computed styles separately (transparent bg → null so callers
+  // fall back to their own default instead of mapping alpha-0 to a color).
+  const rootStyleOf = (el) => {
+    try {
+      if (!el) return null;
+      const cs = getComputedStyle(el);
+      const transparent = (v) => {
+        const m = String(v || "").match(/rgba?\(([^)]*)\)/i);
+        if (!m) return false;
+        const parts = m[1].split(/[\s,/]+/).filter(Boolean);
+        return parts.length >= 4 && Number(parts[3]) === 0;
+      };
+      return {
+        backgroundColor: transparent(cs.backgroundColor) ? null : cs.backgroundColor,
+        color: transparent(cs.color) ? null : cs.color,
+        fontFamily: String(cs.fontFamily || "").split(",")[0].replace(/["']/g, ""),
+        fontSize: cs.fontSize,
+      };
+    } catch { return null; }
+  };
+  return { total, sampled: out.length, elements: out, repeated, fixed, sticky, bodyStyle: rootStyleOf(document.body), htmlStyle: rootStyleOf(document.documentElement), sampledAt: new Date().toISOString() };
 })()`;
 
 // typography analysis from the sampled elements (fonts, sizes, weights, line-heights)

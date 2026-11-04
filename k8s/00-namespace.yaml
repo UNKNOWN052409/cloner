@@ -1,0 +1,23 @@
+# Task 4.2.5 — Kubernetes PROFILE: everything in this directory deploys into
+# the "cloner" namespace (kubectl apply -f k8s/ picks up all *.yaml files in
+# lexical order; the .yaml.example secret template is intentionally NOT
+# matched — see 20-secrets.yaml.example).
+#
+# Pod Security: the platform image runs as the non-root "node" user (uid 1000,
+# see the Dockerfile runtime stage) with seccomp RuntimeDefault, so the
+# namespace is labeled for the "restricted" PSA profile on audit/warn and
+# "baseline" on enforce. Enforcing "restricted" is left to the operator —
+# flipping it on is safe for every manifest shipped here (all workloads set
+# runAsNonRoot, allowPrivilegeEscalation=false, capabilities drop ALL,
+# seccompProfile=RuntimeDefault) but is not done by default so exotic node
+# pools (e.g. Chromium user-namespace edge cases) do not go dark silently.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloner
+  labels:
+    app.kubernetes.io/part-of: cloner-platform
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

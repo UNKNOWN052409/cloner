@@ -3,6 +3,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { bus } from "./events.js";
+// SSRF hardening (hunt G5.3): every context gets a request-level guard so
+// redirects, subresources, iframes and DNS-rebinding second lookups re-run
+// the private-host policy at request time — the entry URL check alone cannot
+// see any of those.
+import { attachRequestGuard, assertSafeNavigationUrl, guardPageWebSockets } from "./security/request-guard.js";
 
 let pwPromise = null;
 async function pw() {
@@ -75,8 +80,9 @@ export async function launchBrowser(opts = {}) {
   throw new Error(`no browser could launch (tried bundled chromium, msedge, chrome): ${lastErr?.message}`);
 }
 
-export async function newContext(browser, { cookies, viewport, storage }) {
+export async function newContext(browser, { cookies, viewport, storage, requestGuard = true } = {}) {
   const ctx = await browser.newContext({ viewport, ignoreHTTPSErrors: true, serviceWorkers: "allow" });
+  if (requestGuard) await attachRequestGuard(ctx); // per-request SSRF policy (redirects / rebinding / subresource pivots)
   if (cookies?.length) await ctx.addCookies(cookies);
   // SPA auth often lives in localStorage/sessionStorage (cookies alone don't restore it)
   if (storage && (storage.ls || storage.ss)) {
@@ -135,7 +141,8 @@ const probeDeadline = (p, ms, fallback) =>
 async function waitForAppSettle(page, spaWaitMs = 15000, { expectCanvas = false } = {}) {
   const deadline = Date.now() + Math.max(5000, spaWaitMs);
   let prev = -1, stable = 0, maxCanvas = 0;
-  while (Date.now() < deadline && stable < 3) {
+  let prevCounts = "", countsStable = 0;
+  while (Date.now() < deadline && stable < 3 && countsStable < 3) {
     await page.waitForTimeout(1200);
     const len = await probeDeadline(
       page.evaluate(() => document.body.innerHTML.length).catch(() => prev), 5000, prev,
@@ -145,8 +152,21 @@ async function waitForAppSettle(page, spaWaitMs = 15000, { expectCanvas = false 
     );
     maxCanvas = Math.max(maxCanvas, canvasCount);
     const canvasReady = maxCanvas === 0 || canvasCount > 0;
+    // task 3.4.x fix: marketing/SPA pages mount sections PROGRESSIVELY (scroll /
+    // animation-triggered), so innerHTML length can look stable while button/tab/
+    // header counts still grow — each capture then froze a different mount stage
+    // (Tradovate: one /welcome URL → 12 "distinct" states + carousel drift). Wait
+    // for the SAME count family the state fingerprint uses to go stable too.
+    const counts = await probeDeadline(
+      page.evaluate(() => {
+        const q = (s) => document.querySelectorAll(s).length;
+        return JSON.stringify([q("button"), q("a"), q("input"), q("table"), q("canvas"), q("[role='dialog'],dialog"), q("[role='tab']"), q("header,[role='banner']")]);
+      }).catch(() => prevCounts), 5000, prevCounts,
+    );
     stable = len === prev && canvasReady ? stable + 1 : 0;
+    countsStable = counts === prevCounts ? countsStable + 1 : 0;
     prev = len;
+    prevCounts = counts;
   }
   if (maxCanvas > 0 || expectCanvas) {
     await page
@@ -165,7 +185,20 @@ function guardDialogs(page) {
 export async function capturePage(page, url, { networkIdleMs = 6000, spaWaitMs = 15000, interactions = null } = {}) {
   bus.emit("page:goto", { url });
   guardDialogs(page);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  // WS residual guard (context.route does not intercept websocket handshakes)
+  const detachWsGuard = guardPageWebSockets(page, { logBlocked: false });
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  } finally {
+    detachWsGuard();
+  }
+  // post-navigation assertion: where did we ACTUALLY land? A redirect chain
+  // into a private/loopback target must fail the task, never produce a clone.
+  const landedCheck = assertSafeNavigationUrl(page.url());
+  if (!landedCheck.ok) {
+    await page.close().catch(() => {});
+    throw new Error(`ssrf-guard: ${landedCheck.error}`);
+  }
   let idle = true;
   try {
     await page.waitForLoadState("networkidle", { timeout: networkIdleMs });
@@ -175,6 +208,12 @@ export async function capturePage(page, url, { networkIdleMs = 6000, spaWaitMs =
   // trigger lazy loading, then return to top
   await autoScroll(page);
   await waitForAppSettle(page, spaWaitMs);
+  // task 3.4.x fix: lazy hero/carousel art loads as CSS background-image — the old
+  // settle check never awaited those, so the capture froze the blue fallback color
+  // into screenshot + styles (Tradovate flat-blue clone bug). Await the art first,
+  // then FREEZE carousels/animations so every capture sees the same slide-0 state.
+  await waitForPageArtLoaded(page, 9000);
+  await freezeDynamicUi(page);
   if (!idle) bus.emit("log", { level: "info", msg: "long-loading app — captured after DOM stabilized" });
   await page.waitForTimeout(400);
 
@@ -185,11 +224,10 @@ export async function capturePage(page, url, { networkIdleMs = 6000, spaWaitMs =
   const stack = await probeDeadline(page.evaluate(detectStack), 6000, null).catch(() => null);
   const tokensV2 = await probeDeadline(page.evaluate(designTokensV2), 8000, null).catch(() => null);
 
-  // PRISTINE-FIRST capture: mark triggers passively, screenshot and serialize the
-  // workspace BEFORE the explorer touches anything — the clone is the app's real
-  // state, and exploration mutations can never contaminate it. Recording then
-  // clicks the pre-marked controls (pass 2 re-marks new ones; those records ride
-  // the runtime's text-signature fallback since the pristine HTML is frozen).
+  // PRISTINE-FIRST capture, UPGRADED (user directive: old-Pywl behavior — scroll +
+  // click every button FIRST, then capture): mark safe triggers, expand each with
+  // an Escape reset so the page is at its FULLY-MOUNTED stage when the clone
+  // freezes it. Overlays are reset after every click; nothing is recorded yet.
   let preMarked = [];
   if (interactions) {
     try {
@@ -199,6 +237,11 @@ export async function capturePage(page, url, { networkIdleMs = 6000, spaWaitMs =
       bus.emit("log", { level: "warn", msg: `markTriggers failed: ${e.message.slice(0, 90)}` });
     }
   }
+  const expandedCount = await expandViaTriggers(page, preMarked, {});
+  if (expandedCount) bus.emit("log", { level: "info", msg: `pre-capture expansion: ${expandedCount} trigger(s) clicked + reset` });
+  await waitForAppSettle(page, Math.min(spaWaitMs, 10000), {});
+  await waitForPageArtLoaded(page, 6000);
+  await freezeDynamicUi(page);
   const screenshot = await page.screenshot({ fullPage: true, timeout: 20000 }).catch(() => null);
 
   const html = await probeDeadline(page.evaluate(serializeEnhanced), 25000, null);
@@ -207,6 +250,8 @@ export async function capturePage(page, url, { networkIdleMs = 6000, spaWaitMs =
     // WITHOUT interactions, so we never ship a dead/empty shell
     bus.emit("log", { level: "warn", msg: "serialize timed out — retrying capture without interactions…" });
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+    const retryCheck = assertSafeNavigationUrl(page.url());
+    if (!retryCheck.ok) throw new Error(`ssrf-guard: ${retryCheck.error}`);
     await waitForAppSettle(page, Math.min(spaWaitMs, 12000));
     preMarked = [];
     if (interactions) {
@@ -508,12 +553,101 @@ export async function discoverTabs(page, registrable, max) {
   return links.slice(0, max - 1);
 }
 
+// task 3.4.x fix (part 2): carousels (Swiper etc.) auto-advance between captures,
+// so every capture/render sees a different slide — distinct DOM signatures (12
+// "distinct" states for one Tradovate view) and huge pixel drift (slide
+// misalignment reads as 60%+ diff). Freeze them deterministically: stop autoplay,
+// jump to slide 0, and pause CSS animations so capture and verify align.
+async function freezeDynamicUi(page) {
+  await page
+    .evaluate(() => {
+      try {
+        for (const el of document.querySelectorAll(".swiper, [class*='swiper']")) {
+          const sw = el.swiper;
+          if (sw) {
+            try { sw.autoplay && sw.autoplay.stop && sw.autoplay.stop(); } catch {}
+            try { sw.slideTo && sw.slideTo(0, 0); } catch {}
+          }
+        }
+        const style = document.createElement("style");
+        style.id = "cloner-freeze-style";
+        // complete animations INSTANTLY (0.001s) rather than pausing: paused
+        // entrance fades freeze content at opacity:0 (invisible clone); instant
+        // completion lands the final visible state
+        style.textContent = "*,*::before,*::after{animation-duration:0.001s !important;animation-delay:0s !important;transition:none !important;scroll-behavior:auto !important}";
+        document.head.appendChild(style);
+        window.scrollTo(0, 0);
+      } catch {}
+    })
+    .catch(() => {});
+}
+
+// Await every CSS background-image url() + any <img> still in-flight, capped.
+// Fixes clones whose hero/carousel sections baked the pre-load fallback color
+// into styles.css because the capture raced the art (Tradovate blue-screen bug).
+async function waitForPageArtLoaded(page, capMs = 9000) {
+  await page
+    .evaluate(async (cap) => {
+      const urls = new Set();
+      for (const el of document.querySelectorAll("*")) {
+        const bi = getComputedStyle(el).backgroundImage;
+        if (bi && bi !== "none") {
+          for (const m of bi.matchAll(/url\((['"]?)([^)'"]+)\1\)/g)) {
+            const u = m[2];
+            if (u && !u.startsWith("data:")) urls.add(u);
+          }
+        }
+      }
+      const load = (u) => new Promise((res) => { const x = new Image(); x.onload = x.onerror = res; x.src = u; });
+      const pending = [...document.images].filter((i) => !i.complete || i.naturalWidth === 0);
+      const jobs = [...urls].slice(0, 150).map(load).concat(
+        pending.map((i) => new Promise((res) => { i.onload = i.onerror = res; setTimeout(res, 3500); })),
+      );
+      await Promise.race([Promise.all(jobs), new Promise((res) => setTimeout(res, cap))]);
+    }, capMs)
+    .catch(() => {});
+}
+
+// task 3.4.x (user directive: "playwright scroll + click every button first, THEN
+// capture"): click every safe pre-marked trigger with an Escape reset so
+// progressively-mounted content (lazy sections, tab panels, consent-gated UI) is
+// fully expanded BEFORE the clone freezes the page. Without this the clone froze
+// the initial mount stage (3 buttons instead of 16 — the Tradovate
+// "only 1 page, incomplete" complaint). Overlays are reset after each click; the
+// frozen page stays pre-exploration in the recorded sense.
+async function expandViaTriggers(page, preMarked, { max = 50, waitMs = 450 } = {}) {
+  const ids = (preMarked || []).map((t) => (t && t.id) || t).filter(Boolean).slice(0, max);
+  let expanded = 0;
+  for (const id of ids) {
+    try {
+      const ok = await page.evaluate((tid) => {
+        const el = document.querySelector(`[data-cloner-trigger="${tid}"]`);
+        if (!el) return false;
+        el.scrollIntoView({ block: "center" });
+        el.click();
+        return true;
+      }, id).catch(() => false);
+      if (!ok) continue;
+      await page.waitForTimeout(waitMs);
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.evaluate(() => {
+        document.querySelectorAll("[data-cloner-overlay],[data-cloner-module]").forEach((n) => n.remove());
+      }).catch(() => {});
+      expanded++;
+    } catch {}
+  }
+  return expanded;
+}
+
 // render a local clone for polish comparison
 export async function renderCloneScreenshot(browser, htmlPath, viewport) {
   const ctx = await browser.newContext({ viewport });
   const page = await ctx.newPage();
   await page.goto("file:///" + htmlPath.replace(/\\/g, "/"), { waitUntil: "networkidle", timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(700);
+  // freeze carousels/animations so the verify render shows the SAME slide-0 state
+  // the frozen reference captured — otherwise autoplay drift reads as pixel diff
+  await freezeDynamicUi(page);
   const shot = await page.screenshot({ fullPage: true }).catch(() => null);
   await ctx.close();
   return shot;

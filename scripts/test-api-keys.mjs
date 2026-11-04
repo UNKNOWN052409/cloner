@@ -205,9 +205,15 @@ try {
   check("second revoke → 404 (already revoked)", revAgain.status === 404);
 
   // ---- 8. expiration ----
-  const exp = await api(base, "POST", "/api/keys", { headers: bearer, body: { name: "exp", scopes: ["read:task"], expiresInDays: -1 } });
+  // G5.2: expiresInDays must be a POSITIVE number of days (a negative/garbage
+  // value used to mint a dead-on-arrival key via `new Date(NaN)`; the API now
+  // 400s it). Mint a short-lived key (~1.6s) and wait for it to lapse.
+  const expNeg = await api(base, "POST", "/api/keys", { headers: bearer, body: { name: "exp-neg", scopes: ["read:task"], expiresInDays: -1 } });
+  check("negative expiresInDays rejected with 400", expNeg.status === 400, `got ${expNeg.status}`);
+  const exp = await api(base, "POST", "/api/keys", { headers: bearer, body: { name: "exp", scopes: ["read:task"], expiresInDays: 1.9e-8 } }); // ≈1.64 seconds
   const expKey = exp.json?.key?.fullKey;
-  check("key with past expiry created for test", exp.status === 201 && !!expKey);
+  check("short-lived key created for test", exp.status === 201 && !!expKey);
+  await new Promise((r) => setTimeout(r, 2200));
   const expUse = await api(base, "GET", "/api/whoami", { headers: { "x-api-key": expKey } });
   check("expired key rejected (401)", expUse.status === 401, `status=${expUse.status}`);
 

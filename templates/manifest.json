@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "templates": [
+    {
+      "id": "dashboard-toolbar",
+      "name": "SaaS Dashboard Toolbar",
+      "description": "Toolbar-driven app shell with picker menus, spark canvases and stacked panels — the interaction-heavy dashboard shape.",
+      "category": "dashboard",
+      "previewRef": "scripts/fixture-toolbar.html"
+    },
+    {
+      "id": "lazy-gallery",
+      "name": "Lazy Media Gallery",
+      "description": "Image-card gallery with lazy scroll loading, real PNG assets and responsive grid — content-heavy marketing/store pages.",
+      "category": "gallery",
+      "previewRef": "scripts/fixtures/lazy-scroll.mjs"
+    },
+    {
+      "id": "multi-route-app",
+      "name": "Multi-Route Web App",
+      "description": "Home + SPA routes + modal + tabs navigation shell — the classic multi-page product site starting point.",
+      "category": "app",
+      "previewRef": "scripts/fixtures/multi-route.mjs"
+    },
+    {
+      "id": "live-widgets",
+      "name": "Live Data Widgets",
+      "description": "Ticker streams and stateful widgets that update over time — operational dashboards and monitoring pages.",
+      "category": "dashboard",
+      "previewRef": "scripts/fixtures/widgets.mjs"
+    },
+    {
+      "id": "ecommerce-catalog",
+      "name": "E-commerce Catalog",
+      "description": "Product grid with category navigation and detail views — storefronts and catalog pages.",
+      "category": "ecommerce",
+      "previewRef": "scripts/fixtures/category-ecommerce.mjs"
+    }
+  ]
+}

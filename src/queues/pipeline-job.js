@@ -13,6 +13,7 @@ import path from "node:path";
 import { runExplorationJob } from "../pipeline/exploration-pipeline.js";
 import { reconstructFromArtifacts } from "../reconstruction/reconstruction-pipeline.js";
 import { verifyTask } from "../platform/verify.js";
+import { resolveCloneAdConfig } from "../runtimeTemplate.js"; // task 4.5.5 ad-slot emission hook
 
 const DEFAULT_ARTIFACTS_ROOT = path.join(process.cwd(), "artifacts");
 const noop = () => {};
@@ -42,7 +43,21 @@ export async function runPipelineJob(payload, {
   artifactsRoot = DEFAULT_ARTIFACTS_ROOT,
   linkJobId = noop,
 } = {}) {
-  const { url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [] } = payload || {};
+  const { url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], monetize = false } = payload || {};
+
+  // task 4.5.5: ad slots ONLY for a clone whose owner opted in (monetize, the
+  // policy-safe default is OFF). resolveCloneAdConfig() returns null when no
+  // official zone is configured — the generator then emits zero ad markup, and
+  // the history carries the honest note.
+  const adConfig = monetize ? resolveCloneAdConfig() : null;
+  if (monetize && entry) {
+    entry.history.push({
+      at: new Date().toISOString(),
+      event: adConfig
+        ? `monetize: opted in — emitting official ad zones (${adConfig.zones.map((z) => z.key).join(", ")})`
+        : "monetize: opted in but no ad zone is configured — zero ad markup emitted",
+    });
+  }
 
   if (entry) {
     entry.startedAt = new Date().toISOString();
@@ -74,6 +89,7 @@ export async function runPipelineJob(payload, {
   const reconstruction = await reconstructFromArtifacts(artifactsDir, {
     outDir: artifactsDir + "-project",
     interactionRecords,
+    adConfig, // task 4.5.5: null unless the task owner opted in AND zones are configured
   });
   if (entry) {
     entry.reconstruction = { passed: reconstruction.report.passed, pages: reconstruction.report.generatedFiles, repairs: reconstruction.report.repairs?.length || 0 };

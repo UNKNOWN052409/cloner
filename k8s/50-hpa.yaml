@@ -1,0 +1,164 @@
+# Task 4.2.5 — Kubernetes PROFILE: horizontal autoscaling.
+#
+# autoscaling/v2 HPAs:
+#   cloner-api              min 2 → max 6,  CPU 70% + memory 80%
+#   cloner-worker-us-east-1 min 2 → max 8,  CPU 70% + memory 85%
+#   cloner-worker-eu-west-1 min 2 → max 8,  CPU 70% + memory 85%
+#
+# PREREQUISITE: metrics-server (or an equivalent Metrics API provider) must be
+# installed — CPU/memory metrics come from the Metrics API, not from the
+# platform's own /metrics endpoint (that one exists for humans and Prometheus
+# scraping, not for the HPA). Without metrics-server the HPAs report
+# <unknown> targets and never scale; `kubectl top pods` is the quick probe.
+#
+# Scale behavior:
+#   up   — fast (one replica per 15s, no cap) because queue depth growth is
+#          the pain signal; a burst of clone tasks should widen the pool.
+#   down — 5-minute stabilization window so a lull between explorations does
+#          not thrash pods that are mid-drain.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cloner-api
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cloner-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 15
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cloner-worker-us-east-1
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: worker
+    cloner.io/region: us-east-1
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cloner-worker-us-east-1
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 85
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 15
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cloner-worker-eu-west-1
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: worker
+    cloner.io/region: eu-west-1
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cloner-worker-eu-west-1
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 85
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 15
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

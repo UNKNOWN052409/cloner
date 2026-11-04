@@ -60,6 +60,17 @@ export function loadTask(id) {
 export function saveTask(meta) {
   fs.writeFileSync(path.join(taskDir(meta.id), "task.json"), JSON.stringify(meta, null, 2));
 }
+// G5.1 (BUG #9 companion): remember the PostgreSQL mirror row id for this task —
+// admin inventory / backup read the DB table, the API surfaces read the file
+// store; this mapping (persisted in task.json) is what makes DELETE mirror
+// cleanups possible and keeps the two stores reconcilable.
+export function attachDbTask(id, dbTaskId) {
+  const meta = loadTask(id);
+  if (!meta || !dbTaskId) return meta;
+  meta.dbTaskId = dbTaskId;
+  saveTask(meta);
+  return meta;
+}
 // shred a task's credential/session files immediately (spec §10) — private/ only;
 // the clone tree (out/) is never touched. Returns true when something was removed.
 export function purgeCredentials(id) {
@@ -87,6 +98,23 @@ export function updateTask(id, patch, event = null) {
   if (event) meta.history.push({ at: new Date().toISOString(), event });
   if (meta.history.length > 200) meta.history = meta.history.slice(-200);
   saveTask(meta);
+  // G5.1 (BUG #9 companion): keep the DB mirror row's status in step with the
+  // v1 lifecycle (done/error), so the admin inventory and backups see the
+  // terminal state. Best-effort — the file store remains authoritative.
+  if (patch.status && meta.dbTaskId) {
+    import("../database/task-repository.js")
+      .then((r) => {
+        if (!meta.dbUserId) return;
+        const col = patch.status === "done" ? "completed" : patch.status === "error" ? "failed" : patch.status;
+        const dbPatch = { status: col === "completed" ? "done" : col };
+        if (patch.status === "done" || patch.status === "error") {
+          dbPatch.completed_at = new Date().toISOString();
+          if (patch.error) dbPatch.error = String(patch.error).slice(0, 300);
+        }
+        r.updateTask(meta.dbTaskId, meta.dbUserId, dbPatch).catch(() => {});
+      })
+      .catch(() => {});
+  }
   return meta;
 }
 export function listTasks() {
@@ -107,6 +135,14 @@ export function deleteTask(id) {
 // retention sweep — temporary project files expire after N days (default 15).
 // RETENTION_DAYS is honored but guarded: garbage/zero/negative values fall back to 15
 // (Number("")===0 would otherwise purge everything).
+//
+// G5.4 over-reach guards (the hourly sweep in server.js must never destroy
+// live or protected work — mirrors the artifact-lifecycle rule "never delete
+// on age alone"):
+//   • in-flight tasks (queued/running/verifying) are NEVER swept — a job can
+//     legitimately outlive the retention window mid-run;
+//   • tasks with pinned: true in task.json are NEVER swept (operator hold).
+export const SWEEP_IN_FLIGHT_STATUSES = new Set(["queued", "running", "verifying"]);
 export function sweepExpired(days) {
   const env = Number(process.env.RETENTION_DAYS);
   const d = Number.isFinite(days) && days > 0 ? days : Number.isFinite(env) && env > 0 ? env : 15;
@@ -114,6 +150,8 @@ export function sweepExpired(days) {
   const removed = [];
   for (const t of listTasks()) {
     try {
+      if (t.pinned === true) continue; // operator hold — never swept
+      if (SWEEP_IN_FLIGHT_STATUSES.has(String(t.status || ""))) continue; // live work
       if (new Date(t.createdAt).getTime() < cutoff) { deleteTask(t.id); removed.push(t.id); }
     } catch {}
   }

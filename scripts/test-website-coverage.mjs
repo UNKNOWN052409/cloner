@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Multi-category website coverage test (task 3.5.1).
 //
 // For each Phase-3.5 category fixture (e-commerce, documentation, portal):

@@ -41,6 +41,15 @@ function tar(args, opts = {}) {
   return r;
 }
 
+// tar exit status is decisive (G5.4): a truncated/corrupt archive can exit
+// non-zero while still extracting a PREFIX of the tree — the extraction must
+// be declared failed, not silently continue into verification.
+function tarOr(args, opts = {}) {
+  const r = tar(args, opts);
+  if (r.status !== 0) fail(`tar exited ${r.status}: ${String(r.stderr || "").slice(0, 400)}`);
+  return r;
+}
+
 function sha256File(file) {
   const h = crypto.createHash("sha256");
   h.update(fs.readFileSync(file));
@@ -65,7 +74,7 @@ if (RESTORE) {
   if (!archive || !fs.existsSync(archive)) fail(`no such archive: ${archive}`);
   if (!dest) fail("usage: --restore <archive.tar.gz> <destDir>");
   fs.mkdirSync(dest, { recursive: true });
-  tar(["-xzf", archive], { cwd: dest }); // cwd=dest replaces -C (see note above)
+  tarOr(["-xzf", archive], { cwd: dest }); // cwd=dest replaces -C (see note above)
 
   const base = path.basename(archive).replace(/\.tar\.gz$/, "");
   const manifest = path.join(path.dirname(archive), `${base}.manifest.json`);
@@ -79,7 +88,23 @@ if (RESTORE) {
     if (actual !== rec.sha256) fail(`checksum mismatch for ${rel}`);
     verified++;
   }
-  console.log(`OK  backup-artifacts: restored ${verified}/${Object.keys(entries.files).length} file(s) from ${path.basename(archive)}, all SHA-256 verified`);
+  // G5.4: the restored tree must not contain FILES the manifest never
+  // recorded — a tampered archive that ADDS content would otherwise restore
+  // silently ("all verified" only proves the listed files, not the tree).
+  // private/ is skipped: the manifest excludes it by design, so a live
+  // restore-over-source tree legitimately still holds it.
+  const walkRestored = (dir, relBase = "") => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const rel = relBase ? `${relBase}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (e.name === "private") continue; // never archived → never flagged
+        walkRestored(path.join(dir, e.name), rel);
+      }
+      else if (e.isFile() && !entries.files[rel]) fail(`restored tree has an UNLISTED extra file: ${rel} (archive tampered?)`);
+    }
+  };
+  walkRestored(dest);
+  console.log(`OK  backup-artifacts: restored ${verified}/${Object.keys(entries.files).length} file(s) from ${path.basename(archive)}, all SHA-256 verified, no unlisted extras`);
   process.exit(0);
 }
 
@@ -98,11 +123,16 @@ const archive = path.join(outDir, `${baseName}.tar.gz`);
 
 // build the file list: everything except private/ (session credentials)
 const files = walk(SRC).filter((rel) => !/(^|\/)private\//.test(rel) && rel !== "private");
-// tar with an explicit -T list, null-delimited, so names with spaces survive.
-// cwd=SRC replaces -C (GNU tar on Windows mangles -C targets with drive letters)
+// tar with an explicit -T list that is genuinely NUL-delimited (G5.4 fix: the
+// old code joined with "\n" while claiming to be null-delimited — a filename
+// containing a newline split into two bogus entries and corrupted the backup;
+// --null + NUL separators makes every name byte-safe on Linux prod. Win32
+// cannot even create newline-named files, but the backend must not depend on
+// that). cwd=SRC replaces -C (GNU tar on Windows mangles -C targets with
+// drive letters).
 const listFile = path.join(outDir, `.${baseName}.filelist`);
-fs.writeFileSync(listFile, files.map((f) => `./${f}`).join("\n"), "utf8");
-const r = tar(["-czf", archive, "-T", listFile], { cwd: SRC });
+fs.writeFileSync(listFile, Buffer.concat(files.map((f) => Buffer.from(`./${f}\0`, "utf8"))));
+const r = tar(["--null", "-czf", archive, "-T", listFile], { cwd: SRC });
 fs.rmSync(listFile, { force: true });
 if (r.status !== 0) fail(`tar exited ${r.status}: ${String(r.stderr).toString().slice(0, 400)}`);
 

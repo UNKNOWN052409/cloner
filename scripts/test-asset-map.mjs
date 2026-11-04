@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Fix-2 e2e probe: lazy-scroll fixture (real PNGs) → exploration → reconstruction →
 // assert generated <img src> points at copied public/assets files that exist on disk.
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

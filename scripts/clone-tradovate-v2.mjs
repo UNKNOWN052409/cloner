@@ -5,8 +5,9 @@
 // verification against the live Tradovate workspace and prints a compact verdict.
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-process.chdir(path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), ".."));
+process.chdir(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
 
 const cookiesFile = "output/tradovate-cookies.json";
 const storageFile = "output/tradovate-storage.json";

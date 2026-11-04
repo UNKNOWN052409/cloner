@@ -14,7 +14,7 @@ const BLOCKED_HOSTNAMES = new Set([
 
 const PRIVATE_NAME_PATTERN = /(^|\.)(localhost|local|internal|lan|home|arpa|intranet)$/i;
 
-function isPrivateLiteralIp(host) {
+export function isPrivateLiteralIp(host) {
   // strip brackets from IPv6 literals
   const ip = host.replace(/^\[|\]$/g, "");
   if (net.isIPv4(ip)) {
@@ -24,6 +24,7 @@ function isPrivateLiteralIp(host) {
     if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
     if (a === 192 && b === 168) return true; // RFC1918
     if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+    if (a === 198 && (b === 18 || b === 19)) return true; // RFC2544 benchmark 198.18/15 — used as internal infra range
     if (a >= 224) return true; // multicast + reserved
     return false;
   }
@@ -73,9 +74,17 @@ function isBlockedAddress(ip) {
 // validate a user-supplied target URL. Returns { ok, url, error } — on !ok the
 // caller must reject the task; never navigate on a failed check.
 export async function validatePublicUrl(rawUrl, { allowPrivate = allowPrivateTargets() } = {}) {
+  const raw = String(rawUrl ?? "");
+  // G5.1 hunt fix: control characters (CR/LF/TAB/NUL) must be rejected BEFORE
+  // anything else — the WHATWG URL parser silently STRIPS them
+  // ("https://example.com/\nheader: x" parses to "https://example.com/header: x",
+  // a 200 job), and a newline in a URL that later lands in logs/headers is the
+  // classic request-smuggling shape.
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return { ok: false, error: "URL contains control characters" };
   let u;
   try {
-    u = new URL(String(rawUrl));
+    u = new URL(raw);
   } catch {
     return { ok: false, error: "invalid URL" };
   }
@@ -111,4 +120,29 @@ export async function validatePublicUrl(rawUrl, { allowPrivate = allowPrivateTar
 
 export function allowPrivateTargets() {
   return process.env.CLONER_ALLOW_PRIVATE_TARGETS === "1";
+}
+
+// ---- shared sync predicates (used by the request-level guard) ----
+// The entry-point guard above validates the task URL once; navigation can
+// reach OTHER hosts afterwards (redirects, subresources, iframes, discovered
+// tabs). The request guard re-runs these SAME predicates per request so the
+// private-host policy stays in one place.
+
+// Sync hostname check: blocklist + private-looking names + literal IPs.
+// Returns { blocked, reason } — blocked true → the request must be dropped.
+export function isBlockedHostname(rawHost) {
+  const host = String(rawHost || "").toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!host) return { blocked: true, reason: "missing hostname" };
+  if (BLOCKED_HOSTNAMES.has(host)) return { blocked: true, reason: `host ${host} is blocked` };
+  if (PRIVATE_NAME_PATTERN.test(host)) return { blocked: true, reason: `host ${host} looks internal` };
+  const literal = isPrivateLiteralIp(host);
+  // isLiteral:true here lets the request-level guard honor the
+  // CLONER_ALLOW_PRIVATE_TARGETS opt-in for literal IPs (hunt G5.1: without
+  // it, verdict.isLiteral was undefined → loopback/private literals were
+  // blocked at request time even when the opt-in allowed them at entry,
+  // making local fixture cloning impossible with ERR_BLOCKED_BY_CLIENT).
+  // Blocklisted NAMES never carry isLiteral — they stay blocked regardless
+  // of the opt-in.
+  if (literal === true) return { blocked: true, reason: `private/reserved address ${host} blocked`, isLiteral: true };
+  return { blocked: false, reason: null, isLiteral: literal !== null };
 }

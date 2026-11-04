@@ -75,7 +75,7 @@ function addLog(level, msg) {
   $("#log").appendChild(line);
   $("#log").scrollTop = 1e9;
 }
-function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"' : "&quot;", "'": "&#39;" }[c])); } // G5.3 XSS fix: quote-aware (textContent trick leaves " unescaped — unsafe in attributes)
 
 // ---------- runs ----------
 async function loadRuns() {
@@ -102,7 +102,7 @@ function openRun(runId) {
   for (const p of meta.pages || []) {
     if (p.screenshot) shotUrls.push(`/preview/${runId}/${p.screenshot}`);
   }
-  const shotsHtml = shotUrls.map((u) => `<img src="${u}" loading="lazy" />`).join("") || `<div class="empty-state">no reference screenshots for this run</div>`;
+  const shotsHtml = shotUrls.map((u) => `<img src="${esc(u)}" loading="lazy" />`).join("") // G5.3 XSS fix: escape engine-supplied path || `<div class="empty-state">no reference screenshots for this run</div>`;
   $("#shots").innerHTML = shotsHtml;
   $("#shotsC1").innerHTML = shotsHtml;
   $("#shotsC2").innerHTML = `<iframe src="/preview/${runId}/index.html" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:6px;background:#fff"></iframe>`;

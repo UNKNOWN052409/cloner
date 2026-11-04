@@ -70,6 +70,23 @@ export function getCloneQueue() {
 const nowIso = () => new Date().toISOString();
 const noop = () => {};
 
+// G5.3 secret-leak fix: dead-letter copies never carry raw credentials —
+// they would sit in Redis for the DLQ retention window. Values are replaced
+// with markers; an operator replay re-supplies credentials explicitly.
+export function redactCredentials(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const out = { ...payload };
+  for (const k of ["username", "password", "cookies", "storage"]) {
+    if (out[k] === undefined) continue;
+    out[k] = k === "username" ? "[redacted-user]" : null;
+  }
+  out.credentialsRedacted = true;
+  return out;
+}
+
+// per-process entry sequence — see #createEntry for why tempId needs it
+let TEMP_SEQ = 0n;
+
 class CloneQueue extends EventEmitter {
   constructor({
     maxConcurrent = defaultMaxConcurrent(),
@@ -146,11 +163,22 @@ class CloneQueue extends EventEmitter {
     // API layer that accepted the request, so every read surface (task list,
     // task detail, artifacts, export, WS fan-out) can gate on it. null means
     // legacy/anonymous (local dashboard), which keeps the pre-Phase-4 posture.
-    const tempId = "pending-" + Date.now().toString(36);
+    // tempId uniqueness: the timestamp alone COLLIDES when two submissions
+    // land in the same millisecond (concurrent double-submit storm — found by
+    // the G5.2 hunt: 400 same-ms enqueues → 396 collisions, one entry
+    // silently overwriting another in the registry). A process-wide sequence
+    // plus random suffix makes the handle unique per entry.
+    const tempId = "pending-" + Date.now().toString(36) + "-" + (++TEMP_SEQ).toString(36) + Math.random().toString(36).slice(2, 6);
     const entry = {
       tempId,
       jobId: jobId || null,
       url: payload.url,
+      // 4.5.5 QA fix companion: remember the payload kind so listJobs() can
+      // keep INTERNAL bookkeeping jobs (artifact-lifecycle sweep) out of the
+      // user-facing task list — they surfaced as phantom "undefined ·
+      // completed" rows in the task list output (GET /api/tasks merges
+      // listJobs output).
+      kind: payload && payload.kind ? String(payload.kind).slice(0, 32) : null,
       status: "queued",
       queuedAt: nowIso(),
       sessionId: payload.sessionId !== undefined ? payload.sessionId : "local",
@@ -352,7 +380,16 @@ class CloneQueue extends EventEmitter {
       if (seen.has(e)) continue; // same entry keyed under tempId + jobId
       seen.add(e);
       // `owner` is INTERNAL access metadata — never shipped to API clients
-      out.push({ jobId: e.jobId || e.tempId, url: e.url, status: e.status, queuedAt: e.queuedAt, finishedAt: e.finishedAt });
+      // G5.1 hunt: `id` + `createdAt` mirror the legacy task shape so the
+      // unified GET /api/tasks list ([...legacy, ...v2]) is consumable by the
+      // task list consumers without per-entry shape branching; jobId /
+      // queuedAt stay for the existing API consumers.
+      // 4.5.5 QA fix: internal bookkeeping jobs (artifact-lifecycle sweep)
+      // are NOT clone tasks — listing them put phantom "undefined ·
+      // completed" rows into the task list output. The sweep still runs
+      // and reports through its own entry object; it is only unlisted here.
+      if (e.kind === "artifact-sweep") continue;
+      out.push({ jobId: e.jobId || e.tempId, id: e.jobId || e.tempId, url: e.url, status: e.status, createdAt: e.queuedAt, queuedAt: e.queuedAt, finishedAt: e.finishedAt });
     }
     return out;
   }
@@ -429,6 +466,20 @@ class CloneQueue extends EventEmitter {
   // ---- backend resolution (BullMQ probe, buffered replay) ----
 
   async #resolveBackend() {
+    // G5.1 hunt fix: an explicit CLONER_QUEUE_BACKEND=memory forces the
+    // in-process queue even with Redis reachable. The platform process executes
+    // jobs through the run closure it owns (exploration-runner), so jobs keep
+    // working on hosts where no standalone clone-worker process is running —
+    // previously a reachable Redis silently switched the backend to bullmq and
+    // every job sat in "active" forever (no worker process consuming the
+    // queue), reproducing run-3's clone that never reached a terminal state.
+    if (String(process.env.CLONER_QUEUE_BACKEND || "").toLowerCase() === "memory") {
+      console.log("[clone-queue] backend=memory (forced via CLONER_QUEUE_BACKEND)");
+      this.backend = "memory";
+      this.#resolvedFlag = true;
+      this.#flushPending();
+      return "memory";
+    }
     if (!this.redisUrl) {
       this.#resolvedFlag = true;
       this.#flushPending();
@@ -510,7 +561,20 @@ class CloneQueue extends EventEmitter {
       if (typeof d === "string") {
         try { d = JSON.parse(d); } catch { return; }
       }
-      if (d && typeof d.status === "string") this.#statusEvent(entry, d.status, d);
+      if (d && typeof d.status === "string") {
+        // G5.5 human-journey fix: the worker path never wrote intermediate
+        // stage transitions back into the registry entry (only "active" →
+        // exploring and the terminal states did) — a human polling
+        // GET /api/tasks/:id saw "exploring" frozen for the whole run while
+        // the job moved through reconstructing/verifying in the worker
+        // process. Mirror the memory path (pipeline-job.js writes entry.status
+        // per stage) without ever overriding a terminal/cancel verdict.
+        if (!["cancelled", "error", "completed", "completed_with_limitations"].includes(entry.status)) {
+          entry.status = d.status;
+        }
+        entry.history?.push({ at: nowIso(), event: `worker: ${d.status}` });
+        this.#statusEvent(entry, d.status, d);
+      }
     });
     events.on("completed", ({ jobId, returnvalue }) => {
       const entry = this.entries.get(jobId);
@@ -547,10 +611,15 @@ class CloneQueue extends EventEmitter {
           // dead-letter (plan 4.0.3): the job exhausted every attempt — copy it
           // into the "-dead" queue (same Redis, own queue) for inspection and
           // replay. Best-effort: a DLQ failure must not mask the registry error.
+          // G5.3 secret-leak fix: the DLQ copy strips credentials — the raw
+          // password/cookies/storage would otherwise sit in Redis dead-letter
+          // storage indefinitely. credentialsRedacted marks the shape; an
+          // operator replay re-supplies credentials explicitly.
+          const dlqPayload = job.data?.payload ? redactCredentials(job.data.payload) : null;
           await this.#bull.dlq
             .add("clone", {
               jobId,
-              payload: job.data?.payload ?? null,
+              payload: dlqPayload,
               meta: job.data?.meta ?? null,
               failedReason: String(failedReason || "unknown error"),
               failedAt: nowIso(),

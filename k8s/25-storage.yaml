@@ -1,0 +1,54 @@
+# Task 4.2.5 — persistent application state for control-plane + workers.
+#
+# Two PVCs mirror docker-compose.prod.yml's named volumes exactly:
+#   cloner-artifacts      ← /app/artifacts     (clone output, served by the API
+#                           at /api/jobs/:jobId/artifacts — src/platform/
+#                           server.js resolves it against process.cwd()/artifacts,
+#                           which is why every pod sets workingDir: /app)
+#   cloner-platform-data  ← /app/platform-data (platform-side per-task state)
+#
+# ReadWriteMany is REQUIRED in the default profile: with the API scaled by the
+# HPA (50-hpa.yaml) AND regional worker pools writing artifacts, the same
+# volume is mounted read-write by pods that may land on different nodes.
+# Provision the default StorageClass with an RWX backend (EFS, Filestore,
+# Azure Files, CephFS, NFS provisioner, …). If your cluster only has RWO
+# (block storage), pin api + all regional workers to one node pool
+# (nodeSelector in 30/40-*.yaml) AND set api replicas to 1 — the manifests
+# stay valid, you only lose HPA multi-node scaling. The test suite asserts
+# these PVCs exist and carry ReadWriteMany so a silent RWO default cannot
+# ship unnoticed.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cloner-artifacts
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  # storageClassName intentionally omitted → cluster default StorageClass.
+  # Override explicitly (e.g. "efs-sc") when the default is block storage:
+  #   storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cloner-platform-data
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi

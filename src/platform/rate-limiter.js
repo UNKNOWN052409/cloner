@@ -43,9 +43,19 @@ async function connectRedis() {
 
 function sweepMemory(now) {
   if (memoryBuckets.size < MAX_MEMORY_KEYS) return;
+  // Bucket key layout: `${id}:${windowMs}:${windowIndex}`. A bucket is stale
+  // only once its WINDOW END has passed: (windowIndex + 1) * windowMs <= now.
+  // (The previous comparison — windowIndex <= now in ms — was always true, so
+  // the sweep wiped ACTIVE buckets too once the map filled: at 10k+ distinct
+  // limiter identities every counter reset on every request and the limit was
+  // silently bypassed. Found by the G5.2 hunt.)
   for (const key of memoryBuckets.keys()) {
     const parts = key.split(":");
-    if (Number(parts[2]) <= now) memoryBuckets.delete(key);
+    const windowMs = Number(parts[parts.length - 2]);
+    const windowIndex = Number(parts[parts.length - 1]);
+    if (Number.isFinite(windowMs) && Number.isFinite(windowIndex) && (windowIndex + 1) * windowMs <= now) {
+      memoryBuckets.delete(key);
+    }
   }
 }
 
@@ -58,12 +68,15 @@ function memoryHit(id, windowMs, now) {
   return { count, resetAt: (Math.floor(now / windowMs) + 1) * windowMs };
 }
 
-// Fixed-window INCR in Redis. Atomic: INCR then EXPIRE (set only on first hit,
-// so the TTL is the true window end).
+// Fixed-window counter in Redis. Atomic window creation: SET NX PX establishes
+// the TTL in the SAME command that creates the key, then INCR counts — the
+// classic pattern that cannot leak a permanent key if the process dies between
+// two commands (INCR-then-EXPIRE could leave an unexpiring bucket → a
+// permanent 429 for that identity/window).
 async function redisHit(client, id, windowMs, now) {
   const bucketKey = `rl:${id}:${Math.floor(now / windowMs)}`;
+  try { await client.set(bucketKey, "0", "PX", windowMs, "NX"); } catch { /* INCR below still works; TTL fixed by the winner */ }
   const count = await client.incr(bucketKey);
-  if (count === 1) await client.pexpire(bucketKey, windowMs);
   const ttl = await client.pttl(bucketKey);
   return { count, resetAt: now + (ttl > 0 ? ttl : windowMs) };
 }

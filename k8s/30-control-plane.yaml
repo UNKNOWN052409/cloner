@@ -1,0 +1,217 @@
+# Task 4.2.5 — Kubernetes PROFILE: control plane.
+#
+#   • Deployment cloner-api   — the platform API/UI (bin/platform.js, port 4180)
+#   • Service    cloner-api   — ClusterIP fronting only READY api pods
+#   • Job        cloner-migrator — one-shot forward-only migration run
+#
+# Commands are EXPLICIT (not inherited from the image CMD) so this directory
+# is the single readable contract; they mirror docker-compose.prod.yml:
+#   api:      config-schema validate "api" role, then exec the server
+#   migrator: config-schema migrator (applies forward-only migrations, exits
+#             non-zero on failure — see src/config-schema.js runMigrator)
+#
+# Deployment order (plain kubectl):
+#   1. kubectl apply -f k8s/00-namespace.yaml -f k8s/10-configmap.yaml -f k8s/25-storage.yaml
+#   2. kubectl create/apply the cloner-secrets Secret (template: 20-secrets.yaml.example)
+#   3. kubectl apply -f k8s/30-control-plane.yaml       → run the migrator Job first:
+#        kubectl wait --for=condition=complete --timeout=300s job/cloner-migrator -n cloner
+#   4. kubectl apply -f k8s/40-workers.yaml -f k8s/50-hpa.yaml
+#   (api pods that start before step 2/3 are NOT ready — /readyz checks db,
+#    queue and migration currency — so Service traffic is never routed at a
+#    half-booted pod; see src/platform/health-routes.js.)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloner-api
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: api
+    cloner.io/managed-by: k8s-manifests
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloner-platform
+      app.kubernetes.io/component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloner-platform
+        app.kubernetes.io/part-of: cloner-platform
+        app.kubernetes.io/component: api
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Non-root "node" user (uid 1000) — matches the Dockerfile runtime stage.
+      # fsGroup makes the PVC mounts group-writable. NOT setting
+      # readOnlyRootFilesystem on purpose: headless chromium writes font/
+      # shader caches under $HOME inside the container rootfs.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: cloner-platform
+                    app.kubernetes.io/component: api
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: api
+          # Built from this repository: docker build --target runtime -t cloner-platform:latest .
+          # Push to your registry and change the tag for real deployments.
+          image: cloner-platform:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - node src/config-schema.js api && exec node bin/platform.js --port 4180
+          ports:
+            - name: http
+              containerPort: 4180
+          # /healthz = process liveness (touches no dependency),
+          # /readyz   = db + queue + migrations currency (health-routes.js).
+          # Probe paths are cross-checked against src/platform/health-routes.js
+          # by scripts/test-k8s-manifests.mjs — renaming a route breaks this file.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # server.js serves clone artifacts from process.cwd()/artifacts →
+          # the working directory MUST stay /app.
+          workingDir: /app
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - configMapRef:
+                name: cloner-config
+            - secretRef:
+                name: cloner-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1536Mi
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+            - name: platform-data
+              mountPath: /app/platform-data
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: cloner-artifacts
+        - name: platform-data
+          persistentVolumeClaim:
+            claimName: cloner-platform-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloner-api
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 4180
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cloner-migrator
+  namespace: cloner
+  labels:
+    app.kubernetes.io/name: cloner-platform
+    app.kubernetes.io/part-of: cloner-platform
+    app.kubernetes.io/component: migrator
+spec:
+  # One-shot and loud: no retry hiding a broken migration; the Job either
+  # completes once or surfaces the failure. Re-apply to re-run.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloner-platform
+        app.kubernetes.io/part-of: cloner-platform
+        app.kubernetes.io/component: migrator
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrator
+          image: cloner-platform:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - src/config-schema.js
+            - migrator
+          workingDir: /app
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - configMapRef:
+                name: cloner-config
+            - secretRef:
+                name: cloner-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

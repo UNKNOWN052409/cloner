@@ -28,9 +28,21 @@ export async function runPolish(browser, cfg, outDir, pageMeta, viewport) {
   }
   bus.emit("step", { id: "polish", status: "start", msg: `vision polish (${cfg.model.provider}/${cfg.model.model})` });
 
+  // Wall-clock budget for the whole polish pass (G5.5 human-journey finding:
+  // with a dead vision relay the 280s per-call timeout × rounds × configured
+  // providers stalled a FINISHED clone for many minutes — the human sees
+  // "start vision polish" and nothing else. Polish is best-effort decoration;
+  // when the budget runs out the pass degrades to a warn and the clone
+  // completes. CLONER_POLISH_BUDGET_MS=0 disables the budget (old behavior).
+  const budgetMs = Number(process.env.CLONER_POLISH_BUDGET_MS ?? 120000);
+  const deadline = budgetMs > 0 ? Date.now() + budgetMs : Infinity;
   let appliedCss = "";
   try {
     for (let round = 1; round <= (cfg.polish.rounds || 1); round++) {
+      if (Date.now() > deadline) {
+        bus.emit("step", { id: "polish", status: "skip", msg: `polish budget (${Math.round(budgetMs / 1000)}s) exhausted — skipping remaining round(s)` });
+        break;
+      }
       const cloneShot = await renderCloneScreenshot(browser, path.join(outDir, pageMeta.file), viewport);
       if (!cloneShot) throw new Error("clone render failed");
       const clonePath = path.join(outDir, "_reference", `clone-r${round}.png`);
@@ -58,7 +70,9 @@ export async function runPolish(browser, cfg, outDir, pageMeta, viewport) {
             streamed += d;
             if (streamed.length % 800 < d.length) bus.emit("model:progress", { chars: streamed.length });
           },
-          timeoutMs: 280000,
+          // a single hanging call must not outlive the pass budget — bound it
+          // to what remains (G5.5: dead relay + 280s per call stalled clones)
+          timeoutMs: Math.max(1000, Math.min(280000, deadline - Date.now())),
         },
       );
 

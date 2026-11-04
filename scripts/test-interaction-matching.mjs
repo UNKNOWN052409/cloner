@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Task 3.3.1 e2e — exact interaction element matching in the generated clone.
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 //
 // Boots the fixture-toolbar site (scripts/fixture-toolbar.html) on an ephemeral
 // node:http port, runs a real exploration (runExplorationJob) + reconstruction

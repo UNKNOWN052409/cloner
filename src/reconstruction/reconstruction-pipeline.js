@@ -81,7 +81,7 @@ export function deriveInteractionRecords(artifactsDir) {
       if (id.startsWith("t")) {
         const b = trigById.get(id);
         if (!b) continue; // no documented behavior for this capture — honest skip
-        const rec = { id, kind: b.opens?.kind || "overlay", text: b.trigger.label || "", html, box: { w: b.opens?.w, h: b.opens?.h }, pageId };
+        const rec = { id, kind: b.opens?.kind || "overlay", text: b.trigger.label || "", html, box: { x: b.opens?.x, y: b.opens?.y, w: b.opens?.w, h: b.opens?.h }, pageId };
         const els = pageDom(pageId);
         if (els) {
           const el = els.find((e) => e && e.dataClonerTrigger === id && typeof e.i === "number");
@@ -96,7 +96,7 @@ export function deriveInteractionRecords(artifactsDir) {
         const h = html.match(/<h[1-4][^>]*>([^<]{1,80})</);
         const text = (h ? h[1] : "").trim();
         const cp = modByText.get(text);
-        records.push({ id, kind: "module", text, html, box: cp ? { w: cp.w, h: cp.h } : {}, pageId });
+        records.push({ id, kind: "module", text, html, box: cp ? { x: cp.x, y: cp.y, w: cp.w, h: cp.h } : {}, pageId });
       }
     }
   }
@@ -162,7 +162,7 @@ export function structuralPathFor(elements, targetIndex) {
   return ["div.cx-x:nth-of-type(1)", ...segs].join(">");
 }
 
-export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords, visionFn, visionCfg } = {}) {
+export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords, visionFn, visionCfg, adConfig } = {}) {
   const logger = createLogger({ jobId: path.basename(artifactsDir) + "-recon", artifactsDir: path.dirname(artifactsDir) });
   const report = { rounds: [], repairs: [], limitations: [], generatedFiles: 0, passed: false };
   // explicit records win (runner may pass captured ones); else derive from artifacts
@@ -288,12 +288,20 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
         hasStreams: streamPlan.channelSpecs.length > 0,
       };
       const html = generatePageHtml({ url: lp.url, pageId: lp.pageId }, { children: [tree] }, cssCtx);
-      // route-slug filenames: page-001 (the seed) is always index.html; other
-      // pages take a readable route slug ("/pricing" → pricing.html)
+      // route-slug filenames: page-001 (the seed) is ALWAYS index.html — the
+      // verification contract compares page-001's captured screenshot against
+      // index.html, so no other page may take that file name. G4.1 self-reverse
+      // found the collision on real navigation: exploring nginx.org/en/docs/
+      // also discovered the site root, whose route "/" hit the old
+      // `|| route === "/"` branch and OVERWROTE page-001's index.html (96.9%
+      // pixel drift — the comparison was scoring a different page). Directory
+      // routes ("/guide/") strip to an empty basename → fall back to the
+      // pageId; nested segments collapse ("/docs/setup" → docs_setup.html).
       const route = new URL(lp.url, "http://x").pathname;
-      const file = lp.pageId === "page-001" || route === "/"
+      const slug = route.replace(/^\//, "").replace(/\/+$/, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_").replace(/\//g, "_").replace(/_+$/, "");
+      const file = lp.pageId === "page-001"
         ? "index.html"
-        : (route.replace(/^\//, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_") || lp.pageId) + ".html";
+        : (slug || lp.pageId) + ".html";
       pages.push({ route, html, file, elements: flat.length });
       fileByPageId.set(lp.pageId, file);
       allElements.push(...lp.elements);
@@ -302,7 +310,11 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
 
     // tokens from captured evidence
     const stylesElements = loaded.pages.flatMap((p) => p.styles?.elements || []);
-    tokens = buildTokens(loaded.assetManifest, stylesElements);
+    // G4.1: the page-root style (body, html fallback) from the first page that
+    // captured it — the body rule must reflect the page's own background, not
+    // the most frequent element background (nginx's black banner bug)
+    const pageRootStyle = loaded.pages.map((p) => p.styles?.bodyStyle || p.styles?.htmlStyle || null).find(Boolean) || null;
+    tokens = buildTokens(loaded.assetManifest, stylesElements, pageRootStyle);
     tokensCssText = tokensCss(tokens);
     // persist the measured tokens next to the artifacts — verification's HEX
     // stage reads this file (same contract as the v1 flow's design-tokens.json)
@@ -335,7 +347,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     }
     const colliding = new Set([...indexPages].filter(([, set]) => set.size > 1).map(([i]) => i));
     const scopeOf = (el) => (el && colliding.has(el.i) && pageOfElement.get(el) ? `body[data-page="${pageOfElement.get(el)}"] ` : "");
-    componentsCssText = buildComponentCss(allElements, layoutByIndex, { scopeOf });
+    componentsCssText = buildComponentCss(allElements, layoutByIndex, { scopeOf, assetMap });
     // task 3.4.3: typography refinement overrides — repairs the generator's two
     // real drifts (captured font-weight 400 on UA-bold tags renders bold because
     // buildComponentCss drops "400", and letter-spacing is never emitted) from
@@ -365,6 +377,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
       assetRoot: artifactsDir, // localPath is relative to the JOB artifact dir
       interactionRecords: replayRecords,
       streamPlan, // task 3.4.4: embedded data-stream replayer (runtime/streams.js)
+      adConfig, // task 4.5.5: ad slots only for opted-in clones (null = zero ad markup)
     });
 
     // validation (spec §7)

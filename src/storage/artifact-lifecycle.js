@@ -175,6 +175,106 @@ export function sha256File(file) {
   return h.digest("hex");
 }
 
+// ---------- integrity manifest (G5.4: manifest vs disk mismatches) ----------
+// The exploration manifest (manifest.json) records WHAT was produced but
+// nothing verified the tree afterwards: a modified or missing file exported
+// silently (G5.4 hunt — corrupt a page, exportV2Task still ships the ZIP).
+// The integrity manifest freezes {relPath → {size, sha256}} for every content
+// file at completion time; export (and any other consumer) fails closed when
+// the tree no longer matches.
+export const INTEGRITY_MANIFEST_NAME = "integrity.json";
+
+// Mutable or derived entries that must never be pinned by the integrity
+// manifest: manifest.json carries the lifecycle header (patched by pin /
+// setRetention / finalizeExportV2 after completion), export.zip and
+// export-staging/ are export byproducts, private/ dies at export time.
+function integritySkipEntry(name) {
+  return (
+    name === "manifest.json" ||
+    name === INTEGRITY_MANIFEST_NAME ||
+    name === "export.zip" ||
+    name === "export-staging" ||
+    name === STAGING_DIRNAME ||
+    name === "private"
+  );
+}
+
+export function buildIntegrityManifest(jobDir) {
+  const files = {};
+  const walk = (d, rel) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (integritySkipEntry(e.name)) continue;
+      const p = path.join(d, e.name);
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(p, r);
+      else if (e.isFile()) {
+        const st = fs.statSync(p);
+        files[r] = { size: st.size, sha256: sha256File(p) };
+      }
+    }
+  };
+  walk(jobDir, "");
+  return { schemaVersion: 1, createdAt: new Date().toISOString(), fileCount: Object.keys(files).length, files };
+}
+
+export function writeIntegrityManifest(jobDir) {
+  const m = buildIntegrityManifest(jobDir);
+  fs.writeFileSync(path.join(jobDir, INTEGRITY_MANIFEST_NAME), JSON.stringify(m, null, 2));
+  return m;
+}
+
+// Verify the recorded manifest against the disk. missing/modified FAIL CLOSED
+// (ok:false) — they mean a recorded file was tampered with or lost. Extra
+// files are REPORTED but tolerated (ok stays true): legitimate post-completion
+// stages (verification reports, understanding.json, design-tokens.json in the
+// server's run flow) legitimately add unrecorded files, and export.zip itself
+// is derived. Planted-extra detection for archives is covered strictly by
+// backup-artifacts restore. A job dir without an integrity manifest verifies
+// trivially (legacy trees).
+export function verifyArtifactIntegrity(jobDir, { manifestFile = INTEGRITY_MANIFEST_NAME } = {}) {
+  const out = { ok: true, verified: 0, missing: [], modified: [], extra: [], note: null };
+  const mfPath = path.join(jobDir, manifestFile);
+  if (!fs.existsSync(mfPath)) {
+    out.note = "no integrity manifest (legacy job) — verification skipped";
+    return out;
+  }
+  let mf;
+  try {
+    mf = JSON.parse(fs.readFileSync(mfPath, "utf8"));
+  } catch (e) {
+    out.ok = false;
+    out.note = `integrity manifest unreadable: ${String(e?.message || e)}`;
+    return out;
+  }
+  const listed = mf.files || {};
+  for (const [rel, rec] of Object.entries(listed)) {
+    const p = path.join(jobDir, ...rel.split("/"));
+    if (!fs.existsSync(p)) { out.ok = false; out.missing.push(rel); continue; }
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size !== rec.size || sha256File(p) !== rec.sha256) {
+      out.ok = false;
+      out.modified.push(rel);
+      continue;
+    }
+    out.verified += 1;
+  }
+  const walk = (d, rel) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (integritySkipEntry(e.name)) continue;
+      const p = path.join(d, e.name);
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(p, r);
+      else if (e.isFile() && !listed[r]) out.extra.push(r); // reported, not fatal (see header)
+    }
+  };
+  walk(jobDir, "");
+  return out;
+}
+
 // ---------- usage accounting (consumed by 4.0.4 quotas) ----------
 // computeUsage(root) — walks an artifacts tree and returns byte/file totals
 // split into per-org buckets and the legacy bucket.

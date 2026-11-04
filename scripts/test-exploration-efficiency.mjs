@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Task 3.5.5 — intelligent exploration efficiency test.
 //
 // Runs the SAME redundant-navigation fixture through the real exploration

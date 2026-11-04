@@ -1,3 +1,4 @@
+process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1"; // G5.3 SSRF guard: loopback fixture targets — documented opt-in (production default stays strict)
 // Exploration-engine fixture test (Phase 1): boots each of the four static
 // fixture sites (scripts/fixtures/*) on an ephemeral server, runs the real
 // pipeline (runExplorationJob) against it with tight budgets, and asserts the

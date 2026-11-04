@@ -245,7 +245,13 @@ await new Promise((resolveServer) => {
   fs.rmSync(outDir, { recursive: true, force: true });
   const logFile = path.join(outDir + ".run.log");
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
-  const proc = spawn(process.execPath, [path.join(root, "bin/cloner.js"), url, "--no-polish", "--no-ui", "-p", "1", "-o", outDir], { cwd: root });
+  const proc = spawn(process.execPath, [path.join(root, "bin/cloner.js"), url, "--no-polish", "--no-ui", "-p", "1", "-o", outDir], {
+    cwd: root,
+    // G5.3 SSRF guard: this harness clones its OWN loopback fixture — the
+    // documented CLONER_ALLOW_PRIVATE_TARGETS=1 opt-in (production default
+    // stays strict; every sibling fixture suite sets the same env).
+    env: { ...process.env, CLONER_ALLOW_PRIVATE_TARGETS: "1" },
+  });
   let log = "";
   proc.stdout.on("data", (d) => { log += d; });
   proc.stderr.on("data", (d) => { log += d; });

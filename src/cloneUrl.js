@@ -5,7 +5,8 @@ import { bus } from "./events.js";
 import { loadCookies, launchBrowser, newContext, attachSniffer, capturePage, discoverTabs, renderCloneScreenshot } from "./browser.js";
 import { downloadAssets, rewriteHtml, captureCss, finalizeCssRewrite } from "./assets.js";
 import { runPolish } from "./polish.js";
-import { buildRuntime } from "./runtimeTemplate.js";
+import { buildRuntime, resolveCloneAdConfig, withAdSlots } from "./runtimeTemplate.js";
+import { requestMonetizeOptIn } from "./platform/ads-optin.js"; // task 4.5.5 owner opt-in scope
 
 export async function cloneUrl(url, cfg, outDir, opts = {}) {
   const crawl = cfg.crawl;
@@ -235,12 +236,27 @@ export async function cloneUrl(url, cfg, outDir, opts = {}) {
   await ctx.close().catch(() => {});
 
   // --- assemble pages ---
+  // task 4.5.5: ad slots only for a clone whose owner opted in (monetize,
+  // captured by ads-optin.js in the task-creation request scope; explicit
+  // opts.monetize overrides for callers outside the request chain). Config
+  // resolves to null with no official zones configured → zero ad markup.
+  const monetizeOptIn = opts.monetize === true || requestMonetizeOptIn() === true;
+  const adConfig = monetizeOptIn ? resolveCloneAdConfig() : null;
+  if (monetizeOptIn) {
+    bus.emit("log", {
+      level: "info",
+      msg: adConfig
+        ? `monetize: opted in — emitting official ad zones (${adConfig.zones.map((z) => z.key).join(", ")})`
+        : "monetize: opted in but no ad zone is configured — zero ad markup emitted",
+    });
+  }
   bus.emit("step", { id: "assemble", status: "start", msg: "writing clone…" });
   for (let i = 0; i < pages.length; i++) {
     const p = pages[i];
     let html = p.html || "<!DOCTYPE html><html><head></head><body><!-- capture failed --></body></html>";
     html = rewriteHtml(html, p.url, urlMap, origin);
     if (i > 0) html = rewriteLinks(html, p.url, pages, origin);
+    html = withAdSlots(html, adConfig, { page: `page-${i + 1}` }); // idempotent + fail-safe
     const name = i === 0 ? "index.html" : `page-${i + 1}.html`;
     fs.writeFileSync(path.join(outDir, name), html);
     p.file = name;

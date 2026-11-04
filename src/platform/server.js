@@ -18,7 +18,7 @@ import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
 import { exportTask, exportV2Task } from "./exporter.js";
 import { verifyTask } from "./verify.js";
-import { authRequired, requireRole } from "../auth/auth-middleware.js";
+import { authRequired, requireRole, tokenFingerprint } from "../auth/auth-middleware.js";
 import * as auth from "../auth/auth-service.js";
 import * as taskRepo from "../database/task-repository.js";
 import { migrate } from "../database/client.js";
@@ -32,13 +32,50 @@ import * as auditService from "./audit-service.js";                   // 4.0.9 h
 import { audit as auditEvents } from "./audit-service.js";
 import { keysRouter, apiKeyAuth } from "./api-key-service.js";        // 4.0.6 API keys (+ rate limit)
 import { quotaGuard, quotaUsageRoute, quotaReconcile, promoteReservation, releaseReservation } from "./quota-middleware.js"; // 4.0.4
+import { QuotaExceededError } from "./quota-service.js";
+import { checkLimit, rateLimitHeaders } from "./rate-limiter.js";
 import { getCloneQueue } from "../queues/clone-queue.js";
 import { resolveArtifactPath, sweep as artifactSweep, enqueueSweep } from "../storage/artifact-lifecycle.js"; // 4.0.5
+import { dashboardRouter } from "./dashboard-routes.js";              // G2.1 dashboard summary + quota widgets
+// ---- Phase 4.2 / 4.5 / G-series integrations (grand-final integration) ----
+import { regionRouter, getRegionRegistry } from "../distributed/region-registry.js";               // 4.2.1 region registry
+import { createReplicationRouter, attachReplicationToQueue } from "../storage/artifact-replication.js"; // 4.2.3 artifact replication
+import { failoverRoutes, createFailoverController, createQueueDispatcher } from "../distributed/failover.js"; // 4.2.9 failover
+import { attachTraceSinkFromEnv } from "../observability/trace-export.js";                          // 4.2.10 tracing export
+import { capacityRouter } from "./routes-capacity.js";                                              // 4.2.11 capacity dashboards
+import { hooksRouter, installWorkflowHooks, emitTaskLifecycleEvent } from "./workflow-hooks.js";    // 4.2.15 workflow hooks
+import { notificationRouter } from "./notification-delivery.js";                                    // 4.2.16 notifications
+import { githubPublishRouter } from "./github-publish-real.js";                                     // G1.1 real GitHub publish
+import { createEmailRouter } from "./email-real.js";                                                // G1.2 real SMTP email
+import { uiConfigRouter } from "./ui-config-routes.js";                                             // G2.3 provider config
+import { createRecoveryRouter } from "./session-recovery.js";                                       // 4.5.3 export recovery
+import { oauthRouter } from "./oauth-real.js";                                                      // 4.5.1 google-only OAuth
+import { billingRouter, billingRawBody } from "./billing-stripe.js";                                // 4.5.2 zero-dollar billing
+import { adsRouter } from "../monetization/ad-slots.js";                                            // 4.5.4 ad provider core
+import { adConfigRouter } from "../monetization/ad-config-api.js";                                  // 4.5.5 per-task monetize flag
+import { intelligenceRouter } from "./intelligence/intelligence-routes.js";                         // G3.3 ops intelligence
+import { monetizeOptInMiddleware } from "./ads-optin.js";                                           // 4.5.5 opt-in capture
+import { createPluginRegistry } from "../integrations/plugin-framework.js";                         // 4.2.14 plugin framework
+import { settleJobCost, setCreditLedger, isInsufficientCreditsError, LedgerSettlementError } from "./compute-accounting.js";
+import { resolveScope } from "./quota-service.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export function startPlatform({ port = 4180 } = {}) {
   const app = express();
+  // G5.2 hunt hardening: management surfaces take SMALL JSON payloads only.
+  // Mounted BEFORE the 20mb parser — the first matching parser consumes the
+  // stream, so an oversized auth/key body is rejected with 413 without ever
+  // being parsed or hashed (2MB bodies were previously accepted on
+  // /api/auth/register — a bcrypt round on megabytes of password per request —
+  // and on /api/keys; every route parsed up to 20MB).
+  app.use("/api/auth", express.json({ limit: "32kb" }));
+  app.use("/api/keys", express.json({ limit: "64kb" }));
+  // Billing (4.5.2) BEFORE the global 20mb parser: the /webhook route needs the
+  // EXACT raw request bytes for HMAC verification — billingRawBody() fails
+  // closed (500 + actionable message) when a parser already consumed the
+  // stream. checkout/portal parse their own small JSON inside the router.
+  app.use("/api/billing", billingRouter());
   app.use(express.json({ limit: "20mb" }));
 
   // ---- Phase 4.0 mount order (auth → tenant → quota → rate-limit → routes) ----
@@ -64,11 +101,127 @@ export function startPlatform({ port = 4180 } = {}) {
   //    audit events land in the real hash-chained 4.0.9 audit_events table.
   app.use("/api/admin", adminRouter({ queue: getCloneQueue(), audit: auditBridgeFromAuditService(auditService) }));
 
+  // 6. Dashboard aggregate (G2.1): task-history summary + caller quota usage for
+  //    the operator dashboard clients (headless since G7.1 — API consumers only).
+  //    Carries its own credentialedRead-style credential resolution (anonymous
+  //    loopback keeps the legacy local-dashboard posture).
+  app.use("/api/dashboard", dashboardRouter());
+
+  // ---- distributed-plane boot wiring (4.2.x) — runs BEFORE the mounts that
+  // reference the objects they create ----
+  // Trace sink (4.2.10): spans export to JSONL when CLONER_TRACING != "0".
+  attachTraceSinkFromEnv();
+
+  // Artifact replication (4.2.3): copy-on-complete to REPLICATION_REGIONS
+  // roots; a no-op (origin-only) when the env is unset.
+  const detachReplication = attachReplicationToQueue(getCloneQueue());
+  void detachReplication; // process-lifetime wiring; no shutdown path tears it down
+
+  // Workflow hooks (4.2.15): v2 queue status → user webhook fan-out.
+  installWorkflowHooks({ queue: getCloneQueue() });
+
+  // Plugin framework (4.2.14): lifecycle hooks for first-party integrations;
+  // audit events land in the hash-chained trail (never throws). Exposed on
+  // globalThis so the quota guard's rejection path can reach it without an
+  // import cycle.
+  const plugins = createPluginRegistry({ audit: (e) => auditSafe(recordAuditEventSafe, e) });
+  plugins.attachEventBus(bus);
+  globalThis.__clonerPlugins = plugins;
+
+  // Compute accounting (4.2.12): the free-platform grant ledger is the real
+  // ledger; it is GRANT-ONLY (no debit interface — see credit-ledger.js), so
+  // settlements persist with status 'unposted' until a debit-capable ledger is
+  // injected. setCreditLedger(null) keeps the accounting path live with the
+  // documented sweep upgrade path (one call with any debit-capable object).
+  setCreditLedger(null);
+
+  // Ops failover controller (4.2.9): heartbeat sweep + re-route handoff
+  // through the REAL queue. A re-routed job's run closure resolves back to the
+  // pipeline the payload already carries (memory backend executes in-process;
+  // a BullMQ deployment consumes the region queue from its worker process).
+  const failover = createFailoverController({
+    dispatch: createQueueDispatcher(getCloneQueue(), (job) =>
+      (job?.payload?.run ? { run: job.payload.run } : null)),
+  });
+  failover.start();
+
+  // 7. Billing (4.5.2): mounted ABOVE (before express.json) — the /webhook
+  //    route requires raw request bytes for signature verification.
+
+  // 8. Recovery (4.5.3): one-click-export import + resume. express.raw is
+  //    per-route inside the router (application/zip, 1GB); the tenant-scope
+  //    middleware only validates membership when ?orgId= is present.
+  app.use("/api/recovery", createRecoveryRouter({ authRequired, tenantScope: resolveTenantScope }));
+
+  // 9. Notifications (4.2.16): per-user email/webhook preferences + delivery
+  //    log; all rows session-scoped inside the router.
+  app.use("/api/notifications", notificationRouter());
+
+  // 10. Email (G1.2): real SMTP send + receipts (env-configured; 503
+  //     EMAIL_NOT_CONFIGURED when SMTP_* is absent).
+  app.use("/api/email", createEmailRouter());
+
+  // 11. Model-provider config (G2.3): onboarding rotation + REAL probes; the
+  //     router carries its own loopback-or-authed gate.
+  app.use("/api/config", uiConfigRouter());
+
+  // 12. Ads (4.5.4/4.5.5): provider-tag serving (public, anonymous session
+  //     cookie for frequency caps) + per-task monetize flag management.
+  app.use("/api/ads", adsRouter());
+  app.use("/api/ad-config", adConfigRouter());
+
+  // 13. Capacity dashboards (4.2.11): operator surface — the router carries
+  //     authRequired + its own admin guard (403 non-admin).
+  app.use("/api/capacity", capacityRouter());
+
+  // 14. Ops intelligence (G3.3): same operator posture; engines degrade to
+  //     200 {degraded:true} when their data source is unavailable.
+  app.use("/api/intelligence", intelligenceRouter());
+
+  // 15. Region registry admin (4.2.1): the registry is the coordinator's
+  //     in-memory plane; guarded with the platform auth (operator surface).
+  app.use("/api/regions", regionRouter({ registry: getRegionRegistry(), authRequired }));
+
+  // 16. GitHub publish (G1.1): the router demands a guard — mounted AFTER the
+  //     middleware family is defined below (see the github mount note there).
+  // 17. Workflow hooks (4.2.15): user-defined lifecycle webhook receivers;
+  //     the router carries its own authRequired.
+  app.use("/api/hooks", hooksRouter);
+
+  // 18. Google-only OAuth (4.5.1): self-contained login flow; sessions it
+  //     creates satisfy the existing authRequired surfaces.
+  app.use("/api/auth/oauth", oauthRouter());
+
+  // 19. Distributed failover ops (4.2.9): region heartbeat/reroute/replica
+  //     admin under one controller; admin-only for state-mutating routes.
+  const failoverGuard = (req, res, next) => {
+    if (req.userRole === "admin") return next();
+    res.status(403).json({ error: "admin role required" });
+  };
+  app.use("/api/distributed", failoverRoutes({ controller: failover, guard: failoverGuard }));
+
   // ---- database migrations (run once at boot) ----
   migrate().catch((e) => console.error('[db] migration failed:', e.message));
 
   // ---- auth routes (spec §6) — security events land in audit_events (4.0.9) ----
-  app.post('/api/auth/register', async (req, res) => {
+  // G5.2 hunt hardening: per-IP throttle on the credential endpoints. They were
+  // previously UNLIMITED — 40 rapid bad logins all returned 401 with no 429
+  // (credential stuffing and bcrypt CPU burn were free). Limiter ids are
+  // per-route + per-IP, never token material. Limits via env; a limiter outage
+  // fails open so auth availability never depends on the limiter.
+  const authLimits = () => ({
+    perMinute: Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE || 15),
+    perHour: Number(process.env.AUTH_RATE_LIMIT_PER_HOUR || 150),
+  });
+  const authThrottle = (route) => async (req, res, next) => {
+    try {
+      const result = await checkLimit(`auth:${route}:${req.ip || "unknown"}`, authLimits());
+      for (const [h, v] of Object.entries(rateLimitHeaders(result))) res.setHeader(h, v);
+      if (!result.allowed) return res.status(429).json({ error: "too many attempts — try again later", retryAfterMs: result.retryAfterMs });
+    } catch { /* rate limiter unavailable → fail open for auth availability */ }
+    next();
+  };
+  app.post('/api/auth/register', authThrottle("register"), async (req, res) => {
     try {
       const { email, password } = req.body || {};
       const user = await auth.registerUser(email, password);
@@ -76,11 +229,25 @@ export function startPlatform({ port = 4180 } = {}) {
       res.json({ ok: true, userId: user.id, email: user.email });
     } catch (e) { res.status(400).json({ error: e.message.slice(0, 120) }); }
   });
-  app.post('/api/auth/login', async (req, res) => {
+  app.post('/api/auth/login', authThrottle("login"), async (req, res) => {
     try {
       const { email, password } = req.body || {};
       const session = await auth.loginUser(email, password);
-      auditSafe(auditEvents.loginSuccess, { actorEmail: session.email, actorId: session.userId, sessionId: session.token, targetType: "session", targetId: session.token });
+      // hunt G5.3 fix: NEVER write the raw bearer token into the audit log —
+      // audit_events.target_id was storing the full session credential, which
+      // turned every audit reader (admin, exports, backups) into a session
+      // hijack. Only a non-reversible fingerprint goes in.
+      const tokFp = tokenFingerprint(session.token);
+      auditSafe(auditEvents.loginSuccess, { actorEmail: session.email, actorId: session.userId, sessionId: tokFp, targetType: "session", targetId: tokFp });
+      // G5.5 human-journey fix: hand the session to the BROWSER too (HttpOnly,
+      // SameSite=Strict, 7-day TTL matching SESSION_TTL_MS). Browser
+      // navigations (clone preview, iframe loads) cannot set an Authorization
+      // header; ws-auth.authenticateUpgrade already trusted this exact cookie
+      // for WS upgrades, and the preview/authed routes now resolve the same
+      // identity from it. API-only callers keep using the Bearer header — the
+      // cookie is additive, never a replacement.
+      res.setHeader("Set-Cookie",
+        `cloner_session=${session.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${7 * 24 * 3600}`);
       res.json({ ok: true, token: session.token, userId: session.userId, email: session.email, expiresAt: session.expiresAt });
     } catch (e) {
       auditSafe(auditEvents.loginFailure, { actorEmail: (req.body || {}).email || null, targetType: "session" });
@@ -90,23 +257,28 @@ export function startPlatform({ port = 4180 } = {}) {
   app.post('/api/auth/logout', authRequired, async (req, res) => {
     const token = (req.headers.authorization || '').replace('Bearer ', '');
     await auth.revokeSession(token);
-    auditSafe(auditEvents.sessionRevoked, { actorId: req.userId, sessionId: token.slice(0, 12) + "…", targetType: "session", targetId: token.slice(0, 12) });
+    const tokFp = tokenFingerprint(token); // fingerprint only — never the raw token
+    auditSafe(auditEvents.sessionRevoked, { actorId: req.userId, sessionId: tokFp, targetType: "session", targetId: tokFp });
+    // clear the browser-side session cookie set at login (G5.5 human journey)
+    res.setHeader("Set-Cookie", "cloner_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
     res.json({ ok: true });
   });
   app.get('/api/auth/me', authRequired, (req, res) => {
     res.json({ userId: req.userId, email: req.userEmail, role: req.userRole });
   });
 
-  // ---- static UI ----
-  app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "..", "..", "platform-ui", "index.html")));
-  app.use("/ui", express.static(path.join(__dirname, "..", "..", "platform-ui")));
+  // ---- headless backend (G7.1: the platform's own UI was removed) ----
+  // The platform ships as an API only. There are NO static mounts: "/" and
+  // every non-API path fall through to the terminal 404. Clients integrate
+  // through /api/* (tasks, jobs, exports, admin, dashboard, config) and the
+  // /ws event stream; generated CLONES are still served under /preview/:id.
   // picker script injected into previews (element selection)
   const PICKER_JS = fs.readFileSync(path.join(__dirname, "..", "picker.js"), "utf8");
 
   // ---- tasks ----
   // Credentialed-caller chain (Phase 4.0 order: auth → tenant → quota →
-  // rate-limit → handler). Anonymous local callers (the pre-existing platform-ui
-  // dashboard) still work: when no Authorization header AND no X-API-Key header
+  // rate-limit → handler). Anonymous local callers (the pre-existing local
+  // dashboard clients) still work: when no Authorization header AND no X-API-Key header
   // are present the request proceeds with userId=null (personal scope), exactly
   // the pre-Phase-4 behavior. Once a credential IS presented it is enforced
   // fully — invalid token/key, wrong scope, rate limit or quota → rejected
@@ -119,23 +291,50 @@ export function startPlatform({ port = 4180 } = {}) {
     if (!hasOrgCtx) return next();
     return resolveTenantScope(req, res, next);
   }
+  // G5.1 hunt fix: a PRESENTED credential must be ENFORCED, never silently
+  // downgraded to anonymous. Previously any Authorization value that was not
+  // exactly "Bearer <token>" (empty header, bare "Bearer", lowercase scheme,
+  // "Basic …") and an EMPTY x-api-key header fell through to the
+  // loopback-anonymous branch — a caller who MEANT to authenticate received
+  // anonymous 200s (probe: `bearer <valid>`, `Bearer `, `Basic …` all → 200 on
+  // GET /api/tasks). Now: an Authorization header that is not "Bearer <tok>"
+  // is a 401; an x-api-key header present in ANY form (including "") goes to
+  // key validation (invalid → 401). Only a request with NO credential headers
+  // at all reaches the loopback-anonymous legacy posture.
+  function enforceOrAnonymous(req, res, next, { keyScope } = {}) {
+    const auth = req.headers.authorization;
+    if (auth !== undefined) {
+      if (typeof auth !== "string" || !auth.startsWith("Bearer ") || auth.slice(7).trim() === "") {
+        return res.status(401).json({ error: "malformed authorization header" });
+      }
+      return authRequired(req, res, next);
+    }
+    if (req.headers["x-api-key"] !== undefined) return apiKeyAuth(keyScope)(req, res, next);
+    // G5.2 hunt hardening: ANONYMOUS task creation is loopback-only. A
+    // REMOTE anonymous caller previously got free clone compute (real
+    // browser jobs) with zero credentials — probe: remote POST /api/tasks
+    // returned 200. The local dashboard keeps its legacy posture.
+    if (!wsAuth.isLoopback(req.socket?.remoteAddress)) return res.status(401).json({ error: "authentication required" });
+    req.userId = null; // anonymous local dashboard (legacy posture)
+    next();
+  }
   const credentialed = (opts = {}) => [
-    (req, res, next) => {
-      const hasBearer = !!(req.headers.authorization || "").startsWith("Bearer ");
-      const hasKey = !!req.headers["x-api-key"];
-      if (hasKey) return apiKeyAuth(opts.scope || "create:task")(req, res, next);
-      if (hasBearer || req.query?.token) return authRequired(req, res, next);
-      req.userId = null; // anonymous local dashboard (legacy posture)
-      next();
-    },
+    (req, res, next) => enforceOrAnonymous(req, res, next, { keyScope: opts.scope || "create:task" }),
     resolveTenantScopeSoft, // 4.0.1: only when an org context was requested
     // quota guard (4.0.4) applies to identified callers only — quotas are
     // per-user/org scopes and an anonymous request has none. Anonymous/local
     // (req.userId null) passes through with NO reservation; req.quotaRelease
     // stays undefined and the handlers skip it (documented above).
+    // G5.2 hunt fix: the org pool comes from the VALIDATED tenant scope, never
+    // from body.orgId — a member of org A could otherwise smuggle
+    // {orgId: <org B>} past the header-validated membership check and consume
+    // org B's slots/daily accounting without membership (probe: reservation
+    // landed in org B). tenantScope is authoritative whenever it resolved; it
+    // is undefined only when no org context was named (→ personal scope).
     (req, res, next) => {
       if (!req.userId) return next();
       return quotaGuard({
+        getOrgId: (rq) => rq.tenantScope?.orgId || null,
         // quotaGuard expects a callable; accept a boolean or a per-request fn
         queued: (rq) => !!(typeof opts.queued === "function" ? opts.queued(rq) : opts.queued),
         estimatedBytes: (rq) => (typeof opts.estimatedBytes === "function" ? opts.estimatedBytes(rq) : opts.estimatedBytes || 0),
@@ -143,6 +342,74 @@ export function startPlatform({ port = 4180 } = {}) {
       })(req, res, next);
     },
   ];
+
+  // G5.2 hunt hardening: per-field payload caps on job submission. Previously
+  // UNBOUNDED per field (30k instructions, 4k usernames, 1.6MB cookie blobs all
+  // accepted at 200) — every accepted job carried the whole blob into the
+  // registry entry, the queue payload and (v1) task.json.
+  const TASK_FIELD_LIMITS = { instructions: 20_000, username: 500, password: 500, cookies: 1_500_000, storage: 1_500_000, policy: 200_000 };
+  // ---- per-job compute accounting (4.2.12): the job-completion path settles
+  // ONE cost row per (scope, taskKey) after the quota release. Never throws —
+  // an accounting failure must never break a completed job's response shape.
+  function dirSizeSync(dir) {
+    try {
+      let total = 0;
+      const stack = [dir];
+      while (stack.length) {
+        const d = stack.pop();
+        let entries;
+        try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+        for (const ent of entries) {
+          const full = path.join(d, ent.name);
+          try {
+            if (ent.isDirectory()) stack.push(full);
+            else if (ent.isFile()) total += fs.statSync(full).size;
+          } catch { /* raced file — skip */ }
+        }
+      }
+      return total;
+    } catch { return 0; }
+  }
+  async function settleJobCostSafe({ userId, orgId, taskKey, queuedAt, finishedAt, artifactsDir, status }) {
+    try {
+      if (!userId || !taskKey) return; // anonymous/local tasks have no scope to bill
+      if (!["completed", "completed_with_limitations", "error"].includes(status)) return; // cancelled jobs settle nothing
+      const scope = resolveScope({ userId, orgId });
+      const runtimeMs = Math.max(0,
+        (Date.parse(finishedAt || "") || Date.now()) - (Date.parse(queuedAt || "") || Date.now()));
+      const artifactBytes = artifactsDir ? dirSizeSync(artifactsDir) : 0;
+      await settleJobCost(scope, taskKey, {
+        userId,
+        runtimeMs,
+        browserSlots: 1, // one clone browser slot per job (the platform's concurrency unit)
+        artifactBytes,
+        meta: { status, pipeline: true },
+      });
+    } catch (e) {
+      // refused/failed settlements are recorded on the row by settleJobCost
+      // itself; only an unexpected crash lands here — log, never rethrow.
+      console.warn(`[accounting] settle ${taskKey}: ${e?.message || e}`);
+    }
+  }
+  function taskFieldError(body) {
+    const b = body || {};
+    const sizeOf = (v) => (typeof v === "string" ? v.length : v == null ? 0 : JSON.stringify(v).length);
+    if (b.instructions !== undefined && String(b.instructions).length > TASK_FIELD_LIMITS.instructions) return { status: 400, error: `instructions too long (max ${TASK_FIELD_LIMITS.instructions} chars)` };
+    if (b.username !== undefined && String(b.username).length > TASK_FIELD_LIMITS.username) return { status: 400, error: `username too long (max ${TASK_FIELD_LIMITS.username} chars)` };
+    if (b.password !== undefined && String(b.password).length > TASK_FIELD_LIMITS.password) return { status: 400, error: `password too long (max ${TASK_FIELD_LIMITS.password} chars)` };
+    if (b.cookies !== undefined && sizeOf(b.cookies) > TASK_FIELD_LIMITS.cookies) return { status: 413, error: "cookies payload too large (max ~1.5MB)" };
+    if (b.storage !== undefined && sizeOf(b.storage) > TASK_FIELD_LIMITS.storage) return { status: 413, error: "storage payload too large (max ~1.5MB)" };
+    if (b.policy !== undefined && sizeOf(b.policy) > TASK_FIELD_LIMITS.policy) return { status: 413, error: "policy payload too large (max ~200KB)" };
+    return null;
+  }
+  // G5.2 hunt fix: a promotion REFUSAL (the scope really is at its concurrent
+  // limit) must stop the job — the old `.catch(() => {})` swallowed the
+  // QuotaExceededError and the job EXECUTED anyway, so two concurrent
+  // submissions could both pass the read-only preflight and run past
+  // max_concurrent_jobs (one reservation stuck 'queued' while its job ran).
+  const cancelOnQuotaRefusal = (handle) => (e) => {
+    if (e instanceof QuotaExceededError) getCloneQueue().cancel(handle).catch(() => {});
+  };
 
   // POST /api/tasks — pipeline v2 parks a job in the queue (queued reservation
   // promoted at execution); v1 runs inline (running reservation). The handler
@@ -154,51 +421,128 @@ export function startPlatform({ port = 4180 } = {}) {
     explorationMinutes: () => 0,
   }), async (req, res) => {
     const { url, username, password, cookies, storage, instructions, mode, pipeline } = req.body || {};
-    if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    const fieldErr = taskFieldError(req.body);
+    if (fieldErr) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(fieldErr.status).json({ error: fieldErr.error }); }
+    // G5.1 hunt fix: EVERY 4xx after the quota guard must release the slot it
+    // reserved — the url-required branch used to leak the reservation (two
+    // malformed submissions permanently exhausted a fresh user's concurrent
+    // limit; reproduced: 2× POST {} → 2 stuck 'running' rows → valid 3rd job
+    // 429 QUOTA_EXCEEDED).
+    if (!url || !/^https?:\/\//i.test(url)) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(400).json({ error: "url required (http(s))" }); }
+    // G5.1 hunt fix: an unknown pipeline value must not silently launch the
+    // legacy v1 browser flow — a typo'd "v3" used to run a completely
+    // different pipeline (real browser job) with no error.
+    if (pipeline !== undefined && pipeline !== "v1" && pipeline !== "v2") { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(400).json({ error: "pipeline must be \"v1\" or \"v2\"" }); }
     const guard = await validatePublicUrl(url);
     if (!guard.ok) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(400).json({ error: "url rejected: " + guard.error }); }
     // pipeline "v2" → exploration + reconstruction + verification (integrated)
     // pipeline "v1" or absent → legacy cloneUrl flow (backward compatible)
     if (pipeline === "v2") {
-      const entry = exploration.queueExploration({
-        url, username, password, cookies, storage, instructions,
-        userId: req.userId, orgId: req.tenantScope?.orgId || null,
-      });
+      let entry;
+      try {
+        entry = exploration.queueExploration({
+          url, username, password, cookies, storage, instructions,
+          userId: req.userId, orgId: req.tenantScope?.orgId || null,
+        });
+      } catch (e) {
+        // G5.1 hunt fix: a throw after reservation must not leak the slot
+        if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" });
+        return res.status(500).json({ error: "internal error" });
+      }
       auditSafe(auditEvents.taskCreate, { actorId: req.userId, targetType: "task", targetId: entry.tempId, metadata: { pipeline: "v2", url } });
       // quota lifecycle: a free slot may have started the job inline — promote
-      // the queued reservation; release is deferred to the queue's terminal event
+      // the queued reservation; release is deferred to the queue's terminal
+      // event. G5.2: the terminal branch ALSO unsubscribes this listener —
+      // every submission used to leave a permanent closure on the queue's
+      // "status" event (probe: listenerCount grew 13→18 after 5 submissions
+      // and never came back → unbounded memory on a long-lived server).
       const q = getCloneQueue();
-      promoteReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId }).catch(() => {});
-      q.onStatus(({ entry: e }) => {
+      promoteReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId }).catch(cancelOnQuotaRefusal(entry.tempId));
+      // G5.1 (BUG #9): v2 jobs get the same DB mirror as v1 — the admin task
+      // inventory reads PostgreSQL, so a v2 clone that never lands a row is
+      // invisible to the operator. The listener below keeps the row's status
+      // in step with the pipeline's terminal state.
+      let v2DbTaskId = null;
+      if (req.userId) {
+        taskRepo.createTask({ userId: req.userId, url, options: { pipeline: "v2", jobId: entry.tempId } })
+          .then((row) => { v2DbTaskId = row.id; })
+          .catch((e) => console.warn(`[tasks] db mirror failed for ${entry.tempId}: ${e.message}`));
+      }
+      const v2StatusCol = (s) => (s === "completed" ? "done" : s === "completed_with_limitations" ? "done" : s === "error" ? "error" : s === "cancelled" ? "cancelled" : s);
+      const off = q.onStatus(({ entry: e }) => {
         if (e.tempId !== entry.tempId && e.jobId !== entry.tempId) return;
         if (!["completed", "completed_with_limitations", "error", "cancelled"].includes(e.status)) return;
+        if (off) off();
+        if (v2DbTaskId && req.userId) {
+          // options.jobId = the registry handle (e.jobId once dispatch links it)
+          // so the admin inventory can correlate a DB row with artifacts/<exp-…>
+          const dbPatch = { status: v2StatusCol(e.status), completed_at: new Date().toISOString() };
+          if (e.error) dbPatch.error = String(e.error).slice(0, 300);
+          taskRepo.getTask(v2DbTaskId, req.userId)
+            .then((row) => {
+              const opts = { ...(row?.options || {}), jobId: e.jobId || entry.tempId };
+              return taskRepo.updateTask(v2DbTaskId, req.userId, { ...dbPatch, options: opts });
+            })
+            .catch(() => {
+              taskRepo.updateTask(v2DbTaskId, req.userId, dbPatch).catch(() => {});
+            });
+        }
         releaseReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId, outcome: e.status === "error" ? "failed" : e.status === "cancelled" ? "cancelled" : "completed" }).catch(() => {});
+        // 4.2.12 per-job compute accounting (after the quota release, per the
+        // integration contract) — cancelled jobs settle nothing.
+        const terminalEntry = q.getEntry(e.jobId || entry.tempId);
+        settleJobCostSafe({
+          userId: req.userId, orgId: req.tenantScope?.orgId || null, taskKey: e.jobId || entry.tempId,
+          queuedAt: terminalEntry?.queuedAt || entry.queuedAt, finishedAt: terminalEntry?.finishedAt || null,
+          artifactsDir: e.artifactsDir || terminalEntry?.artifactsDir || null, status: e.status,
+        });
       });
       res.json({ id: entry.tempId, status: entry.status, pipeline: "v2" });
       return;
     }
     const meta = tasks.createTask({ url, mode, username, password, cookies, storage, instructions, userId: req.userId || "local" });
+    // G5.1 hunt fix (BUG #9): mirror the task into the DB `tasks` table — the
+    // product API never wrote it, so the operator's admin task inventory
+    // (GET /api/admin/tasks, reads PostgreSQL) and the database backup
+    // (docs/BACKUP.md dumps `tasks`) silently missed every task the platform
+    // created. Best-effort: identified callers get a real row (status derived
+    // from the v1 lifecycle); anonymous/loopback tasks have no users.id to
+    // reference (user_id is NOT NULL → skipped, same as before this fix).
+    // A DB hiccup never fails the HTTP request — the file store stays the
+    // source of truth for the API surfaces.
+    if (req.userId) {
+      meta.dbUserId = req.userId; // for the updateTask mirror (tasks.js reads it)
+      taskRepo.createTask({ userId: req.userId, url, options: { mode: mode || "url", pipeline: "v1" } })
+        .then((row) => tasks.attachDbTask(meta.id, row.id))
+        .catch((e) => console.warn(`[tasks] db mirror failed for ${meta.id}: ${e.message}`));
+    }
     auditSafe(auditEvents.taskCreate, { actorId: req.userId, targetType: "task", targetId: meta.id, metadata: { pipeline: "v1", url } });
     res.json(meta);
     runTask(meta.id).catch((e) => {
       tasks.updateTask(meta.id, { status: "error", error: String(e.message || e).slice(0, 300) }, "failed");
       bus.emit("log", { level: "warn", msg: `task ${meta.id} failed: ${e.message}` });
+      // 4.2.12: a crashed v1 run settles as an errored job (runtime up to now).
+      const metaNow = tasks.loadTask(meta.id);
+      settleJobCostSafe({
+        userId: req.userId, orgId: req.tenantScope?.orgId || null, taskKey: meta.id,
+        queuedAt: metaNow?.createdAt || meta.createdAt, finishedAt: new Date().toISOString(),
+        artifactsDir: tasks.outDir(meta.id), status: "error",
+      });
     }).finally(() => {
       releaseReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId, outcome: "completed" }).catch(() => {});
     });
   });
   // GET surfaces: credential resolution + rate limiting, but NO quota
-  // reservation (listing data must not consume a job slot). Same anonymous
-  // fallback as above.
+  // reservation (listing data must not consume a job slot).
+  // G5.2 hunt hardening: (1) anonymous reads are loopback-only like the detail
+  // surfaces — a REMOTE anonymous caller previously received the ownerless
+  // job/task listings (job id + target URL disclosure); (2) an org context is
+  // VALIDATED or refused, never silently ignored — X-Org-Id of a non-member
+  // org used to return 200 with the personal list (probe: foreign and garbage
+  // org headers both ignored).
   const credentialedRead = (scope = "read:task") => [
-    (req, res, next) => {
-      const hasKey = !!req.headers["x-api-key"];
-      const hasBearer = !!(req.headers.authorization || "").startsWith("Bearer ");
-      if (hasKey) return apiKeyAuth(scope)(req, res, next);
-      if (hasBearer || req.query?.token) return authRequired(req, res, next);
-      req.userId = null;
-      next();
-    },
+    (req, res, next) => enforceOrAnonymous(req, res, next, { keyScope: scope }),
+    resolveTenantScopeSoft, // 4.0.1: org context (if named) is enforced, not ignored
   ];
 
   // 3.5.9 lane-3 hardening: detail / destructive / export surfaces must not be
@@ -206,19 +550,46 @@ export function startPlatform({ port = 4180 } = {}) {
   // posture is preserved for loopback only; identified callers resolve their
   // identity so the owner gates inside the handlers run with a real userId.
   // scope=null rejects API keys entirely (no key scope may perform that action).
-  const localOrAuthed = (scope) => (req, res, next) => {
-    const hasBearer = !!(req.headers.authorization || "").startsWith("Bearer ");
-    const hasToken = !!req.query?.token;
-    const hasKey = !!req.headers["x-api-key"];
+  // G5.5 human-journey fix: when no header is presented, a valid `cloner_session`
+  // cookie (set by POST /api/auth/login) resolves the caller's identity BEFORE
+  // the legacy anonymous posture applies. Browser navigations cannot set
+  // Authorization headers — the same physical limitation the WS upgrade path
+  // already solves with this cookie (ws-auth.js header) — so without this a
+  // logged-in user's own /preview load arrived anonymous and owner-gated
+  // surfaces answered 404. Header callers are unchanged; the cookie never
+  // accepts ?token= (G5.3 posture); an invalid cookie falls through to the
+  // pre-existing anonymous rules (loopback legacy / remote 401).
+  const localOrAuthed = (scope) => async (req, res, next) => {
+    // G5.1 hunt fix: same enforcement rule as enforceOrAnonymous — a PRESENTED
+    // Authorization value that is not "Bearer <token>" is a 401, never an
+    // anonymous downgrade. (Cookie identity is still honored first for the
+    // legacy local dashboard posture.)
+    const auth = req.headers.authorization;
+    if (auth !== undefined && !(typeof auth === "string" && auth.startsWith("Bearer ") && auth.slice(7).trim() !== "")) {
+      return res.status(401).json({ error: "malformed authorization header" });
+    }
+    const hasKey = req.headers["x-api-key"] !== undefined;
     if (hasKey) {
       if (!scope) return res.status(403).json({ error: "api keys cannot perform this action (use a session)" });
       return apiKeyAuth(scope)(req, res, next);
     }
-    if (hasBearer || hasToken) return authRequired(req, res, next);
+    if (auth !== undefined) return authRequired(req, res, next); // header-only (hunt G5.3: no ?token=)
+    const cookieIdentity = await wsAuth.authenticateCookie(req);
+    if (cookieIdentity) {
+      req.userId = cookieIdentity.userId;
+      req.userEmail = cookieIdentity.email;
+      req.userRole = cookieIdentity.role;
+      return next();
+    }
     if (!wsAuth.isLoopback(req.socket?.remoteAddress)) return res.status(401).json({ error: "authentication required" });
     req.userId = null; // loopback dashboard legacy posture
     next();
   };
+
+  // 16. GitHub publish (G1.1): the router REFUSES to serve without a guard —
+  //     mounted here (after localOrAuthed exists) with the same loopback-or-
+  //     authed posture as every other local-operator surface.
+  app.use("/api/github", githubPublishRouter({ guard: localOrAuthed("publish:task") }));
 
   app.get("/api/tasks", ...credentialedRead(), async (req, res) => {
     // authenticated (Bearer): only tasks created under this userId (meta.userId
@@ -227,9 +598,12 @@ export function startPlatform({ port = 4180 } = {}) {
     // credentials never leak to unauthenticated callers (4.0.12). Legacy v1
     // tasks follow the same rule: an anonymous caller sees only the
     // ownerless/"local"-scope entries, never another user's tasks.
+    // G5.1 consistency: a platform-admin's v1 view matches the v2 view —
+    // listJobsFor(role:admin) returns everything, so the admin task list must
+    // too (probe: admin saw 1 of 2 tasks in GET /api/tasks).
     const all = tasks.listTasks();
     const legacy = req.userId
-      ? all.filter((t) => t.userId === req.userId)
+      ? (req.userRole === "admin" ? all : all.filter((t) => t.userId === req.userId))
       : all.filter((t) => !t.userId || t.userId === "local");
     const jobs = await exploration.listJobsFor(req.userId ? { userId: req.userId, role: req.userRole } : null);
     res.json([...legacy, ...jobs]);
@@ -238,24 +612,38 @@ export function startPlatform({ port = 4180 } = {}) {
   // ---- exploration jobs (Phase 1 intelligence engine, spec §15) ----
   app.post("/api/jobs/explore", ...credentialed({ queued: true }), async (req, res) => {
     const { url, username, password, cookies, storage, policy } = req.body || {};
-    if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url required (http(s))" });
+    const fieldErr = taskFieldError(req.body);
+    if (fieldErr) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(fieldErr.status).json({ error: fieldErr.error }); }
+    // G5.1 hunt fix: same slot-leak as POST /api/tasks — the url-required 400
+    // used to leak the queued reservation reserved by the guard above.
+    if (!url || !/^https?:\/\//i.test(url)) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(400).json({ error: "url required (http(s))" }); }
     const guard = await validatePublicUrl(url);
     if (!guard.ok) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(400).json({ error: "url rejected: " + guard.error }); }
     if (policy !== undefined && (typeof policy !== "object" || policy === null || Array.isArray(policy))) { if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" }); return res.status(400).json({ error: "policy must be an object" }); }
-    const entry = exploration.queueExploration({
-      url, username, password, cookies, storage, policy,
-      userId: req.userId, orgId: req.tenantScope?.orgId || null,
-    });
+    let entry;
+    try {
+      entry = exploration.queueExploration({
+        url, username, password, cookies, storage, policy,
+        userId: req.userId, orgId: req.tenantScope?.orgId || null,
+      });
+    } catch (e) {
+      // G5.1 hunt fix: a throw after reservation must not leak the slot
+      if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" });
+      return res.status(500).json({ error: "internal error" });
+    }
     auditSafe(auditEvents.taskCreate, { actorId: req.userId, targetType: "task", targetId: entry.tempId, metadata: { kind: "exploration", url } });
     // quota: queued reservation → running when the job actually dispatches;
     // released with the outcome when it terminates (4.0.4 accounting).
+    // G5.2: promotion REFUSAL stops the job (see cancelOnQuotaRefusal) and the
+    // listener unsubscribes at the terminal event (no accumulation).
     const q = getCloneQueue();
-    q.onStatus(({ entry: e }) => {
+    const off = q.onStatus(({ entry: e }) => {
       if (e.tempId !== entry.tempId && e.jobId !== entry.tempId) return;
       if (["exploring", "reconstructing", "verifying"].includes(e.status)) {
-        promoteReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId }).catch(() => {});
+        promoteReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId }).catch(cancelOnQuotaRefusal(entry.tempId));
       }
       if (["completed", "completed_with_limitations", "error", "cancelled"].includes(e.status)) {
+        if (off) off();
         releaseReservation(req.quotaScope, req.quotaTaskKey, { userId: req.userId, outcome: e.status === "error" ? "failed" : e.status === "cancelled" ? "cancelled" : "completed" }).catch(() => {});
       }
     });
@@ -348,39 +736,136 @@ export function startPlatform({ port = 4180 } = {}) {
       }
     }
     sessions.release(req.params.id);
+    // G5.2 hunt fix: deleting a v2 job must also CANCEL its queue entry — the
+    // old code returned ok while the job kept running (and holding its slot)
+    // in the registry.
+    if (exploration.getExplorationJob(req.params.id)) {
+      getCloneQueue().cancel(req.params.id).catch(() => {});
+    }
+    // G5.1 hunt fix (BUG #8): the cancel must release the quota slot too.
+    // The queue's cancel() does not emit a terminal status event on the
+    // BullMQ path, so the submission listener above never ran its
+    // releaseReservation branch — reproduced: two rapid submissions + two
+    // DELETEs left two 'running' reservations forever and every later job
+    // got 429 QUOTA_EXCEEDED. Deleting/cancelling is a terminal outcome for
+    // the caller's slot regardless of which backend runs the job; the
+    // release is a no-op (released=false) when the submission listener
+    // already released it, and it fires only for the CALLER'S OWN request
+    // context (req.quotaTaskKey), so a second user's DELETE can never free
+    // someone else's slot.
+    if (req.quotaRelease) await req.quotaRelease({ outcome: "cancelled" });
+    // G5.1 (BUG #9 companion): DELETE removes the DB mirror row too — the admin
+    // inventory must not resurrect deleted tasks after the next backup/restore.
+    const v1Meta = tasks.loadTask(req.params.id);
     tasks.deleteTask(req.params.id);
+    if (v1Meta?.dbTaskId && (req.userId || v1Meta.dbUserId)) {
+      taskRepo.deleteTask(v1Meta.dbTaskId, req.userId || v1Meta.dbUserId).catch(() => {});
+    }
     auditSafe(auditEvents.taskDelete, { actorId: req.userId, targetType: "task", targetId: req.params.id });
     res.json({ ok: true });
   });
 
   // ---- clone preview (with element picker injected) ----
+  // G5.1 hunt: v2 (pipeline-v2) clones live in the ARTIFACTS tree — the site in
+  // artifacts/<jobId>-project/, exploration evidence in artifacts/<jobId>/ —
+  // while /preview only ever served the legacy v1 out dir. A completed v2 task
+  // therefore showed "not found yet" in the Clone tab forever. resolvePreviewDirs
+  // returns the candidate roots in priority order (v1 out dir → v2 project site →
+  // v2 evidence tree) and the handler keeps the per-root containment guard
+  // (3.5.9 relative check) — a request never escapes any single root.
+  function resolvePreviewDirs(id, { orgId } = {}) {
+    const dirs = [];
+    try { dirs.push(path.resolve(tasks.outDir(id))); } catch { /* unknown v1 id */ }
+    try {
+      const job = exploration.getExplorationJob(id);
+      if (job) {
+        const root = resolveArtifactPath(job.jobId || id, { orgId: orgId || undefined }).path;
+        dirs.push(path.resolve(root + "-project"));
+        dirs.push(path.resolve(root));
+      }
+    } catch { /* registry unavailable — v1 only */ }
+    return dirs;
+  }
   app.get("/preview/:id", localOrAuthed("read:task"), (req, res) => res.redirect(`/preview/${req.params.id}/index.html`));
-  app.get("/preview/:id/*", localOrAuthed("read:task"), (req, res) => {
-    const dir = tasks.outDir(req.params.id);
-    const file = path.resolve(dir, req.params[0] || "index.html");
-    // 3.5.9: relative containment — a bare startsWith(dir) check is bypassable
-    // by sibling dirs sharing the prefix (…/t1/out vs …/t1/out-extra/)
-    const rel = path.relative(path.resolve(dir), file);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) return res.status(403).send("forbidden");
-    if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return res.status(404).send("not found yet");
-    if (file.endsWith(".html")) {
-      let html = fs.readFileSync(file, "utf8");
-      html = html.replace(/<\/body>/i, `<script>${PICKER_JS}</script>`);
-      res.type("html").send(html);
-    } else res.sendFile(file);
+  app.get("/preview/:id/*", localOrAuthed("read:task"), async (req, res) => {
+    // 4.0.12 posture for v2: an owned job's preview is owner-gated (anonymous /
+    // non-member → the same 404 as a missing task — no existence leak)
+    const job = exploration.getExplorationJob(req.params.id);
+    if (job?.owner) {
+      const ok = req.userId ? await exploration.identityCanAccessJob(req.params.id, { userId: req.userId, role: req.userRole }) : false;
+      if (!ok) return res.status(404).send("not found yet");
+    }
+    // G5.5 human-journey fix: v1 previews carried NO owner gate — GET
+    // /api/tasks/:id 404s another user's task (4.0.12) while /preview served
+    // its whole clone tree to any loopback anonymous browser (the same
+    // inconsistent posture the v2 branch above had already fixed). Mirror the
+    // GET policy exactly: identified callers see only their own; anonymous
+    // loopback keeps the legacy "local"-scope posture.
+    const previewMeta = tasks.loadTask(req.params.id);
+    if (previewMeta && !previewMeta.userId) previewMeta.userId = "local"; // pre-4.0 tasks were written without the field
+    if (previewMeta) {
+      if (req.userId && previewMeta.userId !== req.userId) return res.status(404).send("not found yet");
+      if (!req.userId && previewMeta.userId !== "local") return res.status(404).send("not found yet");
+    }
+    for (const dir of resolvePreviewDirs(req.params.id, { orgId: req.tenantScope?.orgId })) {
+      const file = path.resolve(dir, req.params[0] || "index.html");
+      // 3.5.9: relative containment per root — a bare startsWith(dir) check is
+      // bypassable by sibling dirs sharing the prefix (…/t1/out vs …/t1/out-extra/)
+      const rel = path.relative(dir, file);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) continue; // try the next root, never escape this one
+      if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) continue;
+      if (file.endsWith(".html")) {
+        let html = fs.readFileSync(file, "utf8");
+        html = html.replace(/<\/body>/i, `<script>${PICKER_JS}</script>`);
+        return res.type("html").send(html);
+      }
+      return res.sendFile(file);
+    }
+    return res.status(404).send("not found yet");
   });
 
   // ---- chat / edit selected element (reuses engine edit flow) ----
+  // G7.1 hunt fix (g51 second-identity probe): the chat surface MUTATES a
+  // clone's files but was the one surface never owner-gated — an authenticated
+  // non-owner reached the model router and the file write on someone else's
+  // clone (probe log: "[chat] edit via provider: …" fired for a foreign task
+  // before the 500). Gate it exactly like GET/DELETE/export: v2 registry jobs
+  // via identityCanAccessJob, legacy tasks via meta.userId — a non-member gets
+  // the same 404 as a missing task, before any model call.
   app.post("/api/tasks/:id/chat", localOrAuthed(null), async (req, res) => {
+    const v2job = exploration.getExplorationJob(req.params.id);
+    if (v2job) {
+      const ok = req.userId
+        ? await exploration.identityCanAccessJob(req.params.id, { userId: req.userId, role: req.userRole })
+        : !v2job.owner; // loopback anonymous keeps the legacy posture for ownerless jobs
+      if (!ok) return res.status(404).json({ error: "not found" });
+    } else {
+      const gateMeta = tasks.loadTask(req.params.id);
+      if (gateMeta) {
+        if (req.userId && gateMeta.userId !== req.userId) return res.status(404).json({ error: "not found" });
+        if (!req.userId && gateMeta.userId && gateMeta.userId !== "local") return res.status(404).json({ error: "not found" });
+      }
+    }
     const { selector, info = {}, instruction } = req.body || {};
+    // G5.1 hunt hardening: bounded fields — selector/info/instruction reach the
+    // model prompt and the chat-fixes.css comment verbatim, so an unbounded
+    // field used to flow straight into prompts (prompt-injection surface) and
+    // an oversized one burned model tokens for nothing.
+    if (String(instruction ?? "").length > 4000) return res.status(400).json({ error: "instruction too long (max 4000 chars)" });
+    if (String(selector ?? "").length > 500) return res.status(400).json({ error: "selector too long (max 500 chars)" });
+    if (JSON.stringify(info ?? {}).length > 8000) return res.status(400).json({ error: "info payload too large (max ~8KB)" });
     // 3.5.9: basename-only — a body file like "../../package.json" must not
     // escape the task's out/ dir for read+write below
     const file = path.basename(String(req.body?.file || "index.html"));
     if (!instruction) return res.status(400).json({ error: "instruction required" });
     const cfg = loadConfig();
     if (cfg.model.provider === "none" || !cfg.model.apiKey) return res.status(400).json({ error: "no vision model configured (Settings → API providers, phase 6)" });
-    const target = path.join(tasks.outDir(req.params.id), file);
-    if (!fs.existsSync(target)) return res.status(404).json({ error: "clone not ready" });
+    // G5.1 hunt: element edits must reach v2 clones too — resolve the same site
+    // tree /preview serves (v1 out dir, else the v2 <jobId>-project dir)
+    const target = resolvePreviewDirs(req.params.id)
+      .map((d) => path.join(d, file))
+      .find((p) => fs.existsSync(p));
+    if (!target) return res.status(404).json({ error: "clone not ready" });
     try {
       const { routeChat } = await import("./model-router.js");
       const { EDIT_SYSTEM, EDIT_ELEMENT } = await import("../prompts.js");
@@ -398,7 +883,7 @@ export function startPlatform({ port = 4180 } = {}) {
       if (patch.replaceHtml?.find && patch.replaceHtml?.html) updated = updated.replace(patch.replaceHtml.find, patch.replaceHtml.html);
       if (patch.removeSelector) updated = updated.replace(new RegExp(`<\\w+[^>]*${patch.removeSelector.replace(/[.#]/g, "\\$&")}[^>]*>[\\s\\S]*?</\\w+>`, "i"), "");
       if (patch.css) {
-        fs.appendFileSync(path.join(tasks.outDir(req.params.id), "chat-fixes.css"), `\n/* ${new Date().toISOString()} — ${instruction.replace(/\*\//g, "")} */\n${patch.css}\n`);
+        fs.appendFileSync(path.join(path.dirname(target), "chat-fixes.css"), `\n/* ${new Date().toISOString()} — ${instruction.replace(/\*\//g, "")} */\n${patch.css}\n`);
         if (!updated.includes("chat-fixes.css")) updated = updated.replace(/<\/head>/i, `<link rel="stylesheet" href="chat-fixes.css"></head>`);
       }
       if (updated === html) throw new Error("empty patch");
@@ -442,6 +927,8 @@ export function startPlatform({ port = 4180 } = {}) {
         ? await startExport({ id, orgId: req.tenantScope?.orgId || null })
         : await exportTask(req.params.id);
       auditSafe(auditEvents.taskExport, { actorId: req.userId, targetType: "task", targetId: id, metadata: { kind: isV2 ? "v2" : "v1", size } });
+      // 4.2.15: exports are a lifecycle event (task.exported) — both pipelines.
+      emitTaskLifecycleEvent({ status: "exported", taskId: id, url: null, userId: req.userId || null, orgId: req.tenantScope?.orgId || null, pipeline: isV2 ? "v2" : "v1", data: { size } }).catch(() => {});
       sessions.release(req.params.id); // explicit finish → close the session
       res.json({ ok: true, download: `/api/export/${req.params.id}/download`, size });
     } catch (e) {
@@ -489,6 +976,21 @@ export function startPlatform({ port = 4180 } = {}) {
     res.json({ providers: getProviders(cfg).map((p) => ({ name: p.name, provider: p.provider, model: p.model, capabilities: p.capabilities, hasKey: !!p.apiKey })), usage: usageStats() });
   });
 
+  // ---- terminal error handler (G5.2 hunt hardening) ----
+  // Every error an async handler or the body parser produces must come back as
+  // bounded JSON. Previously there was NO error middleware: express's dev
+  // default answered parse failures with an HTML page (NODE_ENV unset → dev
+  // mode → stack trace to the attacker), and an async throw that escaped a
+  // handler would have been an unhandled rejection (process exit on modern
+  // Node). body-parser errors carry their own 4xx status.
+  app.use((err, _req, res, next) => {
+    if (res.headersSent) return next(err);
+    const status = Number(err?.status || err?.statusCode) || (err instanceof SyntaxError ? 400 : 500);
+    const code = status >= 400 && status < 500 ? status : 500;
+    if (code >= 500) console.error(`[http] unhandled route error: ${err?.message || err}`);
+    res.status(code).json({ error: code >= 500 ? "internal error" : String(err?.message || "bad request").slice(0, 200) });
+  });
+
   const server = http.createServer(app);
   // exposed additively so the export/release lifecycle can be driven from
   // tests and the worker path (4.0.4/4.0.5 integration)
@@ -497,8 +999,8 @@ export function startPlatform({ port = 4180 } = {}) {
   // ---- WebSocket: authenticated upgrade + task-scoped rooms (spec §6/§9) ----
   // The upgrade validates an optional token (cookie `cloner_session` or
   // ?token=) against the sessions table. Unauthenticated upgrades are refused
-  // with 401 UNLESS they come from loopback — the local dashboard
-  // (platform-ui) connects with no token and keeps working through the
+  // with 401 UNLESS they come from loopback — local dashboard API clients
+  // connect with no token and keep working through the
   // "legacy" room. Authenticated sockets join their `user:<id>` room instead.
   const wss = new WebSocketServer({
     server,
@@ -553,12 +1055,26 @@ export function startPlatform({ port = 4180 } = {}) {
   // without a task id broadcast to everyone, as before.
   async function broadcast(msg) {
     let gate = null;
+    let acceptedIds = null;
     try {
       const taskId = msg?.task || msg?.data?.job || msg?.data?.task || msg?.data?.taskId || null;
       if (taskId) {
         const users = [...new Set([...sockets].filter((s) => s.identity).map((s) => s.identity.userId))];
         const allowed = await wsAuth.authorizedUserIds(taskId, users);
         gate = (ws) => ws.rooms.has("legacy") || (ws.identity && allowed.has(ws.identity.userId));
+        // G5.5 human-journey fix: v2 clients only ever see the tempId the
+        // POST /api/tasks response hands back ("pending-…"), while queue-side
+        // events (worker path, quota lifecycle) are tagged with the REAL
+        // jobId ("exp-…") — the old strict `ws.taskId === msg.task` filter
+        // silently dropped every one of those events for the socket that had
+        // joined by temp handle. Deliver to a joined id matching EITHER
+        // handle (the registry maps one onto the other).
+        acceptedIds = new Set([taskId]);
+        const entry = getCloneQueue().getEntry(taskId);
+        if (entry) {
+          if (entry.jobId) acceptedIds.add(entry.jobId);
+          if (entry.tempId) acceptedIds.add(entry.tempId);
+        }
       }
     } catch {
       gate = (ws) => ws.rooms.has("legacy"); // unexpected failure → legacy room only
@@ -566,7 +1082,7 @@ export function startPlatform({ port = 4180 } = {}) {
     for (const ws of sockets) {
       try {
         if (gate && !gate(ws)) continue;
-        if (!ws.taskId || !msg.task || ws.taskId === msg.task) ws.send(JSON.stringify(msg));
+        if (!ws.taskId || !msg.task || acceptedIds?.has(ws.taskId)) ws.send(JSON.stringify(msg));
       } catch {}
     }
   }
@@ -592,6 +1108,21 @@ export function startPlatform({ port = 4180 } = {}) {
   }
   let currentTaskId = null;
 
+  // G5.5 human-journey fix: BullMQ worker-path clone jobs execute in a SEPARATE
+  // process — their bus emissions never reach this server, so a human watching
+  // a production (server+worker) deployment received NO live progress over the
+  // WebSocket and had to poll blind. The queue adapter already funnels every
+  // stage transition back through QueueEvents → onStatus (clone-queue.js);
+  // bridge those status events onto the SAME owner-gated broadcast path (the
+  // msg.task tag drives the authorizedUserIds gate in broadcast()).
+  // kind-guard: internal bookkeeping entries (artifact-lifecycle sweep) are
+  // not task progress and must not fan out as phantom job events.
+  getCloneQueue().onStatus(({ entry, status, data }) => {
+    if (!entry || entry.kind) return;
+    const jobId = entry.jobId || entry.tempId;
+    broadcast({ type: "job:status", task: jobId, data: { jobId, tempId: entry.tempId, status, url: entry.url, ...(data || {}) } });
+  });
+
   // ---- audit helper: best-effort, never breaks a business flow (4.0.9) ----
   function auditSafe(fn, payload) {
     try { Promise.resolve(fn({ ...payload, actorType: payload.actorType || (req_user_type(payload) ? "user" : "local") })).catch(() => {}); } catch {}
@@ -604,6 +1135,9 @@ export function startPlatform({ port = 4180 } = {}) {
     if (!meta) return;
     currentTaskId = id;
     tasks.updateTask(id, { status: "running" }, "clone started");
+    // 4.2.15 lifecycle hooks: v1 runner emits the same lifecycle events the v2
+    // queue path fans out (status → event mapping in workflow-hooks.js).
+    emitTaskLifecycleEvent({ status: "running", taskId: id, url: meta.url, userId: meta.userId && meta.userId !== "local" ? meta.userId : null, pipeline: "v1" }).catch(() => {});
     const priv = path.join(tasks.taskDir(id), "private");
     const cookiesFile = fs.existsSync(path.join(priv, "cookies.json")) ? path.join(priv, "cookies.json") : null;
     const storageFile = fs.existsSync(path.join(priv, "storage.json")) ? JSON.parse(fs.readFileSync(path.join(priv, "storage.json"), "utf8")) : undefined;
@@ -623,6 +1157,19 @@ export function startPlatform({ port = 4180 } = {}) {
     const verification = await verifyTask(out);
     tasks.updateTask(id, { status: verification.passed ? "done" : "done", artifacts, verification }, `verification ${verification.passed ? "passed" : "completed with failures"}`);
     broadcast({ type: "task:done", task: id, data: { verification: verification.passed } });
+    // 4.2.15: v1 terminal → task.completed hook fan-out.
+    emitTaskLifecycleEvent({ status: "done", taskId: id, url: meta.url, userId: meta.userId && meta.userId !== "local" ? meta.userId : null, pipeline: "v1", data: { verification: verification.passed } }).catch(() => {});
+    // 4.2.12 per-job compute accounting for the v1 pipeline (the v2 path
+    // settles from its queue listener; cancelled/anonymous settle nothing).
+    settleJobCostSafe({
+      userId: meta.userId && meta.userId !== "local" ? meta.userId : null,
+      orgId: meta.orgId || null,
+      taskKey: id,
+      queuedAt: meta.createdAt || null,
+      finishedAt: new Date().toISOString(),
+      artifactsDir: out,
+      status: "completed",
+    });
   }
 
   // retention sweep (15-day default) on boot + hourly (v1 platform-data dirs,

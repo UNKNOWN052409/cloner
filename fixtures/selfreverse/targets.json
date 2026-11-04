@@ -1,0 +1,67 @@
+{
+  "schema": "selfreverse-targets",
+  "version": "1.1.0",
+  "comment": "G4.1 self-reverse target definitions. Each entry pins ONE real public site the engine must clone through its OWN full pipeline (explore -> reconstruct -> 3-step verifyTask). URLs are data, versioned here — never hard-coded in the runner. Every target is validated through src/security/url-guard.js validatePublicUrl before any navigation (public URLs only; the SSRF guard rejects private/reserved hosts). `budgets` bound each exploration job so a run stays inside CI time. `expect` holds the floors the harness asserts: minPages (captured pages), minBehaviors (documented exploration behaviors — 0 is legitimate for control-free pages), maxPixelPct (the visual pixel-difference ceiling verifyTask's stage 3 already enforces, 60%). `gating: false` marks a target the run still executes for live evidence but whose result does NOT gate the suite — currently vite-dev, a JS-animated SaaS marketing page that surfaced real engine bugs (parent-cycle empty tree, index.html route collision, route-slug ENOENT — all fixed in src/) and whose remaining visual drift (missing CSS background-image art, animation-reordered hero) is the documented reconstruction frontier, kept runnable so regressions and future fixes stay measurable.",
+  "targets": [
+    {
+      "id": "example-com",
+      "url": "https://example.com/",
+      "kind": "minimal-static",
+      "gating": true,
+      "note": "IANA-reserved example domain: 3-element DOM, zero interactive controls — the engine's smallest possible input. Proves the pipeline does not fabricate interactions on control-free pages and that visual fidelity holds on a trivial page.",
+      "budgets": {
+        "maxRoutes": 2,
+        "maxStatesPerPage": 4,
+        "maxInteractionsPerState": 6,
+        "maxTimePerPageMs": 60000,
+        "maxTotalTimeMs": 120000
+      },
+      "expect": { "minPages": 1, "minBehaviors": 0, "maxPixelPct": 60 }
+    },
+    {
+      "id": "httpbin-html",
+      "url": "https://httpbin.org/html",
+      "kind": "document-text",
+      "gating": true,
+      "note": "httpbin's Moby Dick sample: semantic HTML document (h1 + many p) with zero interactive controls. Proves long-form text typography (heading scale, line-height, margins) survives reconstruction without any interaction evidence.",
+      "budgets": {
+        "maxRoutes": 2,
+        "maxStatesPerPage": 4,
+        "maxInteractionsPerState": 6,
+        "maxTimePerPageMs": 60000,
+        "maxTotalTimeMs": 120000
+      },
+      "expect": { "minPages": 1, "minBehaviors": 0, "maxPixelPct": 60 }
+    },
+    {
+      "id": "nginx-docs",
+      "url": "https://nginx.org/en/docs/",
+      "kind": "saas-product-docs",
+      "gating": true,
+      "note": "nginx's product documentation site: real-world multi-page docs with a styled banner, nav columns, link lists and a site root discovered during navigation (exercised the index.html route-collision bug). Zero interactive controls — static documentation, honestly explored.",
+      "budgets": {
+        "maxRoutes": 3,
+        "maxStatesPerPage": 4,
+        "maxInteractionsPerState": 6,
+        "maxTimePerPageMs": 60000,
+        "maxTotalTimeMs": 150000
+      },
+      "expect": { "minPages": 1, "minBehaviors": 0, "maxPixelPct": 60 }
+    },
+    {
+      "id": "vite-dev",
+      "url": "https://vite.dev/",
+      "kind": "saas-docs-landing",
+      "gating": false,
+      "note": "Vite's SaaS landing (VitePress, animated hero, CSS background-image art): NON-GATING frontier. Surfaced the parent-cycle empty-tree bug and the index.html collision (both fixed); remaining visual drift is the documented frontier. Runs for evidence so future fixes stay measurable.",
+      "budgets": {
+        "maxRoutes": 3,
+        "maxStatesPerPage": 6,
+        "maxInteractionsPerState": 10,
+        "maxTimePerPageMs": 120000,
+        "maxTotalTimeMs": 180000
+      },
+      "expect": { "minPages": 1, "minBehaviors": 0, "maxPixelPct": 60 }
+    }
+  ]
+}

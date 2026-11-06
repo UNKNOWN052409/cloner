@@ -2,10 +2,16 @@
 //  - anthropic        (ANTHROPIC_API_KEY [+ ANTHROPIC_BASE_URL])
 //  - openai           (OPENAI_API_KEY, api.openai.com — also used for whisper ASR)
 //  - custom           (any OpenAI-compatible endpoint: baseUrl + apiKey + model)
+//  - stitch           (STITCH_API_KEY — Google Stitch, image→code backend; src/stitch-client.js)
 //  - none             (model-dependent steps are skipped gracefully)
 
 export function hasVision(cfg) {
+  if (cfg.model.provider === "stitch") return !!stitchKey(cfg);
   return cfg.model.provider !== "none" && !!cfg.model.apiKey;
+}
+
+function stitchKey(cfg) {
+  return cfg.model.apiKey || process.env.STITCH_API_KEY || "";
 }
 
 function imageDataUrl(part) {
@@ -17,8 +23,15 @@ export class VisionClient {
     this.cfg = cfg;
     this.provider = cfg.model.provider;
     this.model = cfg.model.model;
-    this.apiKey = cfg.model.apiKey;
+    this.apiKey = this.provider === "stitch" ? stitchKey(cfg) : cfg.model.apiKey;
     this.baseUrl = (cfg.model.baseUrl || "").replace(/\/+$/, "");
+    // selecting stitch without a key must fail loudly here — never a silent
+    // fallback to another provider and never a stack trace deep in the SDK
+    if (this.provider === "stitch" && !this.apiKey) {
+      throw new Error(
+        'provider "stitch" requires STITCH_API_KEY — set it in .env / process.env, or "apiKey" under "model" in cloner.config.json',
+      );
+    }
   }
 
   get openaiBase() {
@@ -31,8 +44,18 @@ export class VisionClient {
   // messages: [{ role: "user"|"assistant", content: string | parts[] }]
   // parts:    { type:"text", text } | { type:"image", dataUrl, mediaType }
   async chat(messages, { maxTokens = 16000, onDelta, timeoutMs = 300000 } = {}) {
+    if (this.provider === "stitch") return this.#stitch(messages, maxTokens, onDelta, timeoutMs);
     if (this.provider === "anthropic") return this.#anthropic(messages, maxTokens, onDelta, timeoutMs);
     return this.#openaiCompatible(messages, maxTokens, onDelta, timeoutMs);
+  }
+
+  // stitch: image→code via Google Stitch. Lazy-imported so the engine works without
+  // the @google/stitch-sdk package installed; one client per VisionClient instance.
+  #stitchClient = null;
+  async #stitch(messages, maxTokens, onDelta, timeoutMs) {
+    const { StitchClient } = await import("./stitch-client.js");
+    this.#stitchClient ||= new StitchClient(this.cfg);
+    return this.#stitchClient.chat(messages, { maxTokens, onDelta, timeoutMs });
   }
 
   async #openaiCompatible(messages, maxTokens, onDelta, timeoutMs) {

@@ -1,15 +1,24 @@
 // Risk-aware interaction policy + bounded exploration budgets (spec §7, §13).
-// Every budget is configurable per job; the defaults keep a full exploration
-// inside ~10 minutes while preventing infinite loops and destructive actions.
+// Every budget is configurable per job while preventing infinite loops and
+// destructive actions. The knobs that size a run (override via
+// config.policy.budgets / config.policy.routes, or the flat
+// config.policy.maxTotalTimeMs shorthand):
+//   budgets.maxRoutes        — pages to explore (including the seed); default 30
+//   budgets.maxTotalTimeMs   — whole-job wall clock; default 900000 (15 min)
+//   budgets.maxTimePerPageMs — per-page wall clock; default 120000 (2 min)
+// CLONER_PROFILE=compact (the 1 GB capacity profile,
+// docs/realignment/CAPACITY-1GB.md) keeps the previous smaller exploration
+// footprint via the COMPACT_BUDGET_OVERRIDES preset below (12 routes / 600000
+// ms); an explicit userPolicy.budgets value always beats the preset.
 
 export const DEFAULT_POLICY = {
   budgets: {
-    maxRoutes: 12,             // pages to explore (including the seed)
+    maxRoutes: 30,             // pages to explore (including the seed)
     maxStatesPerPage: 20,      // interaction states per route
     maxInteractionsPerState: 30,
     maxDepth: 2,               // state graph depth (state → sub-state)
     maxTimePerPageMs: 120000,  // 2 min per page
-    maxTotalTimeMs: 600000,    // 10 min whole job
+    maxTotalTimeMs: 900000,    // 15 min whole job
   },
   viewports: [
     { name: "desktop", width: 1440, height: 900, primary: true },
@@ -32,8 +41,15 @@ export const DEFAULT_POLICY = {
   },
 };
 
+// compact profile (CLONER_PROFILE=compact): the pre-raise route/time numbers so
+// the 1 GB capacity profile keeps its smaller exploration footprint. Everything
+// else stays at the shared defaults; explicit userPolicy.budgets still win.
+const COMPACT_BUDGET_OVERRIDES = { maxRoutes: 12, maxTotalTimeMs: 600000 };
+
 export function resolvePolicy(userPolicy = {}) {
   const merged = JSON.parse(JSON.stringify(DEFAULT_POLICY));
+  // same live-env preset pattern as resolvePoolProfile (src/browser/browser-pool.js)
+  if (process.env.CLONER_PROFILE === "compact") Object.assign(merged.budgets, COMPACT_BUDGET_OVERRIDES);
   if (userPolicy.budgets) Object.assign(merged.budgets, userPolicy.budgets);
   if (userPolicy.viewports?.length) merged.viewports = userPolicy.viewports;
   if (userPolicy.routes) Object.assign(merged.routes, userPolicy.routes);

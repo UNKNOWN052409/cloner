@@ -1,4 +1,7 @@
 // Three-step verification + automated correction loop (spec v2).
+// Lives in the ENGINE (src/reconstruction/) per ADR-0002: verification is
+// engine logic; the shell imports it like any other adapter. Moved verbatim
+// from src/platform/verify.js on 2026-11-05 (git mv, history preserved).
 //   Step 1 FUNCTIONAL:     everything works — every recorded interaction replays,
 //                          inner entries open panels, no decorative buttons.
 //   Step 2 OPTIMIZATION &  performance of the clone (load time, asset weight) +
@@ -14,10 +17,14 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { launchBrowser } from "../browser.js";
 // Phase 3.4 integrations (wired by the integration agent):
-import { analyzeFidelity } from "../reconstruction/visual-fidelity-analyzer.js"; // task 3.4.3
-import { classifyDefects } from "../reconstruction/visual-diff-classifier.js"; // task 3.4.3
-import { runRepairLoop } from "../reconstruction/repair-executor.js"; // task 3.4.5
+import { analyzeFidelity } from "./visual-fidelity-analyzer.js"; // task 3.4.3
+import { classifyDefects } from "./visual-diff-classifier.js"; // task 3.4.3
+import { analyzeLayoutDefects } from "./analysis/layout-analyzer.js"; // layout defect detections (header/overflow/section)
+import { runRepairLoop } from "./repair-executor.js"; // task 3.4.5
+import { runFlowMatrix } from "./verify-flows.js"; // flow-matrix: numbered flow cases (F01-H1…) replayed on the clone
 import { DOM_EXTRACTOR_SCRIPT } from "../intelligence/dom-extractor.js"; // clone element measurement
+import { createLogger } from "../observability/logger.js"; // stage summary (log contract)
+import { createWorkflowEmitter } from "../observability/workflow-events.js"; // viewer todo/stage events
 
 const MAX_ROUNDS = 3;
 const OPEN_GATE = 0.6; // 60% of clicked triggers must open overlay/module
@@ -623,7 +630,16 @@ function repairAssetMap(artifactsDir, cloneDir) {
   return map;
 }
 
-export async function verifyTask(outDirPath, task = null) {
+export async function verifyTask(outDirPath, task = null, { wf: passedWf = null, logger: passedLogger = null } = {}) {
+  // stage observability (log contract + viewer contract): the pipeline caller
+  // passes the job's own logger + workflow emitter so the verification summary
+  // lands in artifacts/<id>/logs/job.log next to the other stages and the
+  // open-todo map stays shared; standalone callers get "-verify"-suffixed
+  // defaults writing into the same job dir.
+  const jobId = path.basename(outDirPath);
+  const logger = passedLogger || createLogger({ jobId: jobId + "-verify", artifactsDir: outDirPath });
+  const wf = passedWf || createWorkflowEmitter({ jobId });
+  wf.stage("verification", "running", 0); // viewer: the stage has started
   const v2Clone = v2Layout(outDirPath);
   const rounds = [];
   let report = null;
@@ -639,9 +655,33 @@ export async function verifyTask(outDirPath, task = null) {
   // instead of an endless pipeline.
   const verifyBudgetMs = Number(process.env.CLONER_VERIFY_BUDGET_MS || 8 * 60_000);
   const verifyDeadline = Date.now() + (Number.isFinite(verifyBudgetMs) && verifyBudgetMs > 0 ? verifyBudgetMs : 8 * 60_000);
+  // flow-matrix verification runs right after the functional stage of round 1
+  // (the matrix replays the RECORDED evidence, which repair rounds do not
+  // change — once per verifyTask keeps the wall-clock budget honest). NON-FATAL
+  // by contract: a matrix error lands in its own report field, never fails
+  // verification; the full matrix goes to <artifacts>/reports/flow-matrix.json.
+  let flowMatrix = null;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     // stage order per spec: 1 functional → 2 optimization/completeness → 3 visual
     const s1 = await stage1Functional(v2Clone || outDirPath);
+    if (round === 1) {
+      try {
+        flowMatrix = await runFlowMatrix(v2Clone || outDirPath, outDirPath);
+      } catch (e) {
+        flowMatrix = { flows: [], bugs: [], error: e.message.slice(0, 140) };
+      }
+      // flow-matrix todos (viewer contract): one todo per replayed flow, closed
+      // with the honest per-flow result as soon as the matrix returns — the
+      // matrix builds AND replays internally (verify-flows.js is the live
+      // boundary), so the add/done pair at this boundary carries each flow's
+      // measured outcome rather than an invented one
+      for (const flow of flowMatrix.flows || []) {
+        const todoId = wf.todoAdd(`verify:${flow.id}`, `${flow.id} ${flow.page || ""}`.trim(), "flow");
+        const cases = flow.cases || [];
+        const failed = cases.filter((c) => c.result !== "pass").length;
+        wf.todoDone(todoId, failed ? `${failed}/${cases.length} flow cases failed` : null);
+      }
+    }
     const s2 = await stage2Optimization(v2Clone || outDirPath, task, v2Clone ? outDirPath : null);
     const s3 = await stage3Visual(v2Clone || outDirPath, v2Clone ? outDirPath : null);
     report = {
@@ -669,8 +709,21 @@ export async function verifyTask(outDirPath, task = null) {
       // plan is empty and improved=false — exactly the old break behavior.
       const cloneDir = v2Clone || outDirPath;
       const fidelityReport = await measureFidelity(cloneDir, outDirPath);
+      // layout defect detections (layout-analyzer buildDetections) join the
+      // plan alongside the pixel classifier's: run 1 of exp-mw59a16doczk
+      // measured a page-level horizontal overflow (+4054px scrollWidth) and a
+      // transparent header band that classifyDefects cannot express — the
+      // detections existed but this loop never called the analyzer, so
+      // planRepairs only ever saw pixel/element defects and applied 0 repairs.
+      // Non-fatal: analyzer errors degrade to classifier defects only.
+      const layoutDetections = await analyzeLayoutDefects(outDirPath, cloneDir)
+        .then((r) => (Array.isArray(r?.defects) ? r.defects : []))
+        .catch(() => []);
       const repair = await runRepairLoop(report, cloneDir, {
-        defects: fidelityReport ? classifyDefects(fidelityReport) : [],
+        defects: [
+          ...(fidelityReport ? classifyDefects(fidelityReport) : []),
+          ...layoutDetections,
+        ],
         checkFns: {
           fidelity: async (projectDir) => {
             const f = await measureFidelity(projectDir, outDirPath);
@@ -696,7 +749,30 @@ export async function verifyTask(outDirPath, task = null) {
     }
   }
   report.rounds = rounds;
+  // flow-matrix result lands in the verification report as a summary — the full
+  // numbered matrix (flows/cases/bugs + screenshots) lives in reports/flow-matrix.json
+  report.flowMatrix = flowMatrix ? {
+    total: flowMatrix.flows.reduce((n, f) => n + f.cases.length, 0),
+    passed: flowMatrix.flows.reduce((n, f) => n + f.cases.filter((c) => c.result === "pass").length, 0),
+    failed: flowMatrix.flows.reduce((n, f) => n + f.cases.filter((c) => c.result === "fail").length, 0),
+    bugs: flowMatrix.bugs.length,
+    note: flowMatrix.note || null,
+    error: flowMatrix.error || null,
+    report: flowMatrix.reportFile || "reports/flow-matrix.json",
+  } : null;
   fs.mkdirSync(path.join(outDirPath, "_reference"), { recursive: true });
   fs.writeFileSync(path.join(outDirPath, "_reference", "verification.json"), JSON.stringify(report, null, 2));
+  // stage summary (log contract): exactly one per stageId — emitted here, after
+  // every fallible step (the report write included), so a crash above leaves the
+  // failure summary to the caller's catch path and one stage never prints twice
+  logger.stage("verification", report.passed ? "completed" : "failed", {
+    rounds: report.rounds?.length,
+    stages_failed: (report.stages || []).filter((s) => !s.passed).length,
+    flows_passed: report.flowMatrix?.passed,
+    flows_failed: report.flowMatrix?.failed,
+    bugs: report.flowMatrix?.bugs,
+    fixes: (report.fixes || []).length,
+  });
+  wf.stage("verification", report.passed ? "completed" : "failed", 1);
   return report;
 }

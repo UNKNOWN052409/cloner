@@ -598,7 +598,7 @@ export function regressionGate(opts = {}) {
 }
 
 // BENCHMARK_WIRING — the documented integration for the integrator agent
-// (scripts/test-multisite-benchmark.mjs and src/platform/verify.js are
+// (scripts/test-multisite-benchmark.mjs and src/reconstruction/verify.js are
 // READ-ONLY for G3.2). Two hooks, both additive, both deterministic:
 export const BENCHMARK_WIRING = Object.freeze([
   "1. Score-drops gate (test-multisite-benchmark.mjs, after regressionCheck):",

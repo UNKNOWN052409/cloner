@@ -7,6 +7,10 @@ import { buildRuntime, withAdSlots } from "../../runtimeTemplate.js";
 // Phase 3.4 integrations (wired by the integration agent):
 import { extendRuntimeWorkspace } from "../docking-layout-builder.js"; // task 3.4.2
 import { buildStreamRuntime } from "../data-stream-replayer.js"; // task 3.4.4
+// multipage navigation: route→local-file href rewriting with the COMPLETE map
+import { buildRouteFileMap, deriveAppOrigin, rewritePageLinks } from "./link-rewriter.js";
+// font fidelity: measured families (dom.json typography) → captured font FILES
+import { buildTokenFontFaces } from "../../assets/fonts-manifest.js";
 
 const SELF_CLOSE = new Set(["img", "br", "hr", "input", "meta", "link"]);
 
@@ -24,6 +28,28 @@ function esc(s) {
 // exact legacy output.
 export function buildComponentCss(elements, layoutByIndex, opts = {}) {
   const scopeOf = typeof opts.scopeOf === "function" ? opts.scopeOf : null;
+  // element indexes restart PER PAGE (allElements concatenates every page's
+  // elements), so both the parent walk and the layout lookup must resolve
+  // within the element's OWN page — a shared index map returns another page's
+  // element (run 1: page-001's .cx-88 img got `left:-611px` derived against
+  // page-017's element 85, landing the hero monitor 551px left of the
+  // original). opts.pageOfElement (element object → pageId) and
+  // opts.layoutByPage (pageId → Map(index → analyzeLayout row)) come from the
+  // pipeline; standalone single-page callers keep the legacy index-only maps.
+  const pageOfElement = opts.pageOfElement instanceof Map ? opts.pageOfElement : null;
+  const layoutByPage = opts.layoutByPage instanceof Map ? opts.layoutByPage : null;
+  const byPage = new Map(); // pageId → Map(index → el) for the parent walk
+  for (const e of elements) {
+    const key = (pageOfElement && pageOfElement.get(e)) || "_";
+    if (!byPage.has(key)) byPage.set(key, new Map());
+    byPage.get(key).set(e.i, e);
+  }
+  // positionOf(el) → the element's captured computed position. styles.json does
+  // NOT carry `position` (dom-extractor.js records it on el.layout only), so the
+  // legacy st.position read silently dropped EVERY fixed/absolute/relative value
+  // (visual round-1 exp-mw59a16doczk: the fixed header-holder rendered in flow —
+  // the whole page shifted +44px and the header content fell below its band).
+  const positionOf = (e) => String(e?.style?.position || e?.layout?.position || "static");
   const rules = [];
   for (const el of elements) {
     const i = el.i;
@@ -38,26 +64,58 @@ export function buildComponentCss(elements, layoutByIndex, opts = {}) {
           kind: el.layout.display.includes("flex") ? "flex" : el.layout.display.includes("grid") ? "grid" : el.layout.display,
           display: el.layout.display,
           flexDirection: el.layout.flexDirection || null,
+          flexWrap: el.layout.flexWrap || null,
           gridTemplateColumns: el.layout.gridTemplateColumns || null,
           justifyContent: el.layout.justifyContent || null,
           alignItems: el.layout.alignItems || null,
           gapPx: el.layout.gap ? parseFloat(el.layout.gap) || null : null,
         }
       : null;
-    const lay = layoutByIndex.get(i) || ownLay;
+    const pageIdOfEl = pageOfElement ? pageOfElement.get(el) : null;
+    const lay = (layoutByPage && pageIdOfEl ? (layoutByPage.get(pageIdOfEl)?.get(i) || null) : null)
+      || layoutByIndex.get(i) || ownLay;
     const scoped = scopeOf ? scopeOf(el) : "";
     const rect = el.rect || el.getBoundingClientRect?.() || null;
     const props = [];
     if (lay) {
       props.push(`display:${lay.kind === "flex" ? "flex" : lay.kind === "grid" ? "grid" : lay.display || "block"}`);
       if (lay.kind === "flex" && lay.flexDirection) props.push(`flex-direction:${lay.flexDirection}`);
+      if (lay.kind === "flex" && lay.flexWrap) props.push(`flex-wrap:${lay.flexWrap}`);
       if (lay.gridTemplateColumns) props.push(`grid-template-columns:${lay.gridTemplateColumns}`);
       if (lay.gapPx) props.push(`gap:${lay.gapPx}px`);
       if (lay.justifyContent) props.push(`justify-content:${lay.justifyContent}`);
       if (lay.alignItems) props.push(`align-items:${lay.alignItems}`);
     }
     if (st.display && !lay) props.push(`display:${st.display}`);
-    if (st.position && st.position !== "static") props.push(`position:${st.position}`);
+    if (st.textAlign) props.push(`text-align:${st.textAlign}`);
+    const position = positionOf(el);
+    if (position && position !== "static") props.push(`position:${position}`);
+    // positioned offsets (same round-1 evidence): a fixed/absolute element with
+    // no top/left collapses to its static-flow position, so the captured rect
+    // MUST be turned into offsets. fixed elements' rects ARE viewport
+    // coordinates (captures run at scroll 0) → top/left = rect directly; for
+    // absolute elements the offset is relative to the nearest positioned
+    // ancestor's captured rect — the same positioned-ancestor chain the clone
+    // reproduces from the captured position values above. All inputs are
+    // measured capture values; nothing is inferred from tag names.
+    if ((position === "fixed" || position === "absolute") && rect && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
+      let baseX = 0, baseY = 0; // fixed → initial containing block (viewport at scroll 0)
+      if (position === "absolute") {
+        const pageEls = byPage.get(pageIdOfEl || "_");
+        const seen = new Set([i]);
+        for (let p = el.parent; p != null && pageEls && pageEls.has(p) && !seen.has(p); p = pageEls.get(p).parent) {
+          seen.add(p);
+          const anc = pageEls.get(p);
+          const apos = positionOf(anc);
+          if (apos === "relative" || apos === "absolute" || apos === "fixed") {
+            const ar = anc.rect || null;
+            if (ar && Number.isFinite(ar.x) && Number.isFinite(ar.y)) { baseX = ar.x; baseY = ar.y; }
+            break;
+          }
+        }
+      }
+      props.push(`left:${Math.round(rect.x - baseX)}px`, `top:${Math.round(rect.y - baseY)}px`);
+    }
     if (st.padding && st.padding !== "0px") props.push(`padding:${st.padding}`);
     if (st.margin && st.margin !== "0px") props.push(`margin:${st.margin}`);
     if (st.backgroundColor && st.backgroundColor !== "rgba(0, 0, 0, 0)") props.push(`background:${st.backgroundColor}`);
@@ -104,8 +162,18 @@ function renderNode(node, cssCtx, depth) {
   if (node.ariaName) attrs += ` aria-label="${esc(node.ariaName)}"`;
   if (node.tag === "a") {
     let href = node.href || "#";
-    if (cssCtx.routeFileMap && cssCtx.routeFileMap.has(new URL(href, "http://x").pathname)) {
-      href = cssCtx.routeFileMap.get(new URL(href, "http://x").pathname);
+    // routeFileMap here is the pipeline's PARTIAL per-page map (built
+    // incrementally while the pages array fills — page-001 sees an empty one),
+    // so this only pre-rewrites routes already processed. In-page fragment
+    // hrefs are never route-matched (new URL("#x", base).pathname is "/" and
+    // used to mis-route them to index.html); the hash survives real rewrites.
+    // The COMPLETE rewrite runs in generateProject via link-rewriter.js.
+    if (href && cssCtx.routeFileMap && !href.startsWith("#")) {
+      try {
+        const u = new URL(href, "http://x");
+        const mapped = cssCtx.routeFileMap.get(u.pathname);
+        if (mapped) href = mapped + (u.hash || "");
+      } catch { /* unparseable href stays raw */ }
     }
     attrs += ` href="${esc(href)}"`;
   }
@@ -178,7 +246,15 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
     name: "reconstructed-site", private: true, version: "0.1.0",
     scripts: { dev: "npx serve . -l 4175" },
   }, null, 2));
-  fs.writeFileSync(path.join(outDir, "styles", "tokens.css"), tokensCssText);
+  // font fidelity: @font-face rules for the ORIGINAL's captured font files are
+  // prepended to tokens.css BEFORE the :root font tokens — the CSS names
+  // families that must actually exist locally, so every measured family
+  // (dom.json typography) resolves to a real file instead of a Times fallback.
+  // A measured family with no captured file gets the closest captured family
+  // of the same class, recorded honestly in styles/fonts-manifest.json.
+  const fontTokens = buildTokenFontFaces({ jobDir: assetRoot || artifactsAssetRoot(), tokensCssText, outDir });
+  fs.writeFileSync(path.join(outDir, "styles", "tokens.css"), fontTokens.css + tokensCssText);
+  fs.writeFileSync(path.join(outDir, "styles", "fonts-manifest.json"), JSON.stringify(fontTokens.manifest, null, 2));
   fs.writeFileSync(path.join(outDir, "styles", "layout.css"), layoutCss);
   fs.writeFileSync(path.join(outDir, "styles", "components.css"), componentsCss);
   // task 3.4.2: dock behaviors ride along with the replay runtime —
@@ -209,6 +285,23 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
   // (basename "guide/.html" is empty and un-writable, and ENOENT'd the whole
   // reconstruction on vite.dev), matching the pipeline-side slug logic.
   const files = [];
+  // multipage navigation (the "1st page hi clone hota hai, kaam nahi karta" fix):
+  // rewrite <a href> with the COMPLETE route→file picture — every explored route
+  // that got a page file. The pipeline's per-page routeFileMap is built
+  // incrementally, so page-001's nav links can only be fixed here. Explored
+  // routes → relative sibling file (works from file:// and any static server);
+  // internal unexplored routes and uncaptured in-page fragments → href="#"
+  // + data-cloner-unexplored="true" (honest, visibly non-functional); external
+  // http(s) links stay untouched. Contract: generation/link-rewriter.js.
+  const routeToFile = buildRouteFileMap(pageHtmls);
+  const fileSet = new Set((pageHtmls || []).map((p) => String(p.file || "").replace(/[^a-zA-Z0-9_./-]/g, "_")));
+  const appOrigin = deriveAppOrigin(assetMap, pageHtmls);
+  // local-file existence for href resolution — files only: "/" must fall
+  // through to the route map (→ index.html) instead of matching the outDir
+  // DIRECTORY itself, which would emit href="./" (serves the directory index
+  // on a static server but opens a listing, not the page, from file://)
+  const outDirExists = (rel) => { try { const p = path.join(outDir, rel); return fs.existsSync(p) && fs.statSync(p).isFile(); } catch { return false; } };
+  let linksRewritten = 0, linksUnexplored = 0;
   for (const p of pageHtmls) {
     let rel = p.file;
     if (!rel) {
@@ -220,15 +313,20 @@ export function generateProject({ outDir, pageHtmls, tokensCssText, layoutCss, c
     }
     const safe = rel.replace(/[^a-zA-Z0-9_./-]/g, "_");
     if (safe.includes("..")) { failed++; continue; }
+    // multipage nav rewrite runs on the page's own HTML BEFORE ad slots (ad
+    // markup is not app navigation and must not be touched)
+    const rw = rewritePageLinks(p.html, { routeToFile, fileSet, origin: appOrigin, currentRoute: p.route, currentFile: safe, outDirExists });
+    linksRewritten += rw.rewritten;
+    linksUnexplored += rw.unexplored;
     // task 4.5.5: ad-slot emission hook — adConfig is non-null ONLY for a clone
     // whose owner opted in (monetize) AND has official zones configured; null
     // leaves the page byte-identical to the pre-4.5.5 output
-    const pageHtml = withAdSlots(p.html, adConfig, { page: safe });
+    const pageHtml = withAdSlots(rw.html, adConfig, { page: safe });
     fs.writeFileSync(path.join(outDir, safe), pageHtml);
     const size = fs.statSync(path.join(outDir, safe)).size;
-    files.push({ route: p.route, file: safe, size });
+    files.push({ route: p.route, file: safe, size, linksRewritten: rw.rewritten, linksUnexplored: rw.unexplored });
   }
-  return { copied, failed, files };
+  return { copied, failed, files, linksRewritten, linksUnexplored };
 }
 
 function artifactsAssetRoot() {

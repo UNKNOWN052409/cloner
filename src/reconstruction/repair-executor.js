@@ -22,11 +22,13 @@
 // the same measurements) and never exceeds maxRounds.
 //
 // CSS repairs write clone-fixes.css-style scoped overrides — the Phase 3.2
-// autoRemediate pattern (src/platform/verify.js:459-472): append the rule to
+// autoRemediate pattern (src/reconstruction/verify.js:459-472): append the rule to
 // clone-fixes.css and inject `<link rel="stylesheet" href="clone-fixes.css">`
 // before </head> once. Asset remaps and dead-attribute pruning edit index.html
-// in place (verify.js:476-485 pattern). The executor only ever mutates those
-// files — snapshot/rollback covers exactly that surface.
+// in place (verify.js:476-485 pattern); a11y fixes (fix descriptors from
+// checkA11y, verify-a11y.js) set aria-label/alt on the action's payload file.
+// The executor only ever mutates those files — snapshot/rollback covers exactly
+// that surface (the history defaults plus every payload file the plan touches).
 //
 // Safety rules: an action with no measurable check is NEVER applied (recorded
 // in `unverifiable`); any apply/measure error triggers the snapshot rollback;
@@ -34,7 +36,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { planRepairs } from "./repair-planner.js";
-import { appendHistory, snapshotProject, restoreSnapshot } from "./repair-history.js";
+import { appendHistory, DEFAULT_SNAPSHOT_FILES, snapshotProject, restoreSnapshot } from "./repair-history.js";
 
 // which injected check is RELEVANT for each repair kind
 export const DEFAULT_KIND_CHECK = Object.freeze({
@@ -43,6 +45,10 @@ export const DEFAULT_KIND_CHECK = Object.freeze({
   "geometry-fix": "fidelity",
   "asset-remap": "fidelity",
   "interaction-rewire": "functional",
+  // a11y fixes score as −violation count (higher = fewer violations) — the
+  // caller wires checkFns.a11y over checkA11y (verify-a11y.js)
+  "a11y-name": "a11y",
+  "a11y-alt": "a11y",
 });
 
 export const CLONE_FIXES_FILE = "clone-fixes.css";
@@ -120,6 +126,50 @@ function applyInteractionRewire(projectDir, action) {
   fs.writeFileSync(file, html.replace(re, ""));
 }
 
+// ------------------------------------------------- a11y in-place HTML repairs
+// Fix descriptors come from checkA11y (verify-a11y.js): a11y-name sets aria-label
+// from the element's own visible text; a11y-alt sets alt from the recorded
+// original, the image filename, or alt="" decorative. The locator (id / attr+index
+// / tag+index) resolves the SAME opening tag the live scan saw — DOM order equals
+// source order in the generated files. `[^>]*?>` cannot see a `>` inside an
+// attribute value and runtime-injected elements shift tag indices — both leave
+// the fix "not found" (throw → snapshot rollback), never a wrong-element edit.
+const openingTagRe = (tag) => new RegExp(`<${tag}\\b[^>]*?>`, "gi");
+
+// the (locator.index)-th opening tag of <tag> matching the locator's constraint
+function findOpeningTag(html, locator) {
+  let n = -1;
+  for (const m of html.matchAll(openingTagRe(locator.tag))) {
+    if (locator.strategy === "attr") {
+      const re = new RegExp(`\\s${escapeRe(locator.attr)}=(["'])${escapeRe(locator.value)}\\1`, "i");
+      if (!re.test(m[0])) continue;
+    } else if (locator.strategy === "id") {
+      const re = new RegExp(`\\sid=(["'])${escapeRe(locator.id)}\\1`, "i");
+      if (!re.test(m[0])) continue;
+    }
+    if (++n === (locator.index || 0)) return m;
+  }
+  return null;
+}
+
+const escapeHtmlAttr = (s) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+
+// shared a11y apply: locate the opening tag, refuse to clobber an existing
+// attribute (never overwrite a real label), insert ` attr="value"` before the
+// opening tag's closing `>` / `/>`
+function applyA11yAttributeFix(projectDir, action, attr) {
+  const payload = action.payload || {};
+  const rel = payload.file || "index.html";
+  const file = path.join(projectDir, rel);
+  const html = fs.readFileSync(file, "utf8");
+  const m = findOpeningTag(html, payload.locator || {});
+  if (!m) throw new Error(`a11y fix target ${action.target || "(no target)"} not found in ${rel}`);
+  if (new RegExp(`\\s${attr}\\s*=`, "i").test(m[0])) throw new Error(`target already has ${attr} — not overwriting an existing label`);
+  const value = escapeHtmlAttr(String(payload.value ?? ""));
+  const fixed = m[0].replace(/\s*\/?>$/, (tail) => ` ${attr}="${value}"${tail}`);
+  fs.writeFileSync(file, html.slice(0, m.index) + fixed + html.slice(m.index + m[0].length));
+}
+
 // applyAction(projectDir, action) — mutates the project; throws on anything
 // unexpected so the round's try/catch rolls the snapshot back.
 export function applyAction(projectDir, action) {
@@ -132,6 +182,10 @@ export function applyAction(projectDir, action) {
       return applyAssetRemap(projectDir, action);
     case "interaction-rewire":
       return applyInteractionRewire(projectDir, action);
+    case "a11y-name":
+      return applyA11yAttributeFix(projectDir, action, "aria-label");
+    case "a11y-alt":
+      return applyA11yAttributeFix(projectDir, action, "alt");
     default:
       throw new Error(`unsupported repair kind "${action.kind}"`);
   }
@@ -165,6 +219,14 @@ export async function executeRepairs(projectDir, actions, opts = {}) {
   const usedKeys = verifyOne
     ? ["verifyOne"]
     : [...new Set(measurable.map((a) => checkForKind[a.kind]))];
+
+  // snapshot surface = the executor's mutation surface: the history defaults
+  // (index.html, styles/, clone-fixes.css) plus every payload file the plan's
+  // actions touch — a fix against a non-index page must roll back too
+  const snapshotFiles = [...new Set([
+    ...DEFAULT_SNAPSHOT_FILES,
+    ...measurable.map((a) => a.payload && a.payload.file).filter(Boolean),
+  ])];
 
   async function scoreWith(key, action) {
     if (verifyOne) return coerceScore(await verifyOne(projectDir, action ?? null), "verifyOne");
@@ -200,7 +262,7 @@ export async function executeRepairs(projectDir, actions, opts = {}) {
   for (let round = 1; round <= maxRounds && measurable.length; round++) {
     const action = measurable[0];
     const label = `${action.id || action.kind}:${action.kind}:${action.target}`;
-    const snap = snapshotProject(projectDir, path.join(snapshotRoot, `round-${String(round).padStart(3, "0")}`));
+    const snap = snapshotProject(projectDir, path.join(snapshotRoot, `round-${String(round).padStart(3, "0")}`), { files: snapshotFiles });
     let before = null;
     let after = null;
     let kept = false;
@@ -263,7 +325,7 @@ export async function executeRepairs(projectDir, actions, opts = {}) {
 }
 
 // runRepairLoop(report, projectDir, opts) — the ONE-CALL integration hook for
-// the verification loop. src/platform/verify.js is READ-ONLY for task 3.4.5;
+// the verification loop. src/reconstruction/verify.js is READ-ONLY for task 3.4.5;
 // the integration agent wires this into verifyTask (verify.js:510-511): when
 // autoRemediate produced no fixes, instead of breaking immediately —
 //   const repair = await runRepairLoop(report, v2Clone || outDirPath, {

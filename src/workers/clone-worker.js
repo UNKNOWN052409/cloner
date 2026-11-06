@@ -51,11 +51,13 @@ const lockDuration = () => Number(process.env.CLONER_LOCK_DURATION_MS || 30_000)
 const maxStalledCount = () => Number(process.env.CLONER_MAX_STALLED_COUNT || 2);
 
 // report status (pipeline-job vocabulary) → canonical task_stages.stage name
-// (the same rows src/orchestration/pipeline-orchestrator.js writes)
+// (the five stages of src/queues/pipeline-job.js — ADR-0001)
 const CANONICAL_STAGE = {
   exploring: "exploration",
+  validating: "artifact_validation",
   reconstructing: "reconstruction",
   verifying: "verification",
+  exporting: "export",
 };
 
 // Best-effort stage persister: one task_stages row per canonical stage

@@ -37,6 +37,12 @@ export const DOM_EXTRACTOR_SCRIPT = `(() => {
         display: cs.display,
         position: cs.position,
         flexDirection: cs.display.includes("flex") ? cs.flexDirection : null,
+        // flex-wrap capture (visual round-1 exp-mw59a16doczk fix): MUI Grid
+        // containers are display:flex; flex-wrap:wrap — without the captured
+        // wrap the generator emits a plain flex row, every item lands on ONE
+        // row and the row overflows the viewport (measured: clone document
+        // scrollWidth 5494px vs the original's 1440px — the D-grade pixel diff)
+        flexWrap: cs.display.includes("flex") ? cs.flexWrap : null,
         gridTemplateColumns: cs.display.includes("grid") ? cs.gridTemplateColumns : null,
         justifyContent: cs.display.includes("flex") ? cs.justifyContent : null,
         alignItems: cs.display.includes("flex") ? cs.alignItems : null,
@@ -48,6 +54,12 @@ export const DOM_EXTRACTOR_SCRIPT = `(() => {
         backgroundImage: cs.backgroundImage && cs.backgroundImage !== "none" ? cs.backgroundImage.slice(0, 300) : null,
         fontFamily: cs.fontFamily.split(",")[0].replace(/["']/g, ""),
         fontSize: cs.fontSize, fontWeight: cs.fontWeight, lineHeight: cs.lineHeight,
+        // text-align capture (same round-1 evidence): the header nav sits
+        // flush-right inside its container via text-align:right and section
+        // headings are centered — without the captured value the clone
+        // left-aligns both (measured: original nav rect x=590 (right edge
+        // flush with its 150..1290 container), clone rendered it at x=150)
+        textAlign: cs.textAlign && cs.textAlign !== "start" ? cs.textAlign : null,
         border: cs.borderTopWidth + " " + cs.borderTopStyle + " " + cs.borderTopColor,
         borderRadius: cs.borderRadius, opacity: cs.opacity,
         overflow: cs.overflow, zIndex: cs.zIndex,

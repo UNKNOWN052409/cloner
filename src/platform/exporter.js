@@ -41,7 +41,10 @@ export async function exportV2Task(id) {
   fs.mkdirSync(staging, { recursive: true });
   const copyDir = (from, to) => {
     for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
-      if (entry.name === "private" || entry.name === "export-staging" || entry.name === "node_modules") continue;
+      // auth/ + auth-sessions/ hold the job's session state (storageState) —
+      // session material never ships in an export; verifyStagedTree below stays
+      // the fail-closed backstop for anything else credential-shaped.
+      if (entry.name === "private" || entry.name === "export-staging" || entry.name === "node_modules" || entry.name === "auth" || entry.name === "auth-sessions") continue;
       const src = path.join(from, entry.name);
       const dst = path.join(to, entry.name);
       if (entry.isDirectory()) { fs.mkdirSync(dst, { recursive: true }); copyDir(src, dst); }

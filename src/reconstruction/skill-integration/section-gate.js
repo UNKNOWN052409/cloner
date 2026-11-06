@@ -4,7 +4,7 @@
 // The external skill's final gate: compare original vs clone side-by-side per
 // SECTION at two viewports (1440 + 390); every discrepancy is checked against
 // the section's spec file — "re-extract if the spec was wrong, fix the
-// component if the builder deviated". Our verification (src/platform/verify.js
+// component if the builder deviated". Our verification (src/reconstruction/verify.js
 // stage3Visual) already gates on page-level pixel difference, token drift and
 // the exact-HEX comparison at ONE viewport, and the 3.4.3 analyzer +
 // classifier (visual-fidelity-analyzer.js / visual-diff-classifier.js) already

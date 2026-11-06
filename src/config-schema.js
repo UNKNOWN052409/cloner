@@ -143,6 +143,22 @@ const SCHEMA = {
     fix: "Set MAX_CONCURRENT=2 (default) or higher for beefier hosts.",
   },
 
+  CLONER_PROFILE: {
+    role: "all",
+    type: "string",
+    requiredIn: [],
+    description:
+      "Browser-pool capacity profile preset (src/browser/browser-pool.js — " +
+      "resolvePoolProfile). \"compact\" is the 1 GB budget: ≤2 pooled browsers " +
+      "× 400 MB RSS ceiling, tighter context/idle caps. Unset = the default " +
+      "profile. An explicit CLONER_POOL_* var always beats the preset.",
+    fix: 'Set CLONER_PROFILE=compact for the 1 GB capacity profile (docs/realignment/CAPACITY-1GB.md); leave unset for the default numbers.',
+    validate: (v) =>
+      ["default", "compact", ""].includes(v)
+        ? null
+        : `must be "default" or "compact" (got ${describe(v)})`,
+  },
+
   RETENTION_DAYS: {
     role: "api",
     type: "int",

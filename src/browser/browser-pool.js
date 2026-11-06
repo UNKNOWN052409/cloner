@@ -46,29 +46,103 @@ import { launchBrowser, newContext } from "../browser.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
+// ---- capacity profiles (pure, testable) --------------------------------------
+// CLONER_PROFILE picks a preset for the pool tunables:
+//   default — the shipped numbers, unchanged (what poolDefaults returned before
+//             profiles existed, byte-for-byte, when the env vars are unset)
+//   compact — the 1 GB capacity profile (docs/realignment/CAPACITY-1GB.md):
+//             ≤2 pooled chromium trees × 400 MB RSS ceiling so a queue of
+//             ~100 users is served inside a 1 GB budget, headless
+// An explicit CLONER_POOL_* var (and MAX_CONCURRENT for maxBrowsers) always
+// wins over the preset — the profile only fills the knobs the operator left
+// unset. resolvePoolProfile is PURE: it takes {profile, env} and reads nothing
+// else (no process.env, no clock, no randomness), so tests drive it with
+// synthetic env objects; poolDefaults() is the process.env wrapper.
+
+export const POOL_PROFILES = {
+  default: {
+    maxBrowsers: 2,
+    recycleAfter: 40,
+    memoryCeilingMB: 2048,
+    maxContextUses: 10,
+    maxContextsPerBrowser: 4,
+    idleTimeoutMs: 120_000,
+  },
+  compact: {
+    maxBrowsers: 2,
+    recycleAfter: 40,
+    memoryCeilingMB: 400,
+    maxContextUses: 10,
+    maxContextsPerBrowser: 2,   // tighter: fewer parked contexts per browser
+    idleTimeoutMs: 30_000,      // tighter: parked browsers close sooner
+  },
+};
+
+// presence = set AND non-empty (an empty CLONER_POOL_X fell through before too)
+const envHas = (env, key) => typeof env[key] === "string" && env[key] !== "";
+
+/**
+ * Resolve the effective pool tunables for one capacity profile. Pure.
+ * @param {{ profile?: string, env?: Record<string, string> }} [opts]
+ *   profile — CLONER_PROFILE value ("default" | "compact"; anything else fails
+ *             safe to "default"). env — the environment to read (testable).
+ * @returns profile-resolved tunables: profile, envOverrides (env vars that won
+ *   over the preset) plus every poolDefaults() key.
+ */
+export function resolvePoolProfile({ profile, env = {} } = {}) {
+  const name = POOL_PROFILES[profile] ? profile : "default";
+  const preset = POOL_PROFILES[name];
+  const overrides = [];
+  const num = (key, fallback, fallbackKey) => {
+    if (envHas(env, key)) { overrides.push(key); return Number(env[key]); }
+    if (fallbackKey && envHas(env, fallbackKey)) { overrides.push(fallbackKey); return Number(env[fallbackKey]); }
+    return fallback;
+  };
+  return {
+    profile: name,
+    envOverrides: overrides,
+    maxBrowsers: num("CLONER_POOL_MAX_BROWSERS", preset.maxBrowsers, "MAX_CONCURRENT"),
+    recycleAfter: num("CLONER_POOL_RECYCLE_AFTER_NAV", preset.recycleAfter),
+    memoryCeilingMB: num("CLONER_POOL_MEMORY_CEILING_MB", preset.memoryCeilingMB),
+    maxContextUses: num("CLONER_POOL_MAX_CONTEXT_USES", preset.maxContextUses),
+    maxContextsPerBrowser: num("CLONER_POOL_MAX_CONTEXTS_PER_BROWSER", preset.maxContextsPerBrowser),
+    idleTimeoutMs: num("CLONER_POOL_IDLE_TIMEOUT_MS", preset.idleTimeoutMs),
+    acquireTimeoutMs: num("CLONER_POOL_ACQUIRE_TIMEOUT_MS", 30_000),
+    memorySampleMinIntervalMs: num("CLONER_POOL_MEMORY_SAMPLE_MS", 3_000),
+    sweeperIntervalMs: num("CLONER_POOL_SWEEP_MS", 15_000),
+    headless: env.CLONER_POOL_HEADED !== "1",
+    launchArgs: ["--disable-blink-features=AutomationControlled"],
+  };
+}
+
 // ---- tunables (env overridable; plain config, no secrets) -------------------
 
-export const poolDefaults = () => ({
-  maxBrowsers: Number(process.env.CLONER_POOL_MAX_BROWSERS || process.env.MAX_CONCURRENT || 2),
-  // main-frame navigations a browser may serve before it is closed and replaced
-  recycleAfter: Number(process.env.CLONER_POOL_RECYCLE_AFTER_NAV || 40),
-  // real OS RSS (MB) a browser process tree may reach before forced recycle
-  memoryCeilingMB: Number(process.env.CLONER_POOL_MEMORY_CEILING_MB || 2048),
-  // how many leases a warm context can serve before it is retired
-  maxContextUses: Number(process.env.CLONER_POOL_MAX_CONTEXT_USES || 10),
-  // hard cap of live contexts parked in one browser
-  maxContextsPerBrowser: Number(process.env.CLONER_POOL_MAX_CONTEXTS_PER_BROWSER || 4),
-  // an idle parked browser is closed after this long
-  idleTimeoutMs: Number(process.env.CLONER_POOL_IDLE_TIMEOUT_MS || 120_000),
-  // acquire waits at most this long for a free slot
-  acquireTimeoutMs: Number(process.env.CLONER_POOL_ACQUIRE_TIMEOUT_MS || 30_000),
-  // RSS samples are cached this long (OS query costs ~0.8s on win32)
-  memorySampleMinIntervalMs: Number(process.env.CLONER_POOL_MEMORY_SAMPLE_MS || 3_000),
-  sweeperIntervalMs: Number(process.env.CLONER_POOL_SWEEP_MS || 15_000),
-  headless: process.env.CLONER_POOL_HEADED !== "1",
-  // extra args passed straight to chromium.launch (real production launch path)
-  launchArgs: ["--disable-blink-features=AutomationControlled"],
-});
+// Same keys and default numbers as before the profile system (byte-for-byte
+// "default" profile); CLONER_PROFILE=compact swaps the preset first.
+export const poolDefaults = () => {
+  const r = resolvePoolProfile({ profile: process.env.CLONER_PROFILE, env: process.env });
+  return {
+    maxBrowsers: r.maxBrowsers,
+    // main-frame navigations a browser may serve before it is closed and replaced
+    recycleAfter: r.recycleAfter,
+    // real OS RSS (MB) a browser process tree may reach before forced recycle
+    memoryCeilingMB: r.memoryCeilingMB,
+    // how many leases a warm context can serve before it is retired
+    maxContextUses: r.maxContextUses,
+    // hard cap of live contexts parked in one browser
+    maxContextsPerBrowser: r.maxContextsPerBrowser,
+    // an idle parked browser is closed after this long
+    idleTimeoutMs: r.idleTimeoutMs,
+    // acquire waits at most this long for a free slot
+    acquireTimeoutMs: r.acquireTimeoutMs,
+    // RSS samples are cached this long (OS query costs ~0.8s on win32)
+    memorySampleMinIntervalMs: r.memorySampleMinIntervalMs,
+    sweeperIntervalMs: r.sweeperIntervalMs,
+    headless: r.headless,
+    // extra args passed straight to chromium.launch (real production launch path)
+    launchArgs: r.launchArgs,
+  };
+};
 
 // ---- real browser RSS measurement -------------------------------------------
 // CDP SystemInfo.getProcessInfo on Chromium 156 returns the process tree with
@@ -399,6 +473,11 @@ export class BrowserPool {
       await page.close().catch(() => {});
     }
     lease.pages.clear();
+    // realignment fix (wiring-driven): mark idle time on EVERY release. Dirty
+    // releases used to skip the park branch, leaving parkedAt at its initial 0,
+    // so the sweeper instantly recycled the browser as "idle" and a dirty
+    // release could never leave a reusable browser parked for the next job.
+    rec.parkedAt = Date.now();
 
     if (!rec.alive || !rec.browser.isConnected()) {
       // browser died under us — accounting already done by the disconnected hook

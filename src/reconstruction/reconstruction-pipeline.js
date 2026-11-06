@@ -7,6 +7,7 @@ import { buildComponentTree, flattenTree } from "./analysis/component-tree-build
 import { analyzeLayout, buildTokens, tokensCss } from "./analysis/layout-analyzer.js";
 import { buildComponentCss, buildLayoutCss, generatePageHtml, generateProject, buildLayoutCss as layoutCssBuilder } from "./generation/project-generator.js";
 import { createLogger } from "../observability/logger.js";
+import { createWorkflowEmitter } from "../observability/workflow-events.js";
 // Phase 3.4 integrations (applied by the integration agent — each module keeps
 // its own public API; the pipeline is the only wiring point):
 import { buildUnderstandingPage, pageArtifactsFromLoaded, summarizeUnderstanding } from "./website-understanding.js"; // task 3.4.1
@@ -17,12 +18,15 @@ import { buildResponsiveCss, augmentProjectWithResponsive } from "./responsive-a
 import { buildStreamPlan } from "./stateful-widget-builder.js"; // task 3.4.4
 import { buildStreamRuntime } from "./data-stream-replayer.js"; // task 3.4.4
 import { createVisionClientForConfig } from "../platform/vision-client.js"; // task 3.4.6
+import { buildBlueprint } from "./blueprint.js"; // ADR-0003: fidelity contract before build
 // task 3.5.2: cross-page reusable-component patterns (documented hook in
 // component-evidence.js — annotate AFTER the per-page understanding fan-out)
 import { buildComponentRegistry, annotateUnderstanding, registrySummary } from "./component-evidence.js";
 // task 3.5.3: deep application-state reconstruction (documented hook in
 // application-state-builder.js — plan + augment once, after the round loop)
 import { buildAppStatePlan, augmentProjectWithAppState, summarizeAppStatePlan } from "./application-state-builder.js";
+// ADR-0003 hygiene: slop lint — the one wiring point (like every other task integration)
+import { slopLint } from "./hygiene/slop-lint.js";
 
 const MAX_ROUNDS = 2;
 
@@ -162,8 +166,19 @@ export function structuralPathFor(elements, targetIndex) {
   return ["div.cx-x:nth-of-type(1)", ...segs].join(">");
 }
 
-export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords, visionFn, visionCfg, adConfig } = {}) {
-  const logger = createLogger({ jobId: path.basename(artifactsDir) + "-recon", artifactsDir: path.dirname(artifactsDir) });
+export async function reconstructFromArtifacts(artifactsDir, { outDir, interactionRecords, visionFn, visionCfg, adConfig, instructions = "", frameworkPreference = null, wf: passedWf = null, logger: passedLogger = null } = {}) {
+  // Log-dir fix: the reconstruction logger used to point at the artifacts ROOT
+  // (path.dirname), so every job's recon lines collided in artifacts/logs/job.log
+  // instead of the job's own logs/job.log. The pipeline caller passes the job's
+  // own logger (job id = the real exp-… id); standalone callers get this
+  // "-recon"-suffixed default, now writing into the job dir too.
+  const logger = passedLogger || createLogger({ jobId: path.basename(artifactsDir) + "-recon", artifactsDir });
+  // workflow events (viewer contract — the same shape exploration-pipeline
+  // emits): the pipeline caller passes its job-level emitter so the open-todo
+  // map is shared and a crash path can close every still-open todo; standalone
+  // callers get one tagged with this job id
+  const wf = passedWf || createWorkflowEmitter({ jobId: path.basename(artifactsDir) });
+  wf.stage("reconstruction", "running", 0); // viewer: the stage has started
   const report = { rounds: [], repairs: [], limitations: [], generatedFiles: 0, passed: false };
   // explicit records win (runner may pass captured ones); else derive from artifacts
   const replayRecords = (interactionRecords && interactionRecords.length) ? interactionRecords : deriveInteractionRecords(artifactsDir);
@@ -198,12 +213,55 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
 
   // ---- load + validate evidence (spec §2) ----
   const loaded = loadArtifacts(artifactsDir);
-  if (!loaded.ok) return { ok: false, why: "not a phase-1 artifact directory (manifest.json missing)", report };
+  if (!loaded.ok) {
+    // failed stage summary (log contract): the reconstruction stage ends right
+    // here — emit the honest failure line before the early return
+    logger.stage("reconstruction", "failed", { pages: 0 });
+    wf.stage("reconstruction", "failed");
+    return { ok: false, why: "not a phase-1 artifact directory (manifest.json missing)", report };
+  }
   let exploration = null;
   try { exploration = JSON.parse(fs.readFileSync(path.join(artifactsDir, "exploration.json"), "utf8")); } catch {}
   logger.info("load", `loaded ${loaded.pages.length} page(s); missing: ${loaded.missing.length}; malformed: ${loaded.malformed.length}`);
   if (loaded.missing.length) report.limitations.push(`missing artifacts: ${loaded.missing.join(", ")}`);
   if (loaded.malformed.length) report.limitations.push(`malformed: ${loaded.malformed.join(", ")}`);
+
+  // workflow todos (viewer contract): one todo per page file, added right after
+  // the artifact load and closed as each page is generated in the round loop
+  // below (round 2 regenerates the same pages — its todoDone calls are no-ops
+  // on the already-closed ids, so only round 1 emits)
+  const pageTodos = new Map(); // pageId → todo id
+  for (const lp of loaded.pages) {
+    const route = lp.url ? new URL(lp.url, "http://x").pathname : lp.pageId;
+    pageTodos.set(lp.pageId, wf.todoAdd(`recon:${lp.pageId}`, route, "page"));
+  }
+
+  // ---- blueprint (ADR-0003): the fidelity contract precedes the build ----
+  // Deterministic, from recorded evidence + the user's instructions; writes
+  // artifactsDir/blueprint.json. Non-fatal: a blueprint failure logs a
+  // limitation and reconstruction proceeds (pre-blueprint behavior).
+  try {
+    const bp = buildBlueprint(artifactsDir, { instructions, frameworkPreference });
+    if (bp.ok) {
+      report.blueprint = {
+        ok: true,
+        file: "blueprint.json",
+        instructionsApplied: bp.blueprint.instructions.applied,
+        scope: bp.blueprint.instructions.scope,
+        framework: bp.blueprint.stack.output.framework,
+        interactionModel: bp.blueprint.interactions.model,
+        ambiguities: bp.blueprint.ambiguities.length,
+        pages: bp.blueprint.pages.length,
+      };
+      logger.info("blueprint", `written (pages=${bp.blueprint.pages.length}, framework=${bp.blueprint.stack.output.framework}, ambiguities=${bp.blueprint.ambiguities.length})`);
+    } else {
+      report.blueprint = { ok: false, why: bp.why };
+      report.limitations.push("blueprint skipped: " + String(bp.why || "").slice(0, 120));
+    }
+  } catch (e) {
+    report.blueprint = { ok: false };
+    report.limitations.push("blueprint generation failed: " + String(e?.message || e).slice(0, 160));
+  }
 
   // ---- per-page analysis + generation (spec §3, §4, §5) ----
   let pages = [];
@@ -220,10 +278,12 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
   let gen = null; // last generated project (hoisted for the post-loop augmentations)
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     pages = [];
+    const usedFiles = new Set(); // slug-collision dedupe, reset per round (pages are rebuilt)
     const allElements = [];
     for (const lp of loaded.pages) {
       if (lp.elements === undefined || lp.emptyEvidence) {
         pages.push({ route: lp.url ? new URL(lp.url, "http://x").pathname : lp.pageId, html: "", elements: 0, skipped: "no dom evidence" });
+        if (round === 1) wf.todoDone(pageTodos.get(lp.pageId), "no dom evidence"); // ok:false + honest note
         continue;
       }
       const rectMap = new Map(lp.elements.map((e) => [e.i, { x: e.rect.x, y: e.rect.y, width: e.rect.w, height: e.rect.h }]));
@@ -299,13 +359,31 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
       // pageId; nested segments collapse ("/docs/setup" → docs_setup.html).
       const route = new URL(lp.url, "http://x").pathname;
       const slug = route.replace(/^\//, "").replace(/\/+$/, "").replace(/\.html?$/i, "").replace(/[?&#]/g, "_").replace(/\//g, "_").replace(/_+$/, "");
-      const file = lp.pageId === "page-001"
-        ? "index.html"
-        : (slug || lp.pageId) + ".html";
+      // slug-collision dedupe: two explored routes can slug to the SAME file —
+      // page-001 ("/") is always index.html and a later page whose route is
+      // "/index.html" slugs to "index" too, so the second write silently
+      // OVERWROTE the first (the verification contract then compared page-001's
+      // screenshot against the other page's file). Keep the canonical route
+      // (page-001 "/") as index.html and disambiguate every later collision as
+      // <slug>-2.html, <slug>-3.html …; the route→file maps below (per-page and
+      // generateProject's complete one) point links at whichever file actually
+      // carries the route.
+      let file = (lp.pageId === "page-001" ? "index" : (slug || lp.pageId)) + ".html";
+      if (usedFiles.has(file)) {
+        const stem = file.slice(0, file.lastIndexOf("."));
+        let n = 2;
+        while (usedFiles.has(`${stem}-${n}.html`)) n++;
+        file = `${stem}-${n}.html`;
+      }
+      usedFiles.add(file);
       pages.push({ route, html, file, elements: flat.length });
       fileByPageId.set(lp.pageId, file);
       allElements.push(...lp.elements);
       logger.info("generate", `${lp.pageId}: ${flat.length} components, file: ${file}`);
+      if (round === 1) {
+        wf.todoDone(pageTodos.get(lp.pageId)); // every add gets a done
+        wf.agent(lp.pageId, "page"); // viewer credits the build unit like exploration does
+      }
     }
 
     // tokens from captured evidence
@@ -324,11 +402,22 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
 
     // components.css from all pages' captured styles
     const layoutByIndex = new Map();
+    // page-scoped layout rows (visual round-1 exp-mw59a16doczk fix): element
+    // indexes restart per page, so the legacy index-only map was LAST-PAGE-WINS
+    // for all 1200 indexes — every page's components.css consumed the final
+    // page's flex/display decisions. buildComponentCss resolves per-page via
+    // opts.layoutByPage + opts.pageOfElement; the global map stays for callers.
+    const layoutByPage = new Map(); // pageId → Map(index → analyzeLayout row)
     for (const lp of loaded.pages) {
       if (!lp.elements) continue;
       const rectMap = new Map(lp.elements.map((e) => [e.i, { x: e.rect.x, y: e.rect.y, width: e.rect.w, height: e.rect.h }]));
       const pageLayout = analyzeLayout(lp.elements, rectMap);
-      for (const [k, v] of Object.entries(pageLayout)) layoutByIndex.set(Number(k), v);
+      const pageRows = new Map();
+      for (const [k, v] of Object.entries(pageLayout)) {
+        layoutByIndex.set(Number(k), v);
+        pageRows.set(Number(k), v);
+      }
+      layoutByPage.set(lp.pageId, pageRows);
     }
     // element indexes restart per page — map each element OBJECT to its page and
     // flag colliding indexes so the shared components.css can scope them
@@ -347,7 +436,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     }
     const colliding = new Set([...indexPages].filter(([, set]) => set.size > 1).map(([i]) => i));
     const scopeOf = (el) => (el && colliding.has(el.i) && pageOfElement.get(el) ? `body[data-page="${pageOfElement.get(el)}"] ` : "");
-    componentsCssText = buildComponentCss(allElements, layoutByIndex, { scopeOf, assetMap });
+    componentsCssText = buildComponentCss(allElements, layoutByIndex, { scopeOf, assetMap, pageOfElement, layoutByPage });
     // task 3.4.3: typography refinement overrides — repairs the generator's two
     // real drifts (captured font-weight 400 on UA-bold tags renders bold because
     // buildComponentCss drops "400", and letter-spacing is never emitted) from
@@ -503,6 +592,21 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     report.limitations.push(`app-state augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
   }
 
+  // ---- slop lint (ADR-0003 hygiene): traceability gate after generation ----
+  // Deterministic scan of the generated project for generator-injected generic
+  // patterns the captured evidence never shows; evidence-backed values stay,
+  // deterministically fixable injections are fixed in place. Non-fatal by
+  // contract: a lint failure logs a limitation and never blocks the clone.
+  try {
+    const slop = slopLint(outDir, { artifactsDir });
+    report.slop = { found: slop.found, fixed: slop.fixed, remaining: slop.remaining };
+    if (slop.notes?.length) report.limitations.push(...slop.notes.map((n) => `slop-lint: ${n}`));
+    logger.info("slop-lint", `found=${slop.found} fixed=${slop.fixed} remaining=${slop.remaining}`);
+  } catch (e) {
+    report.slop = { found: 0, fixed: 0, remaining: 0, error: String(e?.message || e).slice(0, 160) };
+    report.limitations.push("slop lint failed: " + String(e?.message || e).slice(0, 120));
+  }
+
   // ---- success contract (spec §7) ----
   report.status = report.passed ? "completed" : "completed_with_limitations";
   report.limitations.push(...(loaded.missing.length ? [`missing artifacts: ${loaded.missing.join(", ")}`] : []));
@@ -512,6 +616,17 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
   const mdRows = (report.validation || []).map((v) => `| ${v.route} | ${v.file || "—"} | ${v.size || 0}B |`);
   const md = ["# Reconstruction report", "", `- status: ${report.status}`, `- rounds: ${report.rounds.length}`, `- repairs: ${report.repairs.length || 0}`, `- limitations: ${report.limitations.length ? report.limitations.join("; ") : "none"}`, "", "| Route | File | Size |", "|---|---|---|"].concat(mdRows).join("\n");
   fs.writeFileSync(path.join(outDir, "reconstruction-report.md"), md);
+
+  // stage summary (log contract): exactly one per stageId — emitted here, after
+  // every fallible step (report writes included), so a crash above leaves the
+  // failure summary to the caller's catch path and one stage never prints twice
+  logger.stage("reconstruction", report.passed ? "completed" : "completed_with_limitations", {
+    pages: loaded.pages.length,
+    files: report.generatedFiles,
+    repairs: report.repairs.length,
+    limitations: report.limitations.length,
+  });
+  wf.stage("reconstruction", report.passed ? "completed" : "completed-with-errors", 1);
 
   return { ok: report.passed, report, outDir };
 }

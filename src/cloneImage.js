@@ -6,8 +6,16 @@ import { VisionClient, imagePart } from "./vision.js";
 import { SYSTEM_CLONER, CLONE_FROM_IMAGE } from "./prompts.js";
 
 export async function cloneImage(imgPath, cfg, outDir, opts = {}) {
-  if (cfg.model.provider === "none" || !cfg.model.apiKey) {
-    throw new Error("image mode needs a vision model — set OPENAI_API_KEY / ANTHROPIC_API_KEY or cloner.config.json");
+  // key guard mirrors hasVision() in src/vision.js: a stitch provider accepts
+  // STITCH_API_KEY (env) OR model.apiKey; every other provider needs model.apiKey.
+  const stitch = cfg.model.provider === "stitch";
+  const hasKey = stitch ? !!(cfg.model.apiKey || process.env.STITCH_API_KEY) : !!cfg.model.apiKey;
+  if (cfg.model.provider === "none" || !hasKey) {
+    throw new Error(
+      stitch
+        ? 'provider "stitch" requires STITCH_API_KEY — set it in .env / process.env, or "apiKey" under "model" in cloner.config.json'
+        : "image mode needs a vision model — set OPENAI_API_KEY / ANTHROPIC_API_KEY / STITCH_API_KEY, or \"apiKey\" under \"model\" in cloner.config.json",
+    );
   }
   fs.mkdirSync(outDir, { recursive: true });
   const ref = path.join(outDir, "_reference");

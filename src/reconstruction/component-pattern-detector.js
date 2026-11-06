@@ -38,7 +38,7 @@
 //       is applied ONLY when the generated runtime actually ships the sidebar
 //       handler (evidence gate on the runtime source); otherwise the decision
 //       is recorded as CSS-only instead of stamping dead conventions.
-//   F5  platform/verify.js:136-179 + platform/exhaustive-test.js:9-38  clone
+//   F5  reconstruction/verify.js:136-179 + platform/exhaustive-test.js:9-38  clone
 //       probes hard-code `.lm_content`/`.lm_tab`/`.lm_splitter`/`app-sidebar`/
 //       `data-testid^="sidebar-"` selectors. → verifyPanelProbeSelectors():
 //       evidence-derived probe selectors (data-ws-* runtime markers, captured
@@ -681,7 +681,7 @@ export const AUDIT_FINDINGS = Object.freeze([
   },
   {
     id: "F5",
-    file: "src/platform/verify.js",
+    file: "src/reconstruction/verify.js",
     line: 136,
     assumption: "verification app-control probes hard-code .lm_content/.lm_tab/.lm_splitter/app-sidebar/data-testid^='sidebar-' selectors (also src/platform/exhaustive-test.js:9-38 CLICKABLE/STATE_FN)",
     replacementHook: "verifyPanelProbeSelectors(cloneHtml, runtimeSrc)",

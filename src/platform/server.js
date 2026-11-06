@@ -17,7 +17,7 @@ import * as wsAuth from "./ws-auth.js";
 import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
 import { exportTask, exportV2Task } from "./exporter.js";
-import { verifyTask } from "./verify.js";
+import { verifyTask } from "../reconstruction/verify.js";
 import { authRequired, requireRole, tokenFingerprint } from "../auth/auth-middleware.js";
 import * as auth from "../auth/auth-service.js";
 import * as taskRepo from "../database/task-repository.js";
@@ -58,6 +58,7 @@ import { monetizeOptInMiddleware } from "./ads-optin.js";                       
 import { createPluginRegistry } from "../integrations/plugin-framework.js";                         // 4.2.14 plugin framework
 import { settleJobCost, setCreditLedger, isInsufficientCreditsError, LedgerSettlementError } from "./compute-accounting.js";
 import { resolveScope } from "./quota-service.js";
+import { progressRoutes } from "./progress-routes.js";                          // progress build viewer (integrator mount line — progress-routes.js header)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -591,6 +592,39 @@ export function startPlatform({ port = 4180 } = {}) {
   //     authed posture as every other local-operator surface.
   app.use("/api/github", githubPublishRouter({ guard: localOrAuthed("publish:task") }));
 
+  // 20. Progress build viewer (swarm): the page + SSE stream the user watches
+  //     while a clone builds. progress-routes.js ships NO guard of its own, so
+  //     per its integrator contract the mount applies localOrAuthed — the same
+  //     session-auth-or-loopback posture as the /ws upgrade (cookie/Bearer
+  //     session OK, loopback legacy OK, remote anonymous 401; API keys excluded
+  //     — the viewer is a browser page and no key scope serves it). The routes
+  //     inside already carry the /progress prefix, so the router mounts BARE
+  //     (bus defaults to the shared singleton) with the guard path-scoped here.
+  const progressGuard = (req, res, next) => {
+    if (req.path !== "/progress" && !req.path.startsWith("/progress/")) return next();
+    return localOrAuthed(null)(req, res, next);
+  };
+  // Per-job ownership for the live SSE stream, mirroring the
+  // /api/jobs/:jobId/artifacts gate: an owned job's build events stream only to
+  // the owner/org members — an anonymous or foreign caller gets the same 404
+  // the artifact read returns (no existence leak). Ownerless/unknown ids keep
+  // the loopback legacy posture, exactly like artifact reads. Runs AFTER
+  // progressGuard so req.userId is resolved before the gate consults it.
+  const progressSseOwnership = async (req, res, next) => {
+    const m = req.path.match(/^\/progress\/([^/]+)\/events$/);
+    if (req.method !== "GET" || !m) return next();
+    try {
+      const jobId = decodeURIComponent(m[1]);
+      const job = exploration.getExplorationJob(jobId);
+      if (job?.owner) {
+        const ok = req.userId ? await exploration.identityCanAccessJob(jobId, { userId: req.userId, role: req.userRole }) : false;
+        if (!ok) return res.status(404).json({ error: "not found" });
+      }
+    } catch { /* registry lookup failure → legacy posture, same as the artifact gate */ }
+    next();
+  };
+  app.use(progressGuard, progressSseOwnership, progressRoutes());
+
   app.get("/api/tasks", ...credentialedRead(), async (req, res) => {
     // authenticated (Bearer): only tasks created under this userId (meta.userId
     // is set by tasks.createTask / exploration payload); anonymous (local
@@ -1090,7 +1124,12 @@ export function startPlatform({ port = 4180 } = {}) {
   // (stdout is the only place errors survive when no WS client is attached)
   const T0 = Date.now();
   const at = () => `+${((Date.now() - T0) / 1000).toFixed(1)}s`;
-  for (const evt of ["step", "log", "tabs:found", "assets:progress", "assets:done", "page:goto", "run:done", "run:error", "polish:round"]) {
+  // the /ws live whitelist: legacy engine events + the four workflow.* viewer
+  // event types (progress-routes.js WORKFLOW_EVENT_TYPES). The catchup replay
+  // already ships them, but live traffic was filtered out here — a dashboard
+  // watching a running build saw stage/todo events only on reconnect.
+  for (const evt of ["step", "log", "tabs:found", "assets:progress", "assets:done", "page:goto", "run:done", "run:error", "polish:round",
+    "workflow.stage", "workflow.todo.add", "workflow.todo.done", "workflow.agent"]) {
     bus.on(evt, (e) => {
       // 4.0.12 QA fix: the event's OWN job tag wins over the shared v1
       // currentTaskId global — a stale v1 id (set by the last legacy runTask)

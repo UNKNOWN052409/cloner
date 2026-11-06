@@ -24,7 +24,7 @@ const ROOT = path.join(process.cwd(), "artifacts");
 // registry entry carries its owner ({ userId, orgId }) — every read surface
 // gates on it. userId/orgId may be null (anonymous local dashboard, legacy
 // posture: personal scope, no org).
-export function queueExploration({ url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], monetize, userId = null, orgId = null }) {
+export function queueExploration({ url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], monetize, userId = null, orgId = null, instructions = null }) {
   // task 4.5.5: monetize is a PER-TASK OWNER OPT-IN (policy-safe default OFF).
   // Callers may pass it explicitly; otherwise the task-creation request scope
   // captured by ads-optin.js monetizeOptInMiddleware() supplies it. The flag
@@ -36,7 +36,10 @@ export function queueExploration({ url, username, password, cookies, storage, po
   // payload.traceparent (injected below) → tracedExecutor (clone-worker.js).
   // A null sink (CLONER_TRACING=0) degrades to zero-op spans.
   return withSpan("api.enqueue-clone-task", { "job.url": url || null }, (span) => {
-    const payload = { url, username, password, cookies, storage, policy, sessionId, interactionRecords, monetize: optedIn, ...injectTraceparent() };
+    // instructions ride the payload (audit F fix: server.js has always passed
+    // them; this signature previously dropped them, so they never reached the
+    // pipeline — reconstruction cloned full scope silently)
+    const payload = { url, username, password, cookies, storage, policy, sessionId, interactionRecords, monetize: optedIn, instructions, ...injectTraceparent() };
     // returns the entry synchronously (status "queued"; with a free slot the job
     // is already "exploring" by the time this returns — same as before the
     // adapter rewiring)

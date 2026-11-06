@@ -94,7 +94,7 @@ function embedSwarm() {
   const f = $("#swarm");
   if (!jobId) {
     $("#frame-note").textContent = "no job selected — open with ?job=<jobId>";
-    $("#job-body").innerHTML = '<span style="color:var(--err)">no job id in URL (?job=…)</span>';
+    $("#job-body").innerHTML = '<span style="color:var(--status-error)">no job id in URL (?job=…)</span>';
     return;
   }
   f.src = `/progress/${encodeURIComponent(jobId)}`;
@@ -108,8 +108,8 @@ async function loadJob() {
   if (!jobId) return;
   const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`).catch(() => null);
   if (!res || !res.ok) {
-    el.innerHTML = res ? `<span style="color:var(--warn)">job registry: HTTP ${res.status} — status shown from /ws events only</span>`
-      : '<span style="color:var(--warn)">job registry unreachable — status shown from /ws events only</span>';
+    el.innerHTML = res ? `<span style="color:var(--status-pending)">job registry: HTTP ${res.status} — status shown from /ws events only</span>`
+      : '<span style="color:var(--status-pending)">job registry unreachable — status shown from /ws events only</span>';
     return;
   }
   const job = await res.json().catch(() => null);

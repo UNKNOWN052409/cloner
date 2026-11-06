@@ -7,7 +7,7 @@ import http from "node:http";
 import express from "express";
 import { WebSocketServer } from "ws";
 import { fileURLToPath } from "node:url";
-import { bus } from "../events.js";
+import { bus, withJobScope } from "../events.js";
 import { loadConfig } from "../config.js";
 import { cloneUrl } from "../cloneUrl.js";
 import { validatePublicUrl } from "../security/url-guard.js";
@@ -18,6 +18,7 @@ import * as tasks from "./tasks.js";
 import * as sessions from "./sessions.js";
 import { exportTask, exportV2Task } from "./exporter.js";
 import { verifyTask } from "../reconstruction/verify.js";
+import { buildBlueprint } from "../reconstruction/blueprint.js"; // ADR-0003: blueprint approve re-run
 import { authRequired, requireRole, tokenFingerprint } from "../auth/auth-middleware.js";
 import * as auth from "../auth/auth-service.js";
 import * as taskRepo from "../database/task-repository.js";
@@ -35,6 +36,8 @@ import { quotaGuard, quotaUsageRoute, quotaReconcile, promoteReservation, releas
 import { QuotaExceededError } from "./quota-service.js";
 import { checkLimit, rateLimitHeaders } from "./rate-limiter.js";
 import { getCloneQueue } from "../queues/clone-queue.js";
+import { runPipelineJob } from "../queues/pipeline-job.js"; // 4.2.9 re-route fallback executor (mirrors clone-worker)
+import { versionsRouter } from "./version-service.js";               // 4.1.3 project versions
 import { resolveArtifactPath, sweep as artifactSweep, enqueueSweep } from "../storage/artifact-lifecycle.js"; // 4.0.5
 import { dashboardRouter } from "./dashboard-routes.js";              // G2.1 dashboard summary + quota widgets
 // ---- Phase 4.2 / 4.5 / G-series integrations (grand-final integration) ----
@@ -140,9 +143,18 @@ export function startPlatform({ port = 4180 } = {}) {
   // through the REAL queue. A re-routed job's run closure resolves back to the
   // pipeline the payload already carries (memory backend executes in-process;
   // a BullMQ deployment consumes the region queue from its worker process).
+  // resolveRun shape fix (wave 7): the shipped resolver returned `{ run: fn }`
+  // — an OBJECT — so the memory backend's `d.run(...)` call errored every
+  // re-routed entry with "d.run is not a function" (reproduced in
+  // scripts/test-distributed-plane.mjs §6), and `job.payload.run` was in any
+  // case always absent: the failover ledger round-trips every record through
+  // JSON (MemoryStore AND RedisStore stringify), which drops functions.
+  // resolveReroutedRun (bottom of this file) resolves the run BY JOB PAYLOAD —
+  // the shared runPipelineJob / sweep rebuilt over the JSON-surviving payload,
+  // exactly how clone-worker's defaultExecutor resolves the pipeline — and
+  // returns the FUNCTION the dispatcher's `run:` slot expects.
   const failover = createFailoverController({
-    dispatch: createQueueDispatcher(getCloneQueue(), (job) =>
-      (job?.payload?.run ? { run: job.payload.run } : null)),
+    dispatch: createQueueDispatcher(getCloneQueue(), resolveReroutedRun),
   });
   failover.start();
 
@@ -627,6 +639,15 @@ export function startPlatform({ port = 4180 } = {}) {
   };
   app.use(progressGuard, progressSseOwnership, progressRoutes());
 
+  // 21. Project versions (4.1.3): immutable version records + snapshot/rollback.
+  //     The router carries NO guard of its own (version-service.js header
+  //     documents this mount line) — mounted here with the platform's
+  //     loopback-or-authed posture. GET /api/versions (the bare prefix the
+  //     product UI's final page polls — platform-ui/pages/final.js) lists
+  //     recent versions in the SAME { ok, versions } shape the per-task
+  //     listing already returns, so the UI renders both identically.
+  app.use("/api/versions", versionsRouter({ guard: localOrAuthed("read:task") }));
+
   app.get("/api/tasks", ...credentialedRead(), async (req, res) => {
     // authenticated (Bearer): only tasks created under this userId (meta.userId
     // is set by tasks.createTask / exploration payload); anonymous (local
@@ -723,6 +744,81 @@ export function startPlatform({ port = 4180 } = {}) {
     const relJob = path.relative(jobRoot, file);
     if (relRoot.startsWith("..") || path.isAbsolute(relRoot) || relJob.startsWith("..") || path.isAbsolute(relJob) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return res.status(404).json({ error: "not found" });
     res.sendFile(file);
+  });
+
+  // ---- blueprint approve (ADR-0003 fidelity contract; wave 7 endpoints) ----
+  // Re-runs blueprint.js buildBlueprint over the SAME artifacts dir with the
+  // caller-edited scope and rewrites blueprint.json in place. Evidence-
+  // preserving: buildBlueprint reads manifest.json + pages/* and touches
+  // exactly one file (blueprint.json) — recorded evidence is never mutated.
+  // Redacted inputs: only bounded, caller-supplied scope strings reach the
+  // contract; the endpoint accepts neither credentials nor free-form text.
+  // Contract: the product UI (platform-ui/pages/blueprint.js) POSTs
+  // { scope: { include, exclude, notes }, jobId, approved }; the flat
+  // { scopeInclude, scopeExclude } aliases are accepted too. Response
+  // { ok: true, blueprint } — the UI keys its success notice on data.ok and
+  // re-reads blueprint.json through the artifacts route on reload.
+  app.post("/api/jobs/:jobId/blueprint/approve", ...credentialedRead(), async (req, res) => {
+    // Same per-job ownership gate as the artifacts read (mirror
+    // progressSseOwnership): an owned job approves only for the owner / org
+    // members / platform-admin; anonymous or foreign callers get the same 404
+    // the artifact read returns (no existence leak). Ownerless/unknown ids
+    // keep the loopback legacy posture, exactly like artifact reads.
+    const job = exploration.getExplorationJob(req.params.jobId);
+    if (job?.owner) {
+      const ok = req.userId ? await exploration.identityCanAccessJob(req.params.jobId, { userId: req.userId, role: req.userRole }) : false;
+      if (!ok) return res.status(404).json({ error: "not found" });
+    }
+    // scope normalization: the UI's { scope: { include, exclude } } object or
+    // the flat { scopeInclude, scopeExclude } — each an array of bounded
+    // strings (a lone string is accepted as one entry); anything else is a 400,
+    // never silently coerced into the contract.
+    const scopeObj = (req.body?.scope && typeof req.body.scope === "object" && !Array.isArray(req.body.scope)) ? req.body.scope : null;
+    const rawInclude = scopeObj ? scopeObj.include : req.body?.scopeInclude;
+    const rawExclude = scopeObj ? scopeObj.exclude : req.body?.scopeExclude;
+    const asScopeList = (v, field) => {
+      const list = Array.isArray(v) ? v : v === undefined || v === null ? [] : [v];
+      if (list.length > 20) return { error: `${field} accepts at most 20 entries` };
+      const out = [];
+      for (const item of list) {
+        if (typeof item !== "string") return { error: `${field} entries must be strings` };
+        // ';' and newlines are the parser's clause delimiters (blueprint.js
+        // parseInstructions) — stripped so one entry stays one clause
+        const t = item.replace(/[;\n\r]+/g, " ").trim();
+        if (!t) continue;
+        if (t.length > 200) return { error: `${field} entries max 200 chars` };
+        out.push(t);
+      }
+      return { list: out };
+    };
+    const inc = asScopeList(rawInclude, "scopeInclude");
+    if (inc.error) return res.status(400).json({ error: inc.error });
+    const exc = asScopeList(rawExclude, "scopeExclude");
+    if (exc.error) return res.status(400).json({ error: exc.error });
+    if (!inc.list.length && !exc.list.length) return res.status(400).json({ error: "scopeInclude/scopeExclude (or scope.{include,exclude}) required" });
+    // compose the edited scope as instruction clauses the deterministic parser
+    // classifies (blueprint.js INCLUDE_RE / EXCLUDE_RE) — the same seam the
+    // pipeline uses (reconstruction-pipeline.js → buildBlueprint instructions).
+    // Entries that already carry a scope keyword pass through verbatim so a
+    // re-approve of the UI's round-tripped scope is idempotent.
+    const SCOPE_KW = /^(only|just|sirf|limit to|restrict to|exclude|skip|without|ignore|no need for|do not clone|don't clone|not the)\b/i;
+    const clause = (item, kind) => (SCOPE_KW.test(item) ? item : kind === "include" ? `only ${item}` : `exclude ${item}`);
+    const instructions = [
+      ...inc.list.map((s) => clause(s, "include")),
+      ...exc.list.map((s) => clause(s, "exclude")),
+    ].join("; ");
+    // SAME artifacts dir the artifacts read serves for this handle (resolved
+    // through artifact-lifecycle — org-scoped root first, legacy fallback)
+    const { path: artifactsDir } = resolveArtifactPath(req.params.jobId, { orgId: req.tenantScope?.orgId || undefined });
+    const bp = buildBlueprint(artifactsDir, { instructions });
+    if (!bp.ok) {
+      const missing = /missing/i.test(bp.why || "");
+      return res.status(missing ? 404 : 400).json({ error: String(bp.why || "blueprint failed").slice(0, 200) });
+    }
+    // no audit event exists for a blueprint approval (audit-service.js is not
+    // extended here) — the rewritten blueprint.json itself carries the record
+    // (generatedAt + instructions.raw + scope), which is the artifact of record
+    res.json({ ok: true, blueprint: bp.blueprint });
   });
   app.get("/api/tasks/:id", localOrAuthed("read:task"), async (req, res) => {
     // check legacy task store first, then exploration-runner (pipeline v2)
@@ -1275,6 +1371,47 @@ function firstJson(text) {
     try { return JSON.parse(c.slice(s, e + 1)); } catch {}
   }
   return null;
+}
+
+// ---- 4.2.9 re-route run resolver (createQueueDispatcher's resolveRun seam) ----
+// A re-routed job must EXECUTE on the memory backend like any other entry, so
+// the dispatcher's `run` slot must receive a FUNCTION — the shipped
+// `{ run: fn }` wrapper made the queue call an object ("d.run is not a
+// function", reproduced in scripts/test-distributed-plane.mjs §6). The run is
+// resolved BY JOB PAYLOAD (the ledger's JSON round-trip — MemoryStore AND
+// RedisStore stringify — has already dropped every function, and the queue
+// registry never holds closures either: clone-queue.js keeps `run` on the
+// dispatch object, not the entry), mirroring src/workers/clone-worker.js
+// defaultExecutor — the pipeline is rebuilt from the surviving payload:
+//   • clone payloads → the shared runPipelineJob over the re-routed entry
+//     (withJobScope tag + linkJobId registry hook, same as
+//     exploration-runner.queueExploration's in-process closure);
+//   • { kind: "artifact-sweep" } payloads → the same run closure
+//     artifact-lifecycle.enqueueSweep attaches (never fed into the clone
+//     pipeline; memory-backend convention: the run owns the terminal status).
+// Exported for scripts/test-endpoints.mjs (offline re-route harness, which
+// mirrors the production binding with its own queue instance via opts.queue).
+export function resolveReroutedRun(job, { queue = null } = {}) {
+  const q = queue || getCloneQueue();
+  const payload = job?.payload && typeof job.payload === "object" ? job.payload : {};
+  if (payload.kind === "artifact-sweep") {
+    return async ({ entry: e, report }) => {
+      e.status = "sweeping";
+      report("sweeping");
+      const { sweep } = await import("../storage/artifact-lifecycle.js");
+      const result = sweep({ base: payload.root, execute: payload.execute !== false, allowLegacy: false, orphanPolicy: "skip" });
+      report("swept");
+      e.status = "completed"; // memory-backend convention: the run owns terminal status
+      report("completed");
+      return result ?? { ok: true };
+    };
+  }
+  return ({ entry, report }) =>
+    withJobScope(entry.tempId, () => runPipelineJob(payload, {
+      entry, report,
+      artifactsRoot: path.join(process.cwd(), "artifacts"),
+      linkJobId: (tempId, jobId) => q.linkJobId(tempId, jobId),
+    }));
 }
 
 // ---- 4.0.5 export hooks (documented in artifact-lifecycle.js header) ----

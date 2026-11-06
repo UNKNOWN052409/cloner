@@ -580,11 +580,15 @@ section("7. benchmark intelligence (REAL benchmark outputs)");
     const clean = detectRegressions(normBase, normBase, { tolerance: 0 });
     check("identical runs → NO regressions flagged", clean.flagged === false && clean.regressions.length === 0);
 
-    // perturb ONE dimension beyond tolerance on the real data
+    // perturb ONE dimension beyond tolerance on the real data — anchored on the
+    // BASELINE value (not the current value): the runs drift as the engine
+    // improves, so a current-anchored −20 can land ABOVE baseline (a rise, not a
+    // drop) and detection would be right to flag nothing
     const perturbed = JSON.parse(JSON.stringify(current));
     const site0 = perturbed.results[0];
     const dim0 = Object.keys(site0.dimensions)[0];
-    site0.dimensions[dim0] = Math.max(0, Number(site0.dimensions[dim0]) - 20);
+    const baseDim0 = normBase.sites.find((s) => s.site === site0.site)?.dimensions[dim0];
+    site0.dimensions[dim0] = Math.max(0, Number(baseDim0 ?? site0.dimensions[dim0]) - 20);
     const detected = detectRegressions(perturbed, baseline, { tolerance: 5 });
     const hit = detected.regressions.find((r) => r.site === site0.site && r.dimension === dim0);
     check("perturbed dimension → regression flagged with exact fields", detected.flagged === true && !!hit && hit.drop === 20 && hit.from > hit.to, JSON.stringify(hit || detected.regressions.slice(0, 2)));

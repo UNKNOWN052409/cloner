@@ -40,14 +40,32 @@ const PAGES = {
   "/": `<!DOCTYPE html><html><head><title>Live Events Home</title><style>
 body{font-family:Arial,sans-serif;margin:0;background:#f4f5f7;color:#1c2733}
 .nav{background:#1d3557;padding:14px 24px}.nav a{color:#fff;margin-right:18px;text-decoration:none}
+.tabs{background:#dfe6ee;padding:10px 24px;display:flex;gap:10px}
+.tabs button{padding:6px 14px;font-size:13px;background:#fff;border:1px solid #b7c4d4;cursor:pointer}
+.tabs button[aria-selected="true"]{background:#1d3557;color:#fff}
 main{max-width:720px;margin:32px auto;background:#fff;padding:24px;border:1px solid #ccd}
 .popup{display:none;position:fixed;left:20%;top:20%;width:420px;height:180px;background:#eef;border:1px solid #99c;padding:16px;z-index:1000}
 </style></head><body>
 <div class="nav"><a href="/">Home</a><a href="/index.html">Index alias</a><a href="/pricing">Pricing</a></div>
-<main><h1>Live Events Home</h1><p>Seed page with unique home content for the signature check.</p>
+<div class="tabs" role="tablist">
+  <button role="tab" class="tab-btn" data-view="overview" aria-selected="true">Overview</button>
+  <button role="tab" class="tab-btn" data-view="reports" aria-selected="false">Reports</button>
+</div>
+<main>
+<div id="view-overview"><h1>Live Events Home</h1><p>Seed page with unique home content for the signature check.</p></div>
+<div id="view-reports" style="display:none"><h1>Reports view</h1><p>Same-URL tab view the in-URL state walker must record.</p></div>
 <button id="open-panel" onclick="document.getElementById('panel').style.display='block'">Open panel</button>
 <div id="panel" class="popup"><h2>Panel opened</h2><p>Panel body recorded by the capture stage.</p></div>
-</main></body></html>`,
+</main>
+<script>
+document.querySelectorAll('.tab-btn').forEach(function(b){
+  b.addEventListener('click',function(){
+    document.querySelectorAll('.tab-btn').forEach(function(x){x.setAttribute('aria-selected',x===b?'true':'false');});
+    document.getElementById('view-overview').style.display=b.getAttribute('data-view')==='overview'?'block':'none';
+    document.getElementById('view-reports').style.display=b.getAttribute('data-view')==='reports'?'block':'none';
+  });
+});
+</script></body></html>`,
   "/index.html": `<!DOCTYPE html><html><head><title>Live Events Index Alias</title></head><body>
 <div class="nav"><a href="/">Home</a><a href="/pricing">Pricing</a></div>
 <main><h1>Index Alias Page</h1><p>This route slugs to "index" and used to OVERWRITE page-001's index.html.</p></main></body></html>`,
@@ -142,6 +160,31 @@ if (pipelineError || !result) {
   check("validation rows carry distinct file names (no overwrite)", new Set(files).size === files.length && files.filter(Boolean).length >= 3, files.join(", "));
   check("links rewritten to the clone (no absolute fixture hrefs left)",
     !indexHtml.includes(`href="${base}`) && !index2.includes(`href="${base}`), "index.html + index-2.html scanned");
+
+  // ---- 3b. in-URL state depth: the SPA walker runs in the product pipeline ----
+  // The "/" fixture carries same-URL tab views (role=tab buttons swapping a view
+  // container with no navigation) — enumerateInAppStates must record them as
+  // url#state graph nodes + pages/<pageId>-state-NN manifest entries (the
+  // reconstruction emits one page per entry; test-spa-depth.mjs proves that end
+  // to end, here we prove the REAL authed pipeline path records them).
+  let graphStates = null;
+  try { graphStates = JSON.parse(fs.readFileSync(path.join(artifactsRoot, jobId, "graph", "states.json"), "utf8")); } catch {}
+  const inUrl = (graphStates?.nodes || []).filter((n) => n.status === "in-url");
+  check("graph/states.json carries >=1 in-url state node", (graphStates?.nodes || []).length >= 1 && inUrl.length >= 1,
+    `in-url=${inUrl.length} of ${graphStates?.nodes?.length ?? 0} nodes`);
+  check("in-url nodes are keyed url#state with evidence refs",
+    inUrl.length > 0 && inUrl.every((n) => String(n.url).includes("#") && n.screenshotRef && n.domRef),
+    inUrl.map((n) => `${n.id}:${n.url}`).join("; ") || "none");
+  // the raw exploration manifest carries pages as an ARRAY (the pipeline-job
+  // result summarizes it to a count — src/queues/pipeline-job.js:96)
+  let explManifest = null;
+  try { explManifest = JSON.parse(fs.readFileSync(path.join(artifactsRoot, jobId, "manifest.json"), "utf8")); } catch {}
+  const statePages = ((explManifest?.pages) || []).filter((p) => /-state-\d{2}$/.test(String(p.pageId || "")));
+  check("manifest carries a pages/<id>-state-* entry per in-url state", statePages.length >= 1 && statePages.length === inUrl.length,
+    `manifest=${statePages.length} graph=${inUrl.length} — ${statePages.map((p) => p.pageId).join(", ") || "none"}`);
+  check("state entries keyed url#state + stateOf + own dom.json on disk",
+    statePages.length > 0 && statePages.every((p) => String(p.url).includes("#") && p.stateOf === "page-001" && fs.existsSync(path.join(artifactsRoot, jobId, "pages", p.pageId, "dom.json"))),
+    statePages[0] ? `${statePages[0].pageId} → ${statePages[0].url} (stateOf=${statePages[0].stateOf})` : "none");
 }
 
 // ---- 4. /ws live whitelist (read from server.js SOURCE, per the ask) ----

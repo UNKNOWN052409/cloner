@@ -144,6 +144,16 @@ export function buildComponentCss(elements, layoutByIndex, opts = {}) {
     if (st.transform && st.transform !== "none") props.push(`transform:${st.transform}`);
     if (st.overflow && st.overflow !== "visible") props.push(`overflow:${st.overflow}`);
     if (st.zIndex && st.zIndex !== "auto") props.push(`z-index:${st.zIndex}`);
+    // capture-only background canvas hygiene (exp-mw5l1whwd178): the live app's
+    // full-viewport chart/paint surface is captured as a fixed-position canvas —
+    // in the clone it carries no handlers (the runtime binds only recorded
+    // [data-cloner-trigger] controls), but sitting at a higher stacking level
+    // than the workspace it swallows EVERY pointer event, so dock splitters/
+    // tabs/panes are unhittable and the app-control wiring check fails
+    // ("splitter drag resized panel: 697×131 → 697×131"). pointer-events:none
+    // changes no rendering — it only stops the dead layer from hijacking
+    // interaction. Canvases that carry a recorded trigger keep their hit area.
+    if (el.tag === "canvas" && position === "fixed" && !el.dataClonerTrigger) props.push("pointer-events:none");
     if (rect && rect.w > 2 && rect.h > 2) {
       if (rect.w) props.push(`width:${rect.w}px`);
       if (rect.h) props.push(`height:${rect.h}px`);

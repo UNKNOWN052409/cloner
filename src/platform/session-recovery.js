@@ -308,7 +308,7 @@ export async function resumeRecoveryJob({ jobId, identity, base = process.cwd(),
 
     // ---- stage: verification ----
     if (!partial.verification.completed) {
-      const { verifyTask } = await import("./verify.js");
+      const { verifyTask } = await import("../reconstruction/verify.js");
       shell.status = "verifying";
       hist("verification re-run");
       const verification = await verifyTask(artifactsDir);

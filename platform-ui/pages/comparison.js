@@ -38,7 +38,7 @@ function renderStages(report) {
         <div class="check"><span class="mark ${c.ok ? "ok" : "err"}">${c.ok ? "✓" : "✗"}</span>
           <span>${esc(c.name)}</span> <span class="detail">${esc(c.detail || "")}</span></div>`).join("")}
       ${s.metrics ? `<details><summary>metrics</summary><pre class="mono kv" style="white-space:pre-wrap">${esc(JSON.stringify(s.metrics, null, 1))}</pre></details>` : ""}
-    </div>`).join("") + (fm ? `<div class="chips">${fmChip}${fm.note ? `<span class="chip">${esc(fm.note)}</span>` : ""}${fm.error ? `<span class="chip" style="color:var(--err)">${esc(fm.error)}</span>` : ""}</div>` : "");
+    </div>`).join("") + (fm ? `<div class="chips">${fmChip}${fm.note ? `<span class="chip">${esc(fm.note)}</span>` : ""}${fm.error ? `<span class="chip" style="color:var(--status-error)">${esc(fm.error)}</span>` : ""}</div>` : "");
 }
 
 // defect classification — computed from the matrix data itself (fail kinds +
@@ -100,7 +100,7 @@ function shotCell(cap, path, missingText) {
 
 function showFatal(status, why) {
   $("#main").className = "state err";
-  $("#main").innerHTML = `<h2 style="color:var(--err)">comparison unavailable</h2><p>HTTP ${status} — ${esc(why)}</p>
+  $("#main").innerHTML = `<h2 style="color:var(--status-error)">comparison unavailable</h2><p>HTTP ${status} — ${esc(why)}</p>
     <p class="kv">Job id used: <code>${esc(jobId || "(none — open with ?job=<jobId>")}</code></p>`;
 }
 
@@ -137,11 +137,11 @@ async function boot() {
 
   const [ver, matrix] = await Promise.all([getJson("_reference/verification.json"), getJson("reports/flow-matrix.json")]);
   const stEl = $("#stages-body");
-  if (!ver.data) stEl.innerHTML = `<div class="empty" style="color:var(--warn)">verification.json not available (HTTP ${ver.status}) — written at _reference/verification.json once verification runs</div>`;
+  if (!ver.data) stEl.innerHTML = `<div class="empty" style="color:var(--status-pending)">verification.json not available (HTTP ${ver.status}) — written at _reference/verification.json once verification runs</div>`;
   else { stEl.innerHTML = renderStages(ver.data); stEl.className = ""; }
 
   const flEl = $("#flows-body");
-  if (!matrix.data) flEl.innerHTML = `<div class="empty" style="color:var(--warn)">flow-matrix.json not available (HTTP ${matrix.status}) — written to reports/flow-matrix.json by the flow replay stage</div>`;
+  if (!matrix.data) flEl.innerHTML = `<div class="empty" style="color:var(--status-pending)">flow-matrix.json not available (HTTP ${matrix.status}) — written to reports/flow-matrix.json by the flow replay stage</div>`;
   else flEl.innerHTML = renderFlows(matrix.data);
 
   const bgEl = $("#bugs-body");

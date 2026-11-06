@@ -12,7 +12,11 @@ import { getWorkerPool, createWorkerPool, getBrowserRootPid, sampleBrowserRss } 
 import { authenticateSession } from "../exploration/authenticated-session.js";
 import { resolvePolicy } from "../exploration/exploration-policy.js";
 import { createRouteDiscovery, spaRecorderScript } from "../exploration/route-discovery.js";
-import { createStateGraph, DOM_SIGNATURE_SCRIPT } from "../exploration/state-discovery.js";
+// task 3.5.6: the proven SPA in-URL walker (test-spa-depth.mjs) is wired into
+// the per-route loop below — enumerateInAppStates records same-URL view
+// switches as url#state graph nodes, statePageId names their artifact dirs and
+// statePageEntries turns them into manifest.pages entries
+import { createStateGraph, DOM_SIGNATURE_SCRIPT, enumerateInAppStates, statePageId, statePageEntries } from "../exploration/state-discovery.js";
 import { DOM_EXTRACTOR_SCRIPT, analyzeTypography } from "../intelligence/dom-extractor.js";
 import { buildAssetManifest, captureResponsive } from "../assets/asset-manifest.js";
 import { createArtifactStore, redact } from "../storage/artifact-store.js";
@@ -52,6 +56,28 @@ function mergeCookies(base, session) {
     if (i >= 0) out[i] = sc; else out.push(sc);
   }
   return out.length ? out : null;
+}
+
+// task 3.5.6: state-page evidence writer for in-URL states — the same artifact
+// shape scripts/test-spa-depth.mjs proves (its capturePageArtifacts): screenshot
+// + dom.json + geometry.json + styles.json + network.json under pages/<stateId>/,
+// so the reconstruction's artifact-loader reads each state page exactly like a
+// route page. Walk-period network traffic stays attributed to the parent route
+// page, so a state page's network.json is an honest empty ledger.
+async function captureInAppStateArtifacts(store, p, stateId, stateUrl) {
+  const shot = await p.screenshot({ fullPage: false, timeout: 20000 }).catch(() => null);
+  const screenshotRef = shot ? store.writeBinary(`pages/${stateId}/screenshot-viewport.png`, shot) : null;
+  const intel = await p.evaluate(DOM_EXTRACTOR_SCRIPT).catch(() => null);
+  let domRef = null;
+  if (intel) {
+    intel.typography = analyzeTypography(intel.elements);
+    store.writeJson(`pages/${stateId}/dom.json`, { pageId: stateId, url: stateUrl, total: intel.total, sampled: intel.sampled, elements: intel.elements, repeated: intel.repeated, fixed: intel.fixed, sticky: intel.sticky, typography: intel.typography });
+    store.writeJson(`pages/${stateId}/geometry.json`, { pageId: stateId, containers: intel.elements.slice(0, 60).map((e) => ({ i: e.i, tag: e.tag, cls: e.cls, rect: e.rect, layout: e.layout })), fixed: intel.fixed, sticky: intel.sticky, repeated: intel.repeated });
+    store.writeJson(`pages/${stateId}/styles.json`, { pageId: stateId, typography: intel.typography, bodyStyle: intel.bodyStyle || null, htmlStyle: intel.htmlStyle || null, elements: intel.elements.map((e) => ({ i: e.i, tag: e.tag, cls: e.cls, style: e.style })) });
+    domRef = `pages/${stateId}/dom.json`;
+  }
+  store.writeJson(`pages/${stateId}/network.json`, { pageId: stateId, url: stateUrl, entries: [] });
+  return { screenshotRef, domRef };
 }
 
 export async function runExplorationJob({ url, cookiesFile, cookies, storage, username, password, config = {}, artifactsRoot = "artifacts", jobId: forcedId, onProgress = null } = {}) {
@@ -312,6 +338,11 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     // ---- per-page capture + states (bounded, spec §7B/§7C/§8) ----
     const graph = createStateGraph();
     const pages = [];
+    // task 3.5.6: route-page count tracked separately from manifest.pages —
+    // in-URL state entries are appended to pages[] (one manifest page per
+    // state, exactly like the test proves) but must NOT consume the maxRoutes
+    // budget or the page-NNN numbering, which count ROUTES explored
+    let routesExplored = 0;
     const exploredPaths = new Set();
     const maxRoutes = policy.budgets.maxRoutes;
 
@@ -431,7 +462,14 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
         const shotFile = stateShots.find((f) => f.startsWith(`${rec.id}-`) && f.endsWith(".png")) || (stateShots.includes(`picker-${rec.id}.png`) ? `picker-${rec.id}.png` : null);
         const screenshotRef = shotFile ? `_reference/states/${shotFile}` : null;
         const domRef = rec.html ? store.writeText(`states/${pageId}/${rec.id}.html`, rec.html) : null;
-        const st = graph.addState({ url: page.url() + "#" + (rec.text || rec.id), domSig: domSig + ":" + rec.id, parentStateId: rootNode.node.id, interaction: rec.text || rec.id, screenshotRef, domRef, status: "recorded" });
+        // status "in-url": these are same-URL view captures keyed url#state —
+        // the exact shape state-graph-core's walker labels "in-url" and the
+        // consumers count (verify-visual3's in-URL evidence branch filters
+        // status === "in-url"; the gates count the same nodes). The old
+        // "recorded" label was read by nothing, so 13 documented url#state
+        // states surfaced as IN-URL-STATES=0 and the completeness gate failed
+        // its "0 documented behaviors" check despite on-disk dom evidence.
+        const st = graph.addState({ url: page.url() + "#" + (rec.text || rec.id), domSig: domSig + ":" + rec.id, parentStateId: rootNode.node.id, interaction: rec.text || rec.id, screenshotRef, domRef, status: "in-url" });
         graph.addEdge({
           fromStateId: rootNode.node.id, toStateId: st.node.id, trigger: rec.text || rec.id, action: "click",
           expected: `${rec.kind} opens`,
@@ -444,11 +482,58 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       if (pn) exploredPaths.add(pn);
       discovery.markExplored(page.url()); // task 3.5.5: keep the dedup index in sync for planNavigations()
       pages.push({ pageId, url: page.url(), route, records: records.length, domSampled: domIntel ? domIntel.sampled : 0 });
+      routesExplored++; // the ROUTE page counts toward maxRoutes; the in-URL state entries below do not
+      // task 3.5.6: in-URL state depth — the proven SPA walker now runs in the
+      // product pipeline (QA wiring): after interaction recording, walk the
+      // page's visible in-app nav/tab controls and record every same-URL DOM
+      // change as an url#state node + pages/<pageId>-state-NN/ evidence, wired
+      // exactly like scripts/test-spa-depth.mjs proves (the reconstruction
+      // emits one page per manifest.pages entry, no changes needed there).
+      // Guarded by the policy risk rules (DANGEROUS text/containers), capped by
+      // budgets.maxInUrlStates AND the remaining page budget; a candidate that
+      // navigates is restored and left to route-discovery.
+      const pageEntry = pages[pages.length - 1];
+      const walkBudgetMs = Math.min(pageDeadline - Date.now(), 60000);
+      if (process.env.CLONER_DISABLE_INURL_WALK === "1") {
+        // operational kill-switch (same idiom as CLONER_BROWSER_POOL): skips the
+        // walker without a code change — QA can isolate walker-caused deltas
+        logger.debug("state-depth", `page ${pageId}: CLONER_DISABLE_INURL_WALK=1 — in-URL walk skipped`);
+      } else if (walkBudgetMs < 3000) {
+        logger.debug("state-depth", `page ${pageId}: page budget exhausted — in-URL walk skipped`);
+      } else {
+        try {
+          const depth = await enumerateInAppStates(page, {
+            graph,
+            parentNode: rootNode.node,
+            policy,
+            captureState: async ({ page: p, index }) => captureInAppStateArtifacts(store, p, statePageId(pageId, index), pageEntry.url),
+            logger,
+            budgetMs: walkBudgetMs,
+          });
+          // walk-period network traffic belongs to the page whose controls
+          // caused it (spec §11 attribution) — extend the parent page's ledger
+          // (redact is idempotent, so already-redacted entries survive the merge)
+          const walkNet = network.entries.slice(netCursor);
+          netCursor = network.entries.length;
+          if (walkNet.length) {
+            store.writeJson(`pages/${pageId}/network.json`, { pageId, url: pageEntry.url, entries: redact([...newEntries, ...walkNet]) });
+          }
+          if (depth.recorded > 0) {
+            pages.push(...statePageEntries(pageEntry, depth.states));
+            logger.info("state-depth", `${depth.recorded} in-URL state(s) recorded on ${pageId}`, { candidates: depth.candidates, unsafeSkipped: depth.skipped.unsafe, urlChanged: depth.skipped["url-changed"] });
+          } else {
+            logger.debug("state-depth", `page ${pageId}: no in-URL state (candidates=${depth.candidates}, ledger ${JSON.stringify(depth.skipped)})`);
+          }
+        } catch (e) {
+          // fail-soft: the walker never kills the route's exploration
+          warnings.push(`in-URL state walk failed on ${pageId}: ` + String(e?.message || e).slice(0, 100));
+        }
+      }
       logger.debug("explore", `page ${pageId} done`, { records: records.length, domSampled: domIntel ? domIntel.sampled : 0 });
       // viewer: the route todo closes and the page lands as a labeled build unit
       wf.todoDone(todoId);
       wf.agent(pageId, "page");
-      wf.stage("exploration", "running", Math.min(pages.length / Math.max(plannedRoutes.length, pages.length), 1));
+      wf.stage("exploration", "running", Math.min(routesExplored / Math.max(plannedRoutes.length, routesExplored), 1));
       await sampleRss(`after page capture ${pageId}`);
     };
 
@@ -460,20 +545,20 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     // mode (policy.routes.prioritize:false) returns the raw discovered order —
     // identical to the pre-3.5.5 `discovery.routes.slice(0, maxRoutes)` behavior.
     const plannedRoutes = discovery.planNavigations({ max: maxRoutes, explored: [...exploredPaths].map((pn) => pn) });
-    for (let pi = 0; pi < plannedRoutes.length && pages.length < maxRoutes; pi++) {
+    for (let pi = 0; pi < plannedRoutes.length && routesExplored < maxRoutes; pi++) {
       if (Date.now() > deadline) { warnings.push("total exploration time budget exhausted — remaining routes skipped"); break; }
-      await exploreRoute(plannedRoutes[pi], "page-" + String(pages.length + 1).padStart(3, "0"), { navigate: pi > 0 });
+      await exploreRoute(plannedRoutes[pi], "page-" + String(routesExplored + 1).padStart(3, "0"), { navigate: pi > 0 });
     }
     // second pass: SPA routes found during the loop are recorded for every page;
     // ones with a pathname never explored (real new documents, not query/hash
     // state variants of an already-explored page) are explored while budget remains
     for (const route of [...discovery.routes]) {
-      if (pages.length >= maxRoutes || Date.now() > deadline) break;
+      if (routesExplored >= maxRoutes || Date.now() > deadline) break;
       const pn = safePathname(route.url);
       if (!pn || exploredPaths.has(pn)) continue;
       if (plannedRoutes.some((r) => r.url === route.url)) continue;
       exploredPaths.add(pn);
-      await exploreRoute(route, "page-" + String(pages.length + 1).padStart(3, "0"), { navigate: true });
+      await exploreRoute(route, "page-" + String(routesExplored + 1).padStart(3, "0"), { navigate: true });
     }
 
     // ---- graph + state evidence (spec §8, §15) ----
@@ -515,7 +600,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       discoveredInteractions: graphData.stats.edges,
       assets: { total: assetManifest.total + assetCapture.count, totalBytes: assetManifest.totalBytes + assetCapture.bytes, byType: assetManifest.byType, deduplicated: assetManifest.deduplicated, capturedFromNetwork: assetCapture },
       pages,
-      coverage: { routesExplored: pages.length, routesDiscovered: discovery.routes.length, statesRecorded: graphData.stats.nodes },
+      coverage: { routesExplored: routesExplored, routesDiscovered: discovery.routes.length, statesRecorded: graphData.stats.nodes },
       errors: errors.map((e) => ({ message: String(e).slice(0, 200) })),
       warnings: warnings.map((w) => ({ message: String(w).slice(0, 200) })),
       auth: { loginRequired: authInfo.loginRequired, credentialsUsed: !!(username && password), status: authStatus, reason: authReason, indicators: authIndicators, sessionStateRef: sessionState ? "auth/session.json" : null },
@@ -539,13 +624,13 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       source: "v2-exploration-summary",
     });
     store.writeJson("reports/exploration-summary.json", redact({
-      jobId: id, status: manifest.status, pages: pages.length, routes: discovery.routes.length,
+      jobId: id, status: manifest.status, pages: routesExplored, routes: discovery.routes.length,
       states: graphData.stats.nodes, interactions: graphData.stats.edges, errors, warnings,
     }));
     store.writeJson("reports/coverage-report.json", {
       routesDiscovered: discovery.routes.length,
-      routesExplored: pages.length,
-      coveragePct: discovery.routes.length ? Math.round((pages.length / discovery.routes.length) * 100) : 100,
+      routesExplored: routesExplored,
+      coveragePct: discovery.routes.length ? Math.round((routesExplored / discovery.routes.length) * 100) : 100,
       statesRecorded: graphData.stats.nodes,
       budget: policy.budgets,
       // task 3.5.5 step 8: exploration efficiency counters (redundant routes,
@@ -562,7 +647,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     // log contract: THE one summary line for the exploration stage (status +
     // key numbers; the per-stage exactly-once guarantee lives in logger.stage)
     logger.stage("exploration", manifest.status, {
-      routes: discovery.routes.length, pages: pages.length,
+      routes: discovery.routes.length, pages: routesExplored,
       states: graphData.stats.nodes, interactions: graphData.stats.edges,
       assets: assetManifest.total + assetCapture.count,
       warnings: warnings.length, errors: errors.length,

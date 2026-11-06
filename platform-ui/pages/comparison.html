@@ -3,62 +3,72 @@
      pages/page-001/screenshot-viewport.png and _reference/clone-verify.png via
      GET /api/jobs/:jobId/artifacts/*), verification.json stage results
      (functional / optimization-completeness / visual), reports/flow-matrix.json
-     case list + bugs, and a defect classification summary. Self-contained. -->
+     case list + bugs, and a defect classification summary. Tokens come from
+     the shell (../design-tokens.css); styles here are page-local components
+     on those semantic tokens. -->
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<script type="module">
+/* shell tokens (../design-tokens.css): fetched + injected instead of a plain
+ * <link> so an absent sheet degrades silently — a 404'd <link> logs a strict-
+ * MIME "Refused to apply style" console error on hosts that don't serve it. */
+try {
+  const css = await fetch("../design-tokens.css").then((r) => (r.ok ? r.text() : null));
+  if (css) { const el = document.createElement("style"); el.textContent = css; document.head.prepend(el); }
+} catch { /* token sheet optional — components fall back to UA defaults */ }
+</script>
 <title>Comparison &amp; QA</title>
 <style>
-:root{
-  --bg:#0b0f14; --panel:#121821; --panel2:#0e141c; --line:#223041;
-  --ink:#e6edf3; --muted:#8b98a9; --accent:#4f8cff; --ok:#3fb96f; --warn:#e0a63a; --err:#e05252;
-  --radius:10px; --font:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
-  --mono:ui-monospace,SFMono-Regular,Consolas,monospace;
-}
+/* page components on shell tokens — no raw palette here (see design-tokens.css) */
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.5}
+body{margin:0;background:var(--bg-canvas);color:var(--fg-default);font:var(--fs-body)/1.5 var(--font-body)}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background-image:radial-gradient(var(--border-default) 1px,transparent 1px);background-size:24px 24px;opacity:.4}
 a{color:var(--accent);text-decoration:none}
-header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel2)}
-header h1{font-size:18px;margin:0}
-header .src{color:var(--muted);font-family:var(--mono);font-size:12px}
-main{max-width:1200px;margin:0 auto;padding:16px 20px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px}
-.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px}
-.compare{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+a:hover{color:var(--accent-bright);text-decoration:underline}
+header{display:flex;flex-wrap:wrap;gap:var(--sp-3);align-items:baseline;padding:var(--sp-3) var(--sp-5);border-bottom:1px solid var(--border-default);background:var(--bg-page)}
+header h1{font-size:var(--fs-h1);font-weight:300;line-height:1.15;margin:0}
+header .src{color:var(--fg-muted);font-family:var(--font-data);font-size:var(--fs-small)}
+header nav a{font-family:var(--font-data);font-size:var(--fs-small)}
+main{max-width:var(--max-w);margin:0 auto;padding:var(--sp-4) var(--sp-5)}
+.card{background:var(--bg-page);border:1px solid var(--border-default);border-radius:var(--radius);padding:var(--sp-4);margin-bottom:var(--sp-4)}
+.card h2{font-size:var(--fs-small);font-weight:400;color:var(--fg-muted);margin:0 0 var(--sp-3)}
+.compare{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-3)}
 @media (max-width:860px){.compare{grid-template-columns:1fr}}
-.shot{border:1px solid var(--line);border-radius:8px;background:var(--panel2);padding:8px;min-height:80px}
-.shot .cap{font-size:11px;font-family:var(--mono);color:var(--muted);margin-bottom:6px}
-.shot img{width:100%;height:auto;display:block;border-radius:4px;background:#000}
-.shot .missing{color:var(--err);font-size:12px;padding:24px 6px;text-align:center}
-.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-family:var(--mono);border:1px solid var(--line)}
-.badge.ok{color:var(--ok);border-color:var(--ok)}
-.badge.err{color:var(--err);border-color:var(--err)}
-.badge.warn{color:var(--warn);border-color:var(--warn)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.06em}
-td.mono{font-family:var(--mono);font-size:11px}
-.check{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12px}
-.check .mark{font-family:var(--mono);font-weight:700}
-.check .mark.ok{color:var(--ok)} .check .mark.err{color:var(--err)}
-.check .detail{color:var(--muted)}
-.stage{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px;background:var(--panel2)}
-.stage h3{margin:0 0 6px;font-size:13px;display:flex;gap:8px;align-items:center}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.chip{padding:2px 8px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);font-family:var(--mono);font-size:11px}
-.kv{color:var(--muted);font-size:12px}
-.empty{color:var(--muted);font-style:italic}
-.state{padding:40px;text-align:center;color:var(--muted)}
-.state.err{color:var(--err)}
-summary{cursor:pointer;color:var(--accent);font-size:12px}
+.shot{border:1px solid var(--border-default);border-radius:var(--radius);background:var(--bg-input);padding:var(--sp-2);min-height:80px}
+.shot .cap{font-size:var(--fs-caption);font-family:var(--font-data);color:var(--fg-muted);margin-bottom:var(--sp-2)}
+.shot img{width:100%;height:auto;display:block;border-radius:2px;background:var(--bg-canvas)}
+.shot .missing{color:var(--status-error);font-size:var(--fs-small);padding:var(--sp-5) var(--sp-2);text-align:center}
+.badge{display:inline-block;padding:1px var(--sp-2);border-radius:var(--radius);font-size:var(--fs-caption);font-family:var(--font-data);border:1px solid var(--border-default);color:var(--fg-muted)}
+.badge.ok{color:var(--status-ok);border-color:var(--status-ok);background:var(--bg-ok)}
+.badge.err{color:var(--status-error);border-color:var(--status-error-strong);background:var(--bg-error)}
+.badge.warn{color:var(--status-pending);border-color:var(--status-pending);background:var(--bg-pending)}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-small)}
+th,td{text-align:left;padding:var(--sp-1) var(--sp-2);border-bottom:1px solid var(--border-default);vertical-align:top}
+th{color:var(--fg-faint);font-weight:700;font-size:var(--fs-caption)}
+td.mono{font-family:var(--font-data);font-size:var(--fs-caption)}
+.check{display:flex;gap:var(--sp-2);align-items:baseline;padding:2px 0;font-size:var(--fs-small)}
+.check .mark{font-family:var(--font-data);font-weight:700}
+.check .mark.ok{color:var(--status-ok)} .check .mark.err{color:var(--status-error)}
+.check .detail{color:var(--fg-muted)}
+.stage{border:1px solid var(--border-default);border-radius:var(--radius);padding:var(--sp-3);margin-bottom:var(--sp-3);background:var(--bg-input)}
+.stage h3{margin:0 0 var(--sp-2);font-size:var(--fs-small);font-weight:400;display:flex;gap:var(--sp-2);align-items:center}
+.chips{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin:var(--sp-2) 0}
+.chip{padding:1px var(--sp-2);border-radius:var(--radius);border:1px solid var(--border-default);color:var(--fg-muted);font-family:var(--font-data);font-size:var(--fs-caption)}
+.kv{color:var(--fg-muted);font-size:var(--fs-small)}
+.empty{color:var(--fg-muted);font-style:italic}
+.state{padding:var(--sp-7);text-align:center;color:var(--fg-muted);border:1px dashed var(--border-strong);border-radius:var(--radius);background:var(--bg-page)}
+.state.err{color:var(--status-error);border-color:var(--status-error-strong)}
+summary{cursor:pointer;color:var(--accent);font-size:var(--fs-small)}
+summary:hover{color:var(--accent-bright)}
 </style>
 </head>
 <body>
 <header>
   <h1>Comparison &amp; QA</h1>
   <span class="src" id="src-line">loading…</span>
-  <nav style="margin-left:auto;font-size:12px">
+  <nav style="margin-left:auto;font-size:var(--fs-small)">
     <a href="blueprint.html">5</a> ·
     <a href="reconstruction.html">6</a> ·
     <a href="comparison.html">7</a> ·

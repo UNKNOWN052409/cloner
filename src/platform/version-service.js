@@ -18,9 +18,9 @@
 //   getVersion(taskId, version)
 //   rollback(taskId, version, destDir)    → { ok, files } — byte-identical tree
 //   verifyVersion(taskId, version)        → re-hash the store vs manifest
-//   versionsRouter({ localOrAuthed })     — INTEGRATOR MOUNT LINE:
+//   versionsRouter({ guard })             — INTEGRATOR MOUNT LINE:
 //       import { versionsRouter } from "./version-service.js";
-//       app.use("/api/versions", versionsRouter({ localOrAuthed }));
+//       app.use("/api/versions", versionsRouter({ guard: localOrAuthed("read:task") }));
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -121,6 +121,23 @@ export async function listVersions(taskId) {
   }));
 }
 
+// Recent versions across ALL tasks, newest first — the bare GET /api/versions
+// prefix the product UI's final page polls (platform-ui/pages/final.js). Same
+// row shape as listVersions so consumers render either identically; the row
+// count is bounded (manifests can be large) and the limit is caller-clamped.
+export async function listAllVersions({ limit = 50 } = {}) {
+  const lim = Math.max(1, Math.min(200, Number(limit) || 50));
+  const r = await query(
+    `SELECT id, task_id, user_id, org_id, version, note, created_by, manifest, created_at
+     FROM project_versions ORDER BY created_at DESC, version DESC LIMIT $1`,
+    [lim]
+  );
+  return r.rows.map((row) => ({
+    id: row.id, taskId: row.task_id, version: row.version, note: row.note,
+    manifest: row.manifest, createdBy: row.created_by, createdAt: row.created_at,
+  }));
+}
+
 export async function getVersion(taskId, version) {
   const r = await query(
     `SELECT * FROM project_versions WHERE task_id = $1 AND version = $2`,
@@ -189,8 +206,19 @@ export function versionsRouter({ guard } = {}) {
     }
   });
 
+  // Recent versions across all tasks — GET /api/versions (the bare prefix the
+  // product UI's final page polls; previously 404 while the router was
+  // unmounted). Same { ok, versions } shape as the per-task listing.
+  router.get("/", g, async (req, res) => {
+    try {
+      res.json({ ok: true, versions: await listAllVersions({ limit: req.query?.limit }) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 160) });
+    }
+  });
+
   // Create a version from the current project tree on disk.
-  router.post("/tasks/:taskId", express_json, async (req, res) => {
+  router.post("/tasks/:taskId", g, express_json, async (req, res) => {
     try {
       const projectDir = req.body?.projectDir;
       if (!projectDir) return res.status(400).json({ ok: false, error: "projectDir required" });
@@ -208,7 +236,7 @@ export function versionsRouter({ guard } = {}) {
   });
 
   // Rollback: materialize version V into a new dir under destDir (body.destDir).
-  router.post("/tasks/:taskId/rollback", express_json, async (req, res) => {
+  router.post("/tasks/:taskId/rollback", g, express_json, async (req, res) => {
     try {
       const version = Number(req.body?.version);
       if (!Number.isInteger(version) || version < 1) return res.status(400).json({ ok: false, error: "version (integer >= 1) required" });

@@ -4,53 +4,60 @@
      as the live build animation, tails the build log from the /ws WebSocket,
      and keeps per-stage progress pills (exploration → reconstruction →
      verification → export) fed by workflow.stage events. The embedded swarm
-     viewer is the DEFAULT view during an active job. Self-contained: tokens +
-     styles inline, no shared-file contention with the shell. -->
+     viewer is the DEFAULT view during an active job. Tokens come from the
+     shell (../design-tokens.css); styles here are page-local components on
+     those semantic tokens, no shared-file contention with the shell. -->
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<script type="module">
+/* shell tokens (../design-tokens.css): fetched + injected instead of a plain
+ * <link> so an absent sheet degrades silently — a 404'd <link> logs a strict-
+ * MIME "Refused to apply style" console error on hosts that don't serve it. */
+try {
+  const css = await fetch("../design-tokens.css").then((r) => (r.ok ? r.text() : null));
+  if (css) { const el = document.createElement("style"); el.textContent = css; document.head.prepend(el); }
+} catch { /* token sheet optional — components fall back to UA defaults */ }
+</script>
 <title>Reconstruction Workspace</title>
 <style>
-:root{
-  --bg:#0b0f14; --panel:#121821; --panel2:#0e141c; --line:#223041;
-  --ink:#e6edf3; --muted:#8b98a9; --accent:#4f8cff; --ok:#3fb96f; --warn:#e0a63a; --err:#e05252;
-  --radius:10px; --font:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
-  --mono:ui-monospace,SFMono-Regular,Consolas,monospace;
-}
+/* page components on shell tokens — no raw palette here (see design-tokens.css) */
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.5}
+body{margin:0;background:var(--bg-canvas);color:var(--fg-default);font:var(--fs-body)/1.5 var(--font-body)}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background-image:radial-gradient(var(--border-default) 1px,transparent 1px);background-size:24px 24px;opacity:.4}
 a{color:var(--accent);text-decoration:none}
-header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel2)}
-header h1{font-size:18px;margin:0}
-header .src{color:var(--muted);font-family:var(--mono);font-size:12px}
-#ws-state{font-size:11px;font-family:var(--mono);padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
-#ws-state.open{color:var(--ok);border-color:var(--ok)}
-#ws-state.reconnecting{color:var(--warn);border-color:var(--warn)}
-main{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(280px,1fr);gap:16px;padding:16px 20px;height:calc(100vh - 58px)}
+header{display:flex;flex-wrap:wrap;gap:var(--sp-3);align-items:baseline;padding:var(--sp-3) var(--sp-5);border-bottom:1px solid var(--border-default);background:var(--bg-page)}
+header h1{font-size:var(--fs-h1);font-weight:300;line-height:1.15;margin:0}
+header .src{color:var(--fg-muted);font-family:var(--font-data);font-size:var(--fs-small)}
+header nav a{font-family:var(--font-data);font-size:var(--fs-small)}
+#ws-state{font-size:var(--fs-caption);font-family:var(--font-data);padding:1px var(--sp-2);border-radius:var(--radius);border:1px solid var(--border-default);color:var(--fg-muted)}
+#ws-state.open{color:var(--status-ok);border-color:var(--status-ok);background:var(--bg-ok)}
+#ws-state.reconnecting{color:var(--status-pending);border-color:var(--status-pending);background:var(--bg-pending)}
+main{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(280px,1fr);gap:var(--sp-4);padding:var(--sp-4) var(--sp-5);height:calc(100vh - 58px)}
 @media (max-width:960px){main{grid-template-columns:1fr;height:auto}}
 .col{display:flex;flex-direction:column;min-width:0}
-.frame-wrap{position:relative;flex:1;min-height:420px;border:1px solid var(--line);border-radius:var(--radius);background:#000;overflow:hidden}
-iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
-.frame-note{position:absolute;left:0;right:0;bottom:0;background:rgba(11,15,20,.85);color:var(--muted);font-size:11px;font-family:var(--mono);padding:3px 10px}
-.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
-.pill{display:flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel);font-size:12px;font-family:var(--mono);color:var(--muted)}
-.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--line)}
-.pill.running{color:var(--accent);border-color:var(--accent)}
+.frame-wrap{position:relative;flex:1;min-height:420px;border:1px solid var(--border-default);border-radius:var(--radius);background:var(--bg-canvas);overflow:hidden}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg-canvas)}
+.frame-note{position:absolute;left:0;right:0;bottom:0;background:var(--bg-canvas);color:var(--fg-muted);font-size:var(--fs-caption);font-family:var(--font-data);padding:var(--sp-1) var(--sp-3)}
+.pills{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-bottom:var(--sp-3)}
+.pill{display:flex;align-items:center;gap:var(--sp-2);padding:var(--sp-1) var(--sp-3);border-radius:var(--radius);border:1px solid var(--border-default);background:var(--bg-page);font-size:var(--fs-small);font-family:var(--font-data);color:var(--fg-muted)}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--border-default)}
+.pill.running{color:var(--accent);border-color:var(--accent);background:var(--bg-accent-well)}
 .pill.running .dot{background:var(--accent);animation:pulse 1.2s infinite}
-.pill.completed{color:var(--ok);border-color:var(--ok)}
-.pill.completed .dot{background:var(--ok)}
-.pill.failed{color:var(--err);border-color:var(--err)}
-.pill.failed .dot{background:var(--err)}
+.pill.completed{color:var(--status-ok);border-color:var(--status-ok);background:var(--bg-ok)}
+.pill.completed .dot{background:var(--status-ok)}
+.pill.failed{color:var(--status-error);border-color:var(--status-error-strong);background:var(--bg-error)}
+.pill.failed .dot{background:var(--status-error)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.log{flex:1;min-height:260px;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word}
-.log .t{color:var(--muted)}
-.log .type{color:var(--accent)}
-.log .todoadd{color:var(--ok)}
+.log{flex:1;min-height:260px;overflow-y:auto;background:var(--bg-page);border:1px solid var(--border-default);border-radius:var(--radius);padding:var(--sp-3);font-family:var(--font-data);font-size:var(--fs-small);white-space:pre-wrap;word-break:break-word}
+.log .t{color:var(--fg-faint)}
+.log .type{color:var(--accent-bright)}
+.log .todoadd{color:var(--status-ok)}
 .log .foreign{opacity:.45}
-.kv{color:var(--muted);font-size:12px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;margin-bottom:12px}
-.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 8px}
+.kv{color:var(--fg-muted);font-size:var(--fs-small)}
+.card{background:var(--bg-page);border:1px solid var(--border-default);border-radius:var(--radius);padding:var(--sp-3);margin-bottom:var(--sp-3)}
+.card h2{font-size:var(--fs-small);font-weight:400;color:var(--fg-muted);margin:0 0 var(--sp-2)}
 </style>
 </head>
 <body>
@@ -58,7 +65,7 @@ iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000
   <h1>Reconstruction Workspace</h1>
   <span class="src" id="src-line">loading…</span>
   <span id="ws-state">ws idle</span>
-  <nav style="margin-left:auto;font-size:12px">
+  <nav style="margin-left:auto;font-size:var(--fs-small)">
     <a href="blueprint.html">5</a> ·
     <a href="reconstruction.html">6</a> ·
     <a href="comparison.html">7</a> ·

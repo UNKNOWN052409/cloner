@@ -96,7 +96,7 @@ async function boot() {
   $("#src-line").textContent = jobId ? `job ${jobId}` : "no job selected";
   if (!jobId) {
     $("#main").className = "state err";
-    $("#main").innerHTML = "<h2 style='color:var(--err)'>no job selected</h2><p>open this page with ?job=&lt;jobId&gt;</p>";
+    $("#main").innerHTML = "<h2 style='color:var(--status-error)'>no job selected</h2><p>open this page with ?job=&lt;jobId&gt;</p>";
     return;
   }
   $("#main").className = "";
@@ -135,7 +135,7 @@ async function boot() {
       </div>
     </div>`;
 
-  const previewNote = (status, why) => { $("#preview-note").innerHTML = `<span style="color:var(--warn)">preview: HTTP ${status} — ${esc(why)}</span>`; };
+  const previewNote = (status, why) => { $("#preview-note").innerHTML = `<span style="color:var(--status-pending)">preview: HTTP ${status} — ${esc(why)}</span>`; };
   $("#preview")?.addEventListener("error", () => previewNote("network error", "preview tree missing"));
   try {
     const res = await fetch(`/preview/${encodeURIComponent(jobId)}/index.html`, { method: "GET" });
@@ -160,13 +160,13 @@ async function boot() {
   if (task.data) {
     reportHtml += `<div class="kv">status: <b>${esc(task.data.status || "?")}</b>${task.data.reconstruction ? ` · reconstruction ${task.data.reconstruction.passed ? "passed" : "with limitations"} · ${task.data.reconstruction.pages ?? "?"} generated files · ${task.data.reconstruction.repairs ?? 0} repair(s)` : ""}</div>`;
   } else if (task.status) {
-    reportHtml += `<div class="kv" style="color:var(--warn)">task registry: HTTP ${task.status}</div>`;
+    reportHtml += `<div class="kv" style="color:var(--status-pending)">task registry: HTTP ${task.status}</div>`;
   }
   reportHtml += ver.data ? renderStages(ver.data)
-    : `<div class="kv" style="color:var(--warn)">verification.json not available (HTTP ${ver.status}) — written to _reference/verification.json when verification runs</div>`;
+    : `<div class="kv" style="color:var(--status-pending)">verification.json not available (HTTP ${ver.status}) — written to _reference/verification.json when verification runs</div>`;
   reportHtml += recReport.data
     ? `<div class="kv" style="margin-top:8px">reconstruction-report: generatedFiles ${esc(String(recReport.data.generatedFiles ?? "?"))} · passed ${esc(String(recReport.data.passed))} · status ${esc(recReport.data.status || "")}</div>`
-    : `<div class="kv" style="margin-top:8px;color:var(--warn)">reconstruction-report.json not exposed (HTTP ${recReport.status === 404 ? "404 — it lives in artifacts/&lt;jobId&gt;-project/ which the artifact read API does not serve" : recReport.status})</div>`;
+    : `<div class="kv" style="margin-top:8px;color:var(--status-pending)">reconstruction-report.json not exposed (HTTP ${recReport.status === 404 ? "404 — it lives in artifacts/&lt;jobId&gt;-project/ which the artifact read API does not serve" : recReport.status})</div>`;
   $("#report-body").innerHTML = reportHtml || '<div class="empty">nothing yet</div>';
 
   const limits = [];

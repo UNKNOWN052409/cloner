@@ -57,7 +57,7 @@ function renderStack(stack) {
     <p style="margin:10px 0 4px"><b>framework:</b> <span class="mono">${esc(out.framework || "?")}</span>
        <span class="badge ${out.engineOutput === "static" ? "unverified" : "ok"}" title="what the engine actually emits">engine output: ${esc(out.engineOutput || "?")}</span></p>
     <div class="kv">${esc(out.reason || "")}</div>
-    ${out.note ? `<div class="kv" style="color:var(--warn)">${esc(out.note)}</div>` : ""}
+    ${out.note ? `<div class="kv" style="color:var(--status-pending)">${esc(out.note)}</div>` : ""}
     <div class="kv">stack scan: ${esc(String(stack?.scannedUrls ?? "?"))} urls, ${esc(String(stack?.scannedPages ?? "?"))} pages</div>`;
 }
 
@@ -126,7 +126,7 @@ async function postScope(extra = {}) {
 
 function showFatal(status, why) {
   $("#main").className = "state err";
-  $("#main").innerHTML = `<h2 style="color:var(--err)">blueprint unavailable</h2>
+  $("#main").innerHTML = `<h2 style="color:var(--status-error)">blueprint unavailable</h2>
     <p>GET ${esc(artifactUrl("blueprint.json"))} → <b>HTTP ${status}</b></p><p class="kv">${esc(why)}</p>
     <p class="kv">Job id used: <code>${esc(jobId || "(none — open with ?job=<jobId>")}</code></p>`;
 }

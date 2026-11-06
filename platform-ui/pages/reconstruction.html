@@ -1,0 +1,84 @@
+<!doctype html>
+<!-- Page 6 — Reconstruction Workspace: the swarm build animation page.
+     Embeds the existing swarm viewer (GET /progress/:jobId, public/progress/)
+     as the live build animation, tails the build log from the /ws WebSocket,
+     and keeps per-stage progress pills (exploration → reconstruction →
+     verification → export) fed by workflow.stage events. The embedded swarm
+     viewer is the DEFAULT view during an active job. Self-contained: tokens +
+     styles inline, no shared-file contention with the shell. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reconstruction Workspace</title>
+<style>
+:root{
+  --bg:#0b0f14; --panel:#121821; --panel2:#0e141c; --line:#223041;
+  --ink:#e6edf3; --muted:#8b98a9; --accent:#4f8cff; --ok:#3fb96f; --warn:#e0a63a; --err:#e05252;
+  --radius:10px; --font:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.5}
+a{color:var(--accent);text-decoration:none}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel2)}
+header h1{font-size:18px;margin:0}
+header .src{color:var(--muted);font-family:var(--mono);font-size:12px}
+#ws-state{font-size:11px;font-family:var(--mono);padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+#ws-state.open{color:var(--ok);border-color:var(--ok)}
+#ws-state.reconnecting{color:var(--warn);border-color:var(--warn)}
+main{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(280px,1fr);gap:16px;padding:16px 20px;height:calc(100vh - 58px)}
+@media (max-width:960px){main{grid-template-columns:1fr;height:auto}}
+.col{display:flex;flex-direction:column;min-width:0}
+.frame-wrap{position:relative;flex:1;min-height:420px;border:1px solid var(--line);border-radius:var(--radius);background:#000;overflow:hidden}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
+.frame-note{position:absolute;left:0;right:0;bottom:0;background:rgba(11,15,20,.85);color:var(--muted);font-size:11px;font-family:var(--mono);padding:3px 10px}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.pill{display:flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel);font-size:12px;font-family:var(--mono);color:var(--muted)}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--line)}
+.pill.running{color:var(--accent);border-color:var(--accent)}
+.pill.running .dot{background:var(--accent);animation:pulse 1.2s infinite}
+.pill.completed{color:var(--ok);border-color:var(--ok)}
+.pill.completed .dot{background:var(--ok)}
+.pill.failed{color:var(--err);border-color:var(--err)}
+.pill.failed .dot{background:var(--err)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.log{flex:1;min-height:260px;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word}
+.log .t{color:var(--muted)}
+.log .type{color:var(--accent)}
+.log .todoadd{color:var(--ok)}
+.log .foreign{opacity:.45}
+.kv{color:var(--muted);font-size:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;margin-bottom:12px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Reconstruction Workspace</h1>
+  <span class="src" id="src-line">loading…</span>
+  <span id="ws-state">ws idle</span>
+  <nav style="margin-left:auto;font-size:12px">
+    <a href="blueprint.html">5</a> ·
+    <a href="reconstruction.html">6</a> ·
+    <a href="comparison.html">7</a> ·
+    <a href="final.html">8</a>
+  </nav>
+</header>
+<main>
+  <div class="col">
+    <div class="pills" id="pills"></div>
+    <div class="frame-wrap">
+      <iframe id="swarm" title="swarm build viewer (live build animation)"></iframe>
+      <div class="frame-note" id="frame-note">swarm viewer not loaded yet</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card"><h2>Job</h2><div id="job-body" class="kv">loading job status…</div></div>
+    <div class="card"><h2>Build log (tail from /ws)</h2></div>
+    <div class="log" id="log"></div>
+  </div>
+</main>
+<script src="./reconstruction.js" type="module"></script>
+</body>
+</html>

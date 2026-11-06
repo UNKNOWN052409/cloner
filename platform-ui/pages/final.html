@@ -1,0 +1,75 @@
+<!doctype html>
+<!-- Page 8 — Final Project: live clone preview (GET /preview/:id), export.zip
+     download (GET /api/export/:id/download), GitHub publish (POST
+     /api/github/publish/:taskId), build report + known limitations
+     (verification.json + reconstruction-report.json), version history wired to
+     /api/versions (renders the honest 404 state while unmounted).
+     Self-contained: tokens + styles inline. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Final Project</title>
+<style>
+:root{
+  --bg:#0b0f14; --panel:#121821; --panel2:#0e141c; --line:#223041;
+  --ink:#e6edf3; --muted:#8b98a9; --accent:#4f8cff; --ok:#3fb96f; --warn:#e0a63a; --err:#e05252;
+  --radius:10px; --font:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.5}
+a{color:var(--accent);text-decoration:none}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel2)}
+header h1{font-size:18px;margin:0}
+header .src{color:var(--muted);font-family:var(--mono);font-size:12px}
+main{max-width:1200px;margin:0 auto;padding:16px 20px}
+.grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(300px,1fr);gap:16px}
+@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px}
+.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px}
+.frame-wrap{position:relative;height:480px;border:1px solid var(--line);border-radius:8px;background:#000;overflow:hidden}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-family:var(--mono);border:1px solid var(--line)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}
+.badge.err{color:var(--err);border-color:var(--err)}
+.badge.warn{color:var(--warn);border-color:var(--warn)}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button:disabled{opacity:.5;cursor:not-allowed}
+input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;width:100%}
+label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
+.notice{border-radius:8px;padding:10px 12px;font-size:13px;margin-top:10px}
+.notice.ok{background:rgba(63,185,111,.12);border:1px solid var(--ok)}
+.notice.err{background:rgba(224,82,82,.12);border:1px solid var(--err)}
+.notice.warn{background:rgba(224,166,58,.10);border:1px solid var(--warn)}
+ul.list{margin:0;padding-left:18px}
+ul.list li{margin:3px 0}
+.kv{color:var(--muted);font-size:12px}
+.mono{font-family:var(--mono);font-size:12px}
+.empty{color:var(--muted);font-style:italic}
+.stage{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12px}
+.check{display:flex;gap:8px;align-items:baseline;padding:2px 0;font-size:12px}
+.check .mark{font-family:var(--mono);font-weight:700}
+.check .mark.ok{color:var(--ok)} .check .mark.err{color:var(--err)}
+.check .detail{color:var(--muted)}
+.state{padding:40px;text-align:center;color:var(--muted)}
+.state.err{color:var(--err)}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>Final Project</h1>
+  <span class="src" id="src-line">loading…</span>
+  <nav style="margin-left:auto;font-size:12px">
+    <a href="blueprint.html">5</a> ·
+    <a href="reconstruction.html">6</a> ·
+    <a href="comparison.html">7</a> ·
+    <a href="final.html">8</a>
+  </nav>
+</header>
+<main id="main" class="state">loading final project…</main>
+<script src="./final.js" type="module"></script>
+</body>
+</html>

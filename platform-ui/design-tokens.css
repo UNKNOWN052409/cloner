@@ -1,0 +1,135 @@
+/* platform-ui design tokens — the ONE place raw values live.
+ *
+ * Two layers, loaded before style.css:
+ *   1. primitives (--p-*)  — raw palette/typography/spacing values
+ *   2. semantics  (semantic names) — what pages and components may use
+ *
+ * Discipline (matches the slop-lint catalog, src/reconstruction/hygiene/slop-lint.js,
+ * treated as the taste bar for our own chrome too):
+ *   - no purple/blue gradient signature, no gradients at all
+ *   - no default box-shadow elevation (borders and layer steps carry depth)
+ *   - small radii only (4px) — not the generous AI rounding scale
+ *   - no default font stack (system-ui/Inter/Segoe/Arial) — a humanist
+ *     body stack + the house monospace for data
+ *   - no uppercase+tracking eyebrow treatment
+ * Pages never write a raw hex: they consume semantic tokens only.
+ */
+
+:root {
+  /* ---- primitives: ink scale (warm-neutral dark, green-tinted) ---- */
+  --p-ink-0: #0b0f0d;   /* canvas floor */
+  --p-ink-1: #101613;   /* page panels */
+  --p-ink-2: #161e19;   /* raised surfaces */
+  --p-ink-3: #1d2721;   /* hover / input fill */
+  --p-ink-4: #25312a;   /* pressed / active fill */
+
+  /* ---- primitives: lines ---- */
+  --p-line-0: #24302a;
+  --p-line-1: #33423a;
+
+  /* ---- primitives: foreground ---- */
+  --p-fg-hi: #e7ece7;
+  --p-fg-mid: #9daf9f;
+  --p-fg-lo: #61736a;
+
+  /* ---- primitives: accent (console green, house family) ---- */
+  --p-green-0: #6fce8e;
+  --p-green-1: #57b577;
+  --p-green-2: #2e5d40;
+
+  /* ---- primitives: status hues (text-grade, no fills brighter than text) ---- */
+  --p-steel-0: #8fb4d4;   /* activity / running */
+  --p-amber-0: #d4b26e;   /* queued / pending / warnings */
+  --p-red-0: #dc8d78;     /* failed / errors */
+  --p-red-1: #b06a58;
+
+  /* ---- primitives: dim wells for status backgrounds ---- */
+  --p-well-green: #1b2b21;
+  --p-well-steel: #1b252e;
+  --p-well-amber: #2b2618;
+  --p-well-red: #2d1e1a;
+
+  /* ---- primitives: type ---- */
+  --p-font-body: Candara, "Gill Sans", "Gill Sans MT", Verdana, sans-serif;
+  --p-font-data: "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace;
+  --p-size-0: 11px;
+  --p-size-1: 12.5px;
+  --p-size-2: 14px;
+  --p-size-3: 16px;
+  --p-size-4: 19px;
+  --p-size-5: 23px;
+
+  /* ---- primitives: space (4px base) ---- */
+  --p-sp-1: 4px;
+  --p-sp-2: 8px;
+  --p-sp-3: 12px;
+  --p-sp-4: 16px;
+  --p-sp-5: 24px;
+  --p-sp-6: 32px;
+  --p-sp-7: 48px;
+
+  /* ---- primitives: misc ---- */
+  --p-radius: 4px;
+  --p-nav-h: 46px;
+  --p-max-w: 1180px;
+}
+
+/* ======================= semantic layer ======================= */
+:root {
+  /* surfaces */
+  --bg-canvas: var(--p-ink-0);
+  --bg-page: var(--p-ink-1);
+  --bg-raised: var(--p-ink-2);
+  --bg-hover: var(--p-ink-3);
+  --bg-active: var(--p-ink-4);
+  --bg-input: var(--p-ink-1);
+
+  /* lines */
+  --border-default: var(--p-line-0);
+  --border-strong: var(--p-line-1);
+
+  /* text */
+  --fg-default: var(--p-fg-hi);
+  --fg-muted: var(--p-fg-mid);
+  --fg-faint: var(--p-fg-lo);
+  --fg-on-accent: var(--p-ink-0);
+
+  /* accent */
+  --accent: var(--p-green-1);
+  --accent-bright: var(--p-green-0);
+  --accent-quiet: var(--p-green-2);
+  --bg-accent-well: var(--p-well-green);
+
+  /* status: running / completed / queued / failed (text + quiet well pairs) */
+  --status-running: var(--p-steel-0);
+  --bg-running: var(--p-well-steel);
+  --status-ok: var(--p-green-1);
+  --bg-ok: var(--p-well-green);
+  --status-pending: var(--p-amber-0);
+  --bg-pending: var(--p-well-amber);
+  --status-error: var(--p-red-0);
+  --bg-error: var(--p-well-red);
+  --status-error-strong: var(--p-red-1);
+
+  /* type */
+  --font-body: var(--p-font-body);
+  --font-data: var(--p-font-data);
+  --fs-caption: var(--p-size-0);
+  --fs-small: var(--p-size-1);
+  --fs-body: var(--p-size-2);
+  --fs-lead: var(--p-size-3);
+  --fs-h2: var(--p-size-4);
+  --fs-h1: var(--p-size-5);
+
+  /* space + shape */
+  --sp-1: var(--p-sp-1);
+  --sp-2: var(--p-sp-2);
+  --sp-3: var(--p-sp-3);
+  --sp-4: var(--p-sp-4);
+  --sp-5: var(--p-sp-5);
+  --sp-6: var(--p-sp-6);
+  --sp-7: var(--p-sp-7);
+  --radius: var(--p-radius);
+  --nav-h: var(--p-nav-h);
+  --max-w: var(--p-max-w);
+}

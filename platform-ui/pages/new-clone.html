@@ -1,0 +1,69 @@
+<!-- Page 2 fragment — New Clone. POST /api/tasks (pipeline v2). Field caps and
+     url validation mirror src/platform/server.js TASK_FIELD_LIMITS. Scope is
+     carried through the instructions text — the channel the pipeline actually
+     parses (src/reconstruction/blueprint.js parseInstructions). -->
+<div class="page-head">
+  <h1>New Clone</h1>
+  <span class="sub">POST /api/tasks · pipeline v2 (exploration → reconstruction → verification)</span>
+</div>
+
+<form class="stack" id="clone-form" novalidate>
+  <div class="field">
+    <label for="nc-url">Target URL</label>
+    <input id="nc-url" name="url" type="url" inputmode="url" placeholder="https://example.com" required
+           autocomplete="off" spellcheck="false">
+    <div class="hint">http(s) required — the platform rejects private/unroutable targets (validatePublicUrl).</div>
+    <div class="err" id="nc-url-err" hidden></div>
+  </div>
+
+  <details id="nc-creds">
+    <summary>Credentials (optional — for authenticated exploration)</summary>
+    <div class="field" style="margin-top:12px">
+      <label for="nc-user">Username</label>
+      <input id="nc-user" name="username" type="text" autocomplete="off" maxlength="500">
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label for="nc-pass">Password</label>
+      <input id="nc-pass" name="password" type="password" autocomplete="new-password" maxlength="500">
+      <div class="hint">Sent once with the job; never echoed back by the API (responses carry only credentialsProvided).</div>
+    </div>
+  </details>
+
+  <div class="field">
+    <label for="nc-scope">Scope</label>
+    <select id="nc-scope" name="scope">
+      <option value="full-site" selected>Full visible site (default)</option>
+      <option value="single-page">This page only</option>
+      <option value="custom">Custom — I wrote it in Instructions</option>
+    </select>
+    <div class="hint">Scope rides the instructions text — the pipeline parses "limit to …" / "exclude …"
+      clauses deterministically (blueprint.js parseInstructions). The effective text is shown under Instructions.</div>
+  </div>
+
+  <div class="field">
+    <label for="nc-fw">Framework preference</label>
+    <select id="nc-fw" name="framework">
+      <option value="auto" selected>Auto — recommended from the detected stack</option>
+      <option value="static">Static HTML</option>
+    </select>
+    <div class="hint">Sent with the task payload. The reconstruction engine's output target today is static
+      HTML; non-static preferences are used when the pipeline supports them.</div>
+  </div>
+
+  <div class="field">
+    <label for="nc-instructions">Instructions for the explorer / reconstructor (optional)</label>
+    <textarea id="nc-instructions" name="instructions" maxlength="20000"
+              placeholder="e.g. only clone the pricing and docs pages; exclude the blog"></textarea>
+    <div class="hint"><span id="nc-count">0</span>/20,000 characters · effective text below</div>
+    <div class="hint" id="nc-effective"></div>
+  </div>
+
+  <div class="form-err" id="nc-form-err" hidden></div>
+
+  <div style="display:flex;gap:12px;align-items:center">
+    <button class="btn primary" id="nc-start" type="submit">Start Exploration</button>
+    <span class="dim" id="nc-busy" hidden>queuing…</span>
+  </div>
+</form>
+
+<div id="nc-result" hidden></div>

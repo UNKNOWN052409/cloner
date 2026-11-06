@@ -1,0 +1,35 @@
+<!-- Page 4 fragment — Website Intelligence. Pure frontend over the job's
+     artifacts via the existing read endpoint /api/jobs/:jobId/artifacts/*:
+     manifest.json (coverage/pages/metrics), graph/routes.json,
+     design-tokens.json, reports/exploration-summary.json, blueprint.json. -->
+<div class="page-head">
+  <h1>Website Intelligence</h1>
+  <span class="mono" id="wi-id">…</span>
+  <span class="sub">read from artifacts/&lt;jobId&gt;/ via /api/jobs/:id/artifacts/*</span>
+</div>
+
+<div class="statline" id="wi-cov">loading manifest…</div>
+
+<div class="two-col">
+  <div>
+    <div class="section-title">Explored routes</div>
+    <div id="wi-routes" aria-live="polite"><div class="state"><div class="big">Loading…</div></div></div>
+
+    <div class="section-title">Design tokens (measured)</div>
+    <div id="wi-tokens" aria-live="polite"></div>
+  </div>
+
+  <div>
+    <div class="section-title">Exploration coverage</div>
+    <dl class="kv" id="wi-expl"></dl>
+
+    <div class="section-title">Page metrics</div>
+    <dl class="kv" id="wi-metrics"></dl>
+
+    <div class="section-title">Blueprint (if reconstruction ran)</div>
+    <dl class="kv" id="wi-blueprint"></dl>
+
+    <div class="section-title">Warnings / errors</div>
+    <dl class="kv" id="wi-issues"></dl>
+  </div>
+</div>

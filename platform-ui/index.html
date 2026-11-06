@@ -1,0 +1,54 @@
+<!doctype html>
+<!-- platform-ui shell — the 8-page product frontend (realignment spec, owner
+     directive superseding headless G7.1). Supersedes the placeholder index
+     that existed only to give the static mount something to serve.
+     Hash-routed SPA, framework-free, no CDNs. Pages 1-4 render as fragments
+     in #view; nav items 5-8 deep-link to their standalone page documents
+     (pages/blueprint.html?job=…) when those exist. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Cloner — Projects</title>
+  <link rel="stylesheet" href="./design-tokens.css">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <a class="skip-link" href="#view">Skip to content</a>
+
+  <header class="topnav">
+    <a class="brand" href="#/"><span class="tick" aria-hidden="true"></span>cloner</a>
+    <nav aria-label="Product pages">
+      <a href="#/" data-page="1">1 Projects</a>
+      <a href="#/new" data-page="2">2 New Clone</a>
+      <a href="#/" data-page="3" data-needs-project>3 Exploration</a>
+      <a href="#/" data-page="4" data-needs-project>4 Intelligence</a>
+      <a href="pages/blueprint.html" data-page="5" data-ext data-needs-project>5 Blueprint</a>
+      <a href="pages/reconstruction.html" data-page="6" data-ext data-needs-project>6 Build</a>
+      <a href="pages/comparison.html" data-page="7" data-ext data-needs-project>7 QA</a>
+      <a href="pages/final.html" data-page="8" data-ext data-needs-project>8 Final</a>
+    </nav>
+    <div class="auth-chip" id="auth-chip">
+      <span class="who">checking session…</span>
+    </div>
+  </header>
+
+  <main id="view" tabindex="-1">
+    <div class="state"><div class="big">Loading…</div></div>
+  </main>
+
+  <footer class="statusbar">
+    <span id="sb-ws"><i class="dot" style="background:var(--status-pending)"></i>events: connecting</span>
+    <span id="sb-route">route: —</span>
+    <span class="hide-sm">platform API on this origin: /api · stream: /ws · build viewer: /progress/:jobId</span>
+  </footer>
+
+  <noscript>
+    <div class="panel">The product frontend needs JavaScript — the platform API
+      itself stays usable directly: /api/tasks, /api/jobs, /api/dashboard.</div>
+  </noscript>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

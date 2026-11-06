@@ -1,0 +1,20 @@
+<!-- Page 1 fragment — Projects Dashboard. Data: GET /api/tasks (v1 legacy tasks
+     + v2 pipeline jobs, unified list) — see src/platform/server.js. -->
+<div class="page-head">
+  <h1>Projects</h1>
+  <span class="sub">GET /api/tasks — legacy v1 runs + pipeline v2 jobs, newest first</span>
+  <a class="btn primary" href="#/new" style="margin-left:auto">Create New Clone</a>
+</div>
+
+<div class="statline" id="dash-summary">loading counts…</div>
+
+<div class="tabs" id="dash-tabs" role="group" aria-label="Filter tasks">
+  <button type="button" data-f="all" aria-pressed="true">All</button>
+  <button type="button" data-f="running" aria-pressed="false">Running</button>
+  <button type="button" data-f="completed" aria-pressed="false">Completed</button>
+  <button type="button" data-f="failed" aria-pressed="false">Failed</button>
+</div>
+
+<div id="dash-body" aria-live="polite">
+  <div class="state"><div class="big">Loading tasks…</div></div>
+</div>

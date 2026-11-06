@@ -1,0 +1,40 @@
+<!-- Page 3 fragment — Live Exploration Workspace. Live feed: /ws (join <jobId>).
+     Screenshots: artifact reads /api/jobs/:id/artifacts/pages/<pageId>/screenshot-viewport.png
+     (written by the exploration pipeline). The current /ws whitelist carries no
+     image payloads, so the stream is event-triggered artifact polling. -->
+<div class="page-head">
+  <h1>Live Exploration</h1>
+  <span class="mono" id="ex-id">…</span>
+  <span class="chip" id="ex-status">loading</span>
+</div>
+
+<div class="statline" id="ex-meta">loading job…</div>
+<div id="ex-terminal"></div>
+
+<div class="two-col">
+  <div>
+    <div class="section-title">Original site — latest capture</div>
+    <div class="shot-frame" id="ex-shot">
+      <div class="state" style="border:none"><div class="big">No screenshot yet</div>
+        <div>Viewport captures land per explored route under artifacts/&lt;jobId&gt;/pages/.</div></div>
+    </div>
+    <div class="shot-strip" id="ex-strip"></div>
+    <div class="hint" id="ex-shot-note"></div>
+  </div>
+
+  <div>
+    <div class="section-title">Current position</div>
+    <dl class="kv" id="ex-current">
+      <dt>url</dt><dd>—</dd>
+      <dt>page</dt><dd>—</dd>
+    </dl>
+
+    <div class="section-title">Event timeline (live via /ws)</div>
+    <ul class="timeline" id="ex-timeline">
+      <li><span class="dim">waiting for events…</span></li>
+    </ul>
+
+    <div class="section-title">Session / auth</div>
+    <dl class="kv" id="ex-session">loading…</dl>
+  </div>
+</div>

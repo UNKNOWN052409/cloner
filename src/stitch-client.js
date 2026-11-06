@@ -79,9 +79,29 @@ export class StitchClient {
     const project = await this.#projectFor(stitch);
     const screen = await project.generate(prompt, this.deviceType, this.modelId || undefined);
     const htmlUrl = await screen.getHtml();
-    const res = await fetch(htmlUrl, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) throw new Error(`stitch html download ${res.status}: ${(await res.text()).slice(0, 400)}`);
-    const html = await res.text();
+    // the download URL is Google-hosted and may require the SAME credential
+    // (measured live: bare fetch → 401 UNAUTHENTICATED) — try the authenticated
+    // variants first, then a bare fetch for pre-signed URLs.
+    const authVariants = [
+      { headers: { "x-goog-api-key": this.apiKey } },
+      { headers: { Authorization: `Bearer ${this.apiKey}` } },
+      { headers: {} },
+    ];
+    let res = null;
+    let lastErr = "no attempt";
+    for (const init of authVariants) {
+      res = await fetch(htmlUrl, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      if (res.ok) break;
+      lastErr = `${res.status}: ${(await res.text()).slice(0, 200)}`;
+    }
+    if (!res || !res.ok) throw new Error(`stitch html download ${lastErr}`);
+    let html = await res.text();
+    // Stitch serves the screen wrapped in a JSON envelope ({dataString: "<html…"}) —
+    // measured live 2026-11-07. Unwrap when present; plain HTML passes through.
+    try {
+      const parsed = JSON.parse(html);
+      if (parsed && typeof parsed.dataString === "string") html = parsed.dataString;
+    } catch { /* plain HTML — keep */ }
     try {
       this.screenshotUrl = await screen.getImage();
     } catch {} // screenshot URL is a bonus — never fail the clone over it

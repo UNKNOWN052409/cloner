@@ -15,6 +15,7 @@ export const DEFAULT_POLICY = {
   budgets: {
     maxRoutes: 30,             // pages to explore (including the seed)
     maxStatesPerPage: 20,      // interaction states per route
+    maxInUrlStates: 12,        // client-side view switches per route whose URL stays put (authed SPA shells: tab/nav view swaps recorded as url#state page entries)
     maxInteractionsPerState: 30,
     maxDepth: 2,               // state graph depth (state → sub-state)
     maxTimePerPageMs: 120000,  // 2 min per page
@@ -55,6 +56,18 @@ export function resolvePolicy(userPolicy = {}) {
   if (userPolicy.routes) Object.assign(merged.routes, userPolicy.routes);
   if (userPolicy.risk) merged.risk = { ...merged.risk, ...userPolicy.risk }; // was silently dropped before
   if (userPolicy.maxTotalTimeMs) merged.budgets.maxTotalTimeMs = userPolicy.maxTotalTimeMs;
+  // the JSON deep-clone above destroys RegExp values (they serialize to {}),
+  // which made every resolved policy's risk guards unusable — forbiddenText
+  // had no .test, so isSafeInteraction-style consumers failed every control
+  // with "evaluate-error". Re-hydrate the two compiled guards (user-supplied
+  // string forms are compiled; anything else falls back to the defaults).
+  const toRegExp = (v, fallback) => {
+    if (v instanceof RegExp) return v;
+    if (typeof v === "string" && v) { try { return new RegExp(v, "i"); } catch { /* bad user pattern → default */ } }
+    return fallback;
+  };
+  merged.risk.forbiddenText = toRegExp(merged.risk.forbiddenText, DEFAULT_POLICY.risk.forbiddenText);
+  merged.risk.allowedAnchorHref = toRegExp(merged.risk.allowedAnchorHref, DEFAULT_POLICY.risk.allowedAnchorHref);
   return merged;
 }
 

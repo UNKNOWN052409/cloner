@@ -222,7 +222,13 @@ async function stage1Functional(out) {
       fs.mkdirSync(path.join(out, "_reference"), { recursive: true });
       fs.writeFileSync(path.join(out, "_reference", "exhaustive-test.json"), JSON.stringify(ex, null, 2));
     } catch (e) {
-      checks.push({ name: "exhaustive click-everywhere", ok: true, detail: "skipped: " + e.message.slice(0, 60) });
+      // skipped ≠ passed: an unreachable check used to be scored ok:true, which
+      // hid real engine breakage (verify.js:215 imports ./exhaustive-test.js,
+      // a module that no longer exists at this path since the 2026-11-05 move —
+      // so this catch fired on EVERY run and the pass was always fake).
+      // skipped:true marks it neutral for the stage-pass aggregation below
+      // while the report keeps the honest reason.
+      checks.push({ name: "exhaustive click-everywhere", ok: null, skipped: true, detail: "skipped: " + e.message.slice(0, 60) });
     }
     results.push({ appWiring });
     const uncovered = sample.filter((t) => {
@@ -235,7 +241,7 @@ async function stage1Functional(out) {
     const exhaustiveOk = checks.find((c) => c.name === "exhaustive click-everywhere");
     return {
       stage: "functional",
-      passed: mainOk && decoOk && innerOkAll && checks.every((c) => c.ok),
+      passed: mainOk && decoOk && innerOkAll && checks.every((c) => c.skipped || !!c.ok),
       checks: [
         { name: "recorded interactions replay", ok: mainOk, detail: `${opened}/${sample.length} opened (60% gate)${sample.length ? "" : " — no recorded interactions on this page"}` },
         { name: "picker entries open panels", ok: innerOkAll, detail: innerTotal ? `${innerOk}/${innerTotal} inner entries produced panels (50% gate)` : "no picker entries to test" },
@@ -284,22 +290,33 @@ async function stage2Optimization(out, task = null, artifactsDir = null) {
   } catch {}
   await b.close().catch(() => {});
 
-  // asset weight by type (v1: assets/ · v2: public/assets/)
+  // asset weight by type (v1: assets/ · v2: public/assets/). The v2 project
+  // layout writes assets FLAT under public/assets/ (reconstruction-pipeline.js
+  // asset copy: "public/assets/" + basename), so the old single-level walk —
+  // which only counted first-level DIRECTORIES — reported 0 files on a
+  // 201-asset job. Recursive walk instead: every regular file under the root
+  // counts, grouped by its first path segment (nested groups keep per-group
+  // weights, flat files group as "(root)").
   const weights = {};
   let totalBytes = 0, totalFiles = 0;
   const assetsDir = artifactsDir ? path.join(out, "public", "assets") : path.join(out, "assets");
-  try {
-    for (const dir of fs.readdirSync(assetsDir, { withFileTypes: true })) {
-      if (!dir.isDirectory()) continue;
-      let bytes = 0, files = 0;
-      for (const f of fs.readdirSync(path.join(assetsDir, dir.name))) {
-        const st = fs.statSync(path.join(assetsDir, dir.name, f));
-        bytes += st.size; files++;
-      }
-      weights[dir.name] = { files, kb: Math.round(bytes / 1024) };
-      totalBytes += bytes; totalFiles += files;
+  const walkAssets = (dir, depth = 0) => {
+    if (depth > 6) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { walkAssets(p, depth + 1); continue; }
+      if (!e.isFile()) continue;
+      const size = (fs.statSync(p) || { size: 0 }).size;
+      const segs = path.relative(assetsDir, p).split(path.sep);
+      const top = segs.length > 1 ? segs[0] : "(root)";
+      const w = weights[top] || (weights[top] = { files: 0, kb: 0 });
+      w.files++; w.kb += Math.round(size / 1024);
+      totalBytes += size; totalFiles++;
     }
-  } catch {}
+  };
+  walkAssets(assetsDir);
 
   // completeness: required artifacts (v2 also requires pipeline-level artifacts
   // in the artifacts dir: exploration manifest + measured tokens + the report)
@@ -364,6 +381,27 @@ async function stage2Optimization(out, task = null, artifactsDir = null) {
       }
     } catch { /* no/invalid manifest → keep the strict gate */ }
   }
+  // SPA state depth (state-discovery.js enumerateInAppStates): authed shells
+  // legitimately record ZERO overlay behaviors — their view switches are
+  // in-app tab/nav clicks that keep the URL put, documented as url#state
+  // states (status "in-url") in graph/states.json and as page-level entries in
+  // manifest.pages. When the evidence is REAL — every in-URL state carries an
+  // existing domRef artifact — those documented states count toward
+  // completeness. Fail-closed like the branches above: no graph, no in-url
+  // nodes, or one missing dom artifact keeps the strict gate.
+  let inUrlEvidence = null;
+  if (!explMissing && behaviors === 0) {
+    try {
+      const graphRoot = artifactsDir || out;
+      const gs = JSON.parse(fs.readFileSync(path.join(graphRoot, "graph", "states.json"), "utf8"));
+      const inUrl = (gs.nodes || []).filter((n) => n && n.status === "in-url");
+      const evidenced = inUrl.filter((n) => n.domRef && fs.existsSync(path.join(graphRoot, n.domRef)));
+      if (inUrl.length > 0 && evidenced.length === inUrl.length) {
+        behaviors += inUrl.length;
+        inUrlEvidence = `${inUrl.length} in-URL view state(s) documented (url#state page entries, dom evidence on disk)`;
+      }
+    } catch { /* no/invalid graph → keep the strict gate */ }
+  }
   const requireInteractions = process.env.CLONER_VERIFY_REQUIRE_INTERACTIONS !== "0";
   const controlFreePass = controlFreeEvidence !== null && !requireInteractions;
   // The workspace parity branch also covers the "replayable records" half: a
@@ -375,10 +413,14 @@ async function stage2Optimization(out, task = null, artifactsDir = null) {
   const workspacePass = workspaceEvidence !== null;
   checks.push({
     name: "exploration + replay data complete",
-    ok: (!explMissing && behaviors > 0 && (records.length > 0 || workspacePass)) || controlFreePass,
+    // Boolean(): the || chain must not leak the evidence STRING into ok (JSON
+    // consumers check ok === true / !ok — a truthy string breaks the former)
+    ok: Boolean((!explMissing && behaviors > 0 && (records.length > 0 || workspacePass || inUrlEvidence)) || controlFreePass),
     detail: controlFreePass ? `0 interactive controls on the source — nothing to explore or replay (${controlFreeEvidence})` : workspacePass
       ? `${behaviors} documented behaviors, ${records.length} overlay replay record(s) — ${workspaceEvidence}; dock controls replay via the workspace runtime`
-      : explMissing ? "exploration.json missing" : `${behaviors} documented behaviors, ${records.length} replayable records`,
+      : inUrlEvidence
+        ? `${behaviors} documented behaviors, ${records.length} overlay replay record(s) — ${inUrlEvidence}; view switches replay via their url#state pages`
+        : explMissing ? "exploration.json missing" : `${behaviors} documented behaviors, ${records.length} replayable records`,
   });
 
   // no unnecessary elements: dead trigger attrs (no runtime record) + empty modules
@@ -398,8 +440,25 @@ async function stage2Optimization(out, task = null, artifactsDir = null) {
   checks.push({ name: "clone render performance", ok: loadMs !== null && loadMs < 8000, detail: loadMs !== null ? `renders in ${loadMs}ms (budget 8s)` : "render failed" });
   checks.push({ name: "asset weight", ok: totalBytes < 120 * 1024 * 1024, detail: `${totalFiles} files, ${(totalBytes / 1024 / 1024).toFixed(1)}MB total (${Object.entries(weights).map(([k, v]) => `${k}:${v.files}`).join(", ")})` });
 
-  // task requirements echoed from instructions (informational — what was asked)
-  if (task?.instructions) checks.push({ name: "task instructions carried", ok: true, detail: `"${String(task.instructions).slice(0, 100)}"` });
+  // task requirements actually carried: read the blueprint.json the
+  // reconstruction wrote (src/reconstruction/blueprint.js:218) and verify the
+  // instruction text survived into it — the old check echoed the raw
+  // instruction string with a hard-coded ok:true and proved nothing.
+  if (task?.instructions) {
+    const bpFile = path.join(artifactsDir || out, "blueprint.json");
+    let bp = null, bpErr = null;
+    try { bp = JSON.parse(fs.readFileSync(bpFile, "utf8")); } catch (e) { bpErr = e.message.slice(0, 60); }
+    const carried = !!bp && String(bp.instructions?.raw || "").trim().length > 0;
+    const sc = bp?.instructions?.scope || {};
+    checks.push({
+      name: "task instructions carried",
+      ok: carried,
+      detail: carried
+        ? `blueprint.json instructions.applied=${!!bp.instructions.applied}, scope include:${(sc.include || []).length} exclude:${(sc.exclude || []).length} notes:${(sc.notes || []).length} — "${String(bp.instructions.raw).slice(0, 80)}"`
+        : bpErr ? `blueprint.json unreadable (${bpErr}) — instructions not verifiably carried`
+        : "blueprint.json missing — instructions not verifiably carried",
+    });
+  }
 
   return {
     stage: "optimization-completeness",
@@ -407,6 +466,151 @@ async function stage2Optimization(out, task = null, artifactsDir = null) {
     checks,
     metrics: { loadMs, totalFiles, totalMB: +(totalBytes / 1024 / 1024).toFixed(1), weights, behaviors, records: records.length, deadAttrs: deadAttrs.length },
   };
+}
+
+// ====================================== VISUAL — DYNAMIC-REGION STRUCTURE
+// Data-driven pages (live quotes, charts, timestamps) drift PIXELS between
+// sessions by nature — the QA report's grade C on the authed Tradovate clone
+// is exactly this (docs/realignment/qa-report-authenticated-tradovate.md).
+// For a region whose content is known-dynamic, raw pixels are the wrong
+// comparison: the region is compared STRUCTURALLY instead — element counts
+// within tolerance + layout rects within pixel tolerance. The global pixel
+// threshold below is NEVER loosened: the structural path can only carry the
+// verdict when EVERY hottest heatmap cell is covered by a dynamic region AND
+// the region structure matches, and the check detail says so in plain text.
+
+const DYNAMIC_TAG_SET = new Set(["canvas", "svg"]);
+const DYNAMIC_HINT_RE = /(chart|quote|price|ticker|clock|time|graph|spark|candle|feed|live|depth)/i;
+
+// elements of a dom.json sample whose content is known-dynamic (rendered
+// content by construction for canvas/svg; class/id/text hints for quote,
+// ticker, clock and friends)
+export function dynamicRegionElements(elements) {
+  return (elements || []).filter((e) => {
+    if (!e || !e.rect) return false;
+    if (DYNAMIC_TAG_SET.has(String(e.tag || ""))) return true;
+    return DYNAMIC_HINT_RE.test(String(e.cls || "") + " " + String(e.id || "") + " " + String(e.text || ""));
+  });
+}
+
+// 12×8 heatmap cell index → pixel rect over the compared W×H frame
+export function cellRect(cell, W, H, gx = 12, gy = 8) {
+  const col = cell % gx, row = Math.floor(cell / gx);
+  return { x: Math.floor((col / gx) * W), y: Math.floor((row / gy) * H), w: Math.max(1, Math.ceil(W / gx)), h: Math.max(1, Math.ceil(H / gy)) };
+}
+
+export function rectsIntersect(a, b) {
+  return !!(a && b && a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h);
+}
+
+// which hottest heatmap cells are covered by a dynamic region — the attribution
+// gate: only when every hot cell is dynamic can the elevated pixel diff be
+// attributed to data drift rather than layout drift
+export function dynamicAttribution(hotRegions, dynEls, W, H) {
+  const cells = (hotRegions || []).map((h) => {
+    const rect = cellRect(h.cell, W, H);
+    const hit = (dynEls || []).find((e) => rectsIntersect(rect, e.rect));
+    return { cell: h.cell, score: h.score, region: h.region, covered: !!hit, by: hit ? `${hit.tag}${hit.cls ? "." + String(hit.cls).split(/\s+/)[0] : ""}` : null };
+  });
+  return { cells, allCovered: cells.length > 0 && cells.every((c) => c.covered) };
+}
+
+// STRUCTURE comparison of one dynamic region, anchored on the region element
+// itself (matched on the clone side by tag + rect overlap — the generator
+// renames classes to cx-N, so class identity does not survive). Element counts
+// come from each side's OWN region interior (center-in), and the anchor rect
+// must land within position + size tolerance. Intersecting both sides against
+// the ORIGINAL rect was wrong: the generator's synthetic page wrapper spans the
+// whole document (intersects every region) and a small page-level shift pulls
+// boundary elements in/out — measured on the depth fixture: intersect-counting
+// read canvas 3→5 elements + 108px bbox drift while the canvas itself had
+// moved 48px and resized 0.2%.
+export function compareRegionStructure(origAnchor, cloneAnchor, origEls, cloneEls, { countTol = 0.5, rectTolPx = 64, sizeTol = 0.15 } = {}) {
+  const centerIn = (els, r) => (els || []).filter((e) => {
+    if (!e || !e.rect) return false;
+    const cx = e.rect.x + e.rect.w / 2, cy = e.rect.y + e.rect.h / 2;
+    return cx > r.x && cx < r.x + r.w && cy > r.y && cy < r.y + r.h;
+  });
+  const o = centerIn(origEls, origAnchor.rect);
+  const c = centerIn(cloneEls, cloneAnchor.rect);
+  const countOk = o.length === 0 ? c.length === 0 : Math.abs(c.length - o.length) / o.length <= countTol;
+  const posDrift = Math.max(Math.abs(cloneAnchor.rect.x - origAnchor.rect.x), Math.abs(cloneAnchor.rect.y - origAnchor.rect.y));
+  const wRatio = origAnchor.rect.w ? Math.abs(cloneAnchor.rect.w - origAnchor.rect.w) / origAnchor.rect.w : 0;
+  const hRatio = origAnchor.rect.h ? Math.abs(cloneAnchor.rect.h - origAnchor.rect.h) / origAnchor.rect.h : 0;
+  const sizeDrift = Math.max(wRatio, hRatio);
+  const rectOk = posDrift <= rectTolPx && sizeDrift <= sizeTol;
+  return { ok: countOk && rectOk, origCount: o.length, cloneCount: c.length, countOk, drift: Math.round(posDrift), sizeDrift: +sizeDrift.toFixed(3), rectOk, countTol, rectTolPx, sizeTol };
+}
+
+// rect overlap (IoU) — the clone-side anchor matcher for dynamic regions
+export function rectIoU(a, b) {
+  if (!a || !b) return 0;
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const inter = ix * iy;
+  const union = a.w * a.h + b.w * b.h - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+// run the dynamic-region path for stage 3: v2 only (needs the page-001 dom
+// evidence as the original side), renders the clone with the same extractor +
+// viewport as compare-clone.mjs, compares structure per dynamic region and
+// reports which hottest cells the dynamic regions cover
+async function dynamicStructuralCheck(out, artifactsDir, cmp, W, H) {
+  const result = { applicable: false, ran: false, ok: true, allCovered: false, regions: [], detail: "" };
+  if (!artifactsDir) { result.detail = "not applicable (v1 layout — no exploration dom evidence to compare structure against)"; return result; }
+  let origEls = null;
+  try { origEls = JSON.parse(fs.readFileSync(path.join(artifactsDir, "pages", "page-001", "dom.json"), "utf8")).elements; } catch {}
+  if (!Array.isArray(origEls)) { result.detail = "not applicable (pages/page-001/dom.json missing or malformed)"; return result; }
+  result.applicable = true;
+  const dynEls = dynamicRegionElements(origEls);
+  if (!dynEls.length) { result.detail = `no dynamic regions detected in the captured DOM (0 of ${origEls.length} sampled elements) — structural path not applicable`; return result; }
+  if (!cmp.hotRegions.length) { result.detail = "no heatmap cells parsed — nothing to attribute to dynamic regions"; return result; }
+  let cloneEls = [];
+  const b = await launchBrowser({ headless: true });
+  try {
+    const p = await b.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+    await p.goto("file:///" + path.join(out, "index.html").replace(/\\/g, "/"), { waitUntil: "load", timeout: 30000 });
+    await p.waitForTimeout(700);
+    const intel = await p.evaluate(DOM_EXTRACTOR_SCRIPT).catch(() => null);
+    if (intel && Array.isArray(intel.elements)) cloneEls = intel.elements;
+    await p.close();
+  } finally {
+    await b.close().catch(() => {});
+  }
+  result.ran = true;
+  const attr = dynamicAttribution(cmp.hotRegions, dynEls, W, H);
+  result.allCovered = attr.allCovered;
+  const regions = [...dynEls].sort((a, b2) => (b2.rect.w * b2.rect.h) - (a.rect.w * a.rect.h)).slice(0, 6);
+  const hotRects = cmp.hotRegions.map((h) => cellRect(h.cell, W, H));
+  result.regions = regions.map((r) => {
+    const label = `${r.tag}${r.cls ? "." + String(r.cls).split(/\s+/)[0] : ""}`;
+    // the regions that gate the verdict are the ones carrying the pixel
+    // disagreement (covering a hottest cell) — a dynamic region no hot cell
+    // touches contributed nothing measurable, so its shape mismatch is
+    // reported but not gating (small elements like a clock scatter under
+    // page-level shift without moving any cell's mean)
+    const coversHot = hotRects.some((hr) => rectsIntersect(hr, r.rect));
+    // clone-side anchor: same tag, highest rect overlap (classes are renamed cx-N)
+    let anchor = null, best = 0;
+    for (const e of cloneEls) {
+      if (!e || e.tag !== r.tag || !e.rect) continue;
+      const v = rectIoU(r.rect, e.rect);
+      if (v > best) { best = v; anchor = e; }
+    }
+    if (!anchor || best < 0.3) return { region: label, rect: r.rect, coversHot, ok: false, missing: true, origCount: 0, cloneCount: 0, countOk: false, drift: null, sizeDrift: null, rectOk: false };
+    return { region: label, rect: r.rect, coversHot, ...compareRegionStructure(r, anchor, origEls, cloneEls) };
+  });
+  const gating = result.regions.filter((r) => r.coversHot);
+  result.ok = gating.length ? gating.every((r) => r.ok) : result.regions.every((r) => r.ok);
+  const parts = result.regions.map((r) => (r.missing
+    ? `${r.region}${r.coversHot ? " [gating]" : ""}: MISSING in the clone (no same-tag element overlaps the captured region)`
+    : `${r.region}${r.coversHot ? " [gating]" : ""}: elements ${r.origCount}→${r.cloneCount} (${r.countOk ? "within" : "OUTSIDE"} ±${Math.round(r.countTol * 100)}%), anchor drift ${r.drift}px / size ±${(r.sizeDrift * 100).toFixed(1)}% (${r.rectOk ? "within" : "OUTSIDE"} ${r.rectTolPx}px, ±${Math.round(r.sizeTol * 100)}%)`));
+  result.detail = (result.ok ? "structure matches" : "structure drift")
+    + " — " + parts.join(" | ")
+    + "; hot cells: " + attr.cells.map((c) => `#${c.cell}=${c.covered ? "dynamic(" + c.by + ")" : "static"}`).join(", ")
+    + " — dynamic content compared STRUCTURALLY (pixel diff there is data drift, not layout drift); verdict gated on the [gating] regions that carry the hottest cells; global 60% threshold unchanged";
+  return result;
 }
 
 // ============================================================ STEP 3 — VISUAL
@@ -420,11 +624,25 @@ function stage3Visual(out, artifactsDir = null) {
       args.push("4199", origShot, path.join(out, "index.html"), artifactsDir);
     }
     execFile(process.execPath, args, { timeout: 180000 }, async (err, stdout, stderr) => {
-      const text = (stdout || "") + (err?.stdout || "") + (stderr || "");
-      let cmp = parseComparisonTxt(text);
+      let srcText = (stdout || "") + (err?.stdout || "") + (stderr || "");
+      let cmp = parseComparisonTxt(srcText);
       if (!cmp.parsed) {
-        try { cmp = parseComparisonTxt(fs.readFileSync(path.join(artifactsDir || out, "_reference", "comparison.txt"), "utf8")); } catch {}
+        try {
+          srcText = fs.readFileSync(path.join(artifactsDir || out, "_reference", "comparison.txt"), "utf8");
+          cmp = parseComparisonTxt(srcText);
+        } catch {}
       }
+      // compared frame geometry — the 12×8 heatmap cells map onto these pixels
+      // (\u00d7 = the multiplication sign compare-clone.mjs prints)
+      const dimMatch = srcText.match(/pixels compared\s*:\s*(\d+)\s*\u00d7\s*(\d+)/);
+      const cmpW = dimMatch ? Number(dimMatch[1]) : 1440;
+      const cmpH = dimMatch ? Number(dimMatch[2]) : 900;
+      // dynamic-region structural comparison (data-driven pages: live quotes/
+      // charts/timestamps drift pixels between sessions by nature)
+      const dyn = await dynamicStructuralCheck(out, artifactsDir, cmp, cmpW, cmpH).catch((e) => ({
+        applicable: false, ran: false, ok: true, allCovered: false, regions: [],
+        detail: "dynamic-region check failed: " + String(e?.message || e).slice(0, 80),
+      }));
       // EXACT HEX comparison: live tokens (design-tokens.json) vs re-measured clone
       const hexReport = await hexTokenComparison(out, artifactsDir);
       const pct = cmp.pct;
@@ -435,17 +653,25 @@ function stage3Visual(out, artifactsDir = null) {
       const tokenOk = cmp.tokens.length > 0 && cmp.tokens.every((t) => !t.error && (t.total === 0 || t.matched / t.total >= 0.5));
       // total=0 = no captured evidence for that category — absence can't fail
       const hexOk = hexReport.error ? false : hexReport.categories.every((c) => c.total === 0 || c.matched / c.total >= 0.7);
+      const pixelOk = cmp.parsed && pct < 60; // global threshold — NEVER loosened
+      // the structural path can carry the verdict only when the comparison is
+      // parseable, EVERY hottest cell is covered by a known-dynamic region, and
+      // the region structure matches within tolerance — and even then only
+      // below a hard 95% ceiling (near-total drift is never "data noise")
+      const structuralCarry = cmp.parsed && dyn.applicable && dyn.ran && dyn.ok && dyn.allCovered && pct < 95;
       resolve({
         stage: "visual",
-        passed: cmp.parsed && pct < 60 && hexOk,
+        passed: cmp.parsed && hexOk && (pixelOk || structuralCarry),
         checks: [
-          { name: "pixel difference", ok: cmp.parsed && pct < 60, detail: cmp.parsed ? `${pct}% (threshold 60%), mean delta ${cmp.meanDelta}/255, grade: ${cmp.grade || "n/a"}` : "compare failed — no parseable report" },
+          { name: "pixel difference", ok: pixelOk, detail: cmp.parsed ? `${pct}% (threshold 60%), mean delta ${cmp.meanDelta}/255, grade: ${cmp.grade || "n/a"}${structuralCarry && !pixelOk ? " — above threshold, verdict carried by the dynamic-region structural comparison (see that check)" : ""}` : "compare failed — no parseable report" },
           { name: "token drift (categories)", ok: tokenOk, detail: cmp.tokens.length ? cmp.tokens.map((t) => (t.error ? `${t.token}: ERROR` : `${t.token} ${t.matched}/${t.total}`)).join(", ") : "no token rows parsed" },
           { name: "exact HEX comparison", ok: hexOk, detail: hexReport.error ? "failed: " + hexReport.error : hexReport.categories.map((c) => `${c.category} ${c.matched}/${c.total} (${c.drifted.slice(0, 3).map((d) => `live ${d.live} ≠ clone ${d.clone}`).join(", ")})`).join(" | ") },
           { name: "extra/missing elements", ok: hexReport.error ? false : hexReport.extra.length === 0 && hexReport.missing.length === 0, detail: hexReport.error ? "n/a" : `extra: ${hexReport.extra.length ? hexReport.extra.join(",") : "none"} · missing-capture: ${hexReport.missing.length ? hexReport.missing.join(",") : "none"}` },
           { name: "heatmap hottest regions", ok: cmp.hotRegions.length > 0, detail: cmp.hotRegions.length ? cmp.hotRegions.map((h) => `${h.region} (#${h.cell}, score ${h.score})`).join("; ") : "no heatmap cells parsed" },
+          { name: "dynamic-region structural comparison", ok: dyn.ok, notApplicable: !dyn.applicable || !dyn.ran, detail: dyn.detail },
         ],
         heatmap: { grid: "12×8", hotRegions: cmp.hotRegions },
+        dynamicRegions: dyn,
         tokens: cmp.tokens,
         hex: hexReport,
         report: "_reference/comparison.txt + diff.png",

@@ -268,9 +268,11 @@ export function startPlatform({ port = 4180 } = {}) {
     res.json({ userId: req.userId, email: req.userEmail, role: req.userRole });
   });
 
-  // ---- headless backend (G7.1: the platform's own UI was removed) ----
-  // The platform ships as an API only. There are NO static mounts: "/" and
-  // every non-API path fall through to the terminal 404. Clients integrate
+  // ---- API-first backend (G7.1 superseded by ADR-0004) ----
+  // G7.1 ("backend-only, UI removed") is superseded: the 8-page product UI is
+  // served statically from platform-ui/ at "/", mounted AFTER every route
+  // below (see the static mount near the end of this function) so /api, /ws,
+  // /preview and /progress keep absolute precedence. Clients still integrate
   // through /api/* (tasks, jobs, exports, admin, dashboard, config) and the
   // /ws event stream; generated CLONES are still served under /preview/:id.
   // picker script injected into previews (element selection)
@@ -1009,6 +1011,28 @@ export function startPlatform({ port = 4180 } = {}) {
     const cfg = loadConfig();
     res.json({ providers: getProviders(cfg).map((p) => ({ name: p.name, provider: p.provider, model: p.model, capabilities: p.capabilities, hasKey: !!p.apiKey })), usage: usageStats() });
   });
+
+  // ---- product UI static mount (ADR-0004: supersedes headless G7.1) ----
+  // The 8-page product UI is plain static files from <repo>/platform-ui. The
+  // mount sits AFTER every /api, /preview and /progress route above, so those
+  // keep absolute precedence — express walks the stack in mount order and an
+  // API route always answers first; express.static only ever sees what no
+  // route claimed. /ws never reaches express at all (it is an http-server
+  // upgrade handled by WebSocketServer, not middleware). A path matched by
+  // neither a route nor a static file falls through to Express's terminal 404
+  // — exactly the fallthrough this server had when it was headless.
+  //
+  // Posture: the static UI itself is PUBLIC, like a login page — no
+  // localOrAuthed guard here, on purpose. The UI is inert HTML/JS until its
+  // own code calls the API, and every data surface behind /api/* above keeps
+  // its existing guard chain (credentialed / localOrAuthed / loopback
+  // posture); guarding the shell would only hide the login screen from the
+  // people it is for. No cookie/CSRF surface is introduced by serving files.
+  const PLATFORM_UI_DIR = path.join(__dirname, "..", "..", "platform-ui");
+  if (!fs.existsSync(PLATFORM_UI_DIR)) {
+    console.warn("[platform-ui] directory missing — / falls through to 404 until the product UI is built");
+  }
+  app.use("/", express.static(PLATFORM_UI_DIR));
 
   // ---- terminal error handler (G5.2 hunt hardening) ----
   // Every error an async handler or the body parser produces must come back as

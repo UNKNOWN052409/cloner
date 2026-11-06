@@ -41,10 +41,19 @@ const stats = await p.evaluate(async ({ aData, bData }) => {
   const c = document.getElementById("c");
   c.width = W; c.height = H;
   const ctx = c.getContext("2d");
-  ctx.drawImage(A, 0, 0, W, H);
+  // crop (9-arg drawImage), never scale: the original side is the exploration's
+  // VIEWPORT screenshot (1440×900, fullPage:false), while the clone side is a
+  // fullPage render (any page taller than the viewport is). The old 4-arg
+  // drawImage(B, 0, 0, W, H) silently RESIZED the whole clone page into the
+  // original's viewport frame — run 1 of exp-mw59a16doczk scored its squashed
+  // full-page render (60.24%) while the same PNG pair compared 1:1 measures
+  // ~21.6% — so no clone taller than one viewport could ever be judged fairly.
+  // Crop both sides to the shared top-left W×H at natural scale (the same 1:1
+  // viewport mapping verify.js measureFidelity and layout-analyzer.pngSize use).
+  ctx.drawImage(A, 0, 0, W, H, 0, 0, W, H);
   const a = ctx.getImageData(0, 0, W, H).data;
   ctx.clearRect(0, 0, W, H);
-  ctx.drawImage(B, 0, 0, W, H);
+  ctx.drawImage(B, 0, 0, W, H, 0, 0, W, H);
   const bb = ctx.getImageData(0, 0, W, H).data;
   const GX = 12, GY = 8;
   const grid = Array.from({ length: GX * GY }, () => ({ diff: 0, n: 0 }));
@@ -62,9 +71,9 @@ const stats = await p.evaluate(async ({ aData, bData }) => {
     }
   }
   ctx.putImageData(out, 0, 0);
-  // overlay on the clone for context
+  // overlay on the clone for context (same crop semantics as above)
   ctx.globalAlpha = 0.85;
-  ctx.drawImage(B, 0, 0, W, H);
+  ctx.drawImage(B, 0, 0, W, H, 0, 0, W, H);
   ctx.globalAlpha = 1;
   ctx.putImageData(out, 0, 0);
   return {

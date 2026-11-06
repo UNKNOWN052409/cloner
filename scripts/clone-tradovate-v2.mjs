@@ -21,7 +21,7 @@ if (!fs.existsSync(cookiesFile)) {
 
 const { runExplorationJob } = await import("../src/pipeline/exploration-pipeline.js");
 const { reconstructFromArtifacts } = await import("../src/reconstruction/reconstruction-pipeline.js");
-const { verifyTask } = await import("../src/platform/verify.js");
+const { verifyTask } = await import("../src/reconstruction/verify.js");
 
 const t0 = Date.now();
 console.log("[1/3] exploring", url, "…");

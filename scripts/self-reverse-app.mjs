@@ -15,7 +15,7 @@
 //                       close/reopen, collapse, recorded overlay triggers, and
 //                       data-stream widgets updating (zero-network replay of the
 //                       captured timeline, per-key value fidelity).
-//   4. 3-STEP VERIFICATION — src/platform/verify.js (functional /
+//   4. 3-STEP VERIFICATION — src/reconstruction/verify.js (functional /
 //                       optimization-completeness / visual) must PASS on the
 //                       artifacts, repair loop included.
 //
@@ -40,7 +40,7 @@ process.env.CLONER_ALLOW_PRIVATE_TARGETS = "1";
 import { chromium } from "playwright";
 import { runExplorationJob } from "../src/pipeline/exploration-pipeline.js";
 import { reconstructFromArtifacts } from "../src/reconstruction/reconstruction-pipeline.js";
-import { verifyTask } from "../src/platform/verify.js";
+import { verifyTask } from "../src/reconstruction/verify.js";
 import { flattenNumericStructure } from "../src/exploration/websocket-session-capture.js";
 import { startFixtureServer } from "./fixtures/server.mjs";
 import { workspaceDockSite } from "./fixtures/workspace-dock.mjs";

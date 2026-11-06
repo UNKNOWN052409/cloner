@@ -1,0 +1,25 @@
+{
+  "_comment": "Swarm-viewer demo fixture: one clone job's bus event stream, bus-shaped ({ type, data, t, job } as src/events.js emits). Drives the viewer demo mode (?demo=1 fetches it from GET /progress/demo-events.json) and the offline route/reducer tests in scripts/test-progress-viewer.mjs. 4 stages, 3 routes, 6 build units, 3 agents.",
+  "job": "job-demo-1",
+  "events": [
+    { "type": "workflow.stage", "data": { "stage": "exploration" }, "job": "job-demo-1", "t": 1710000000001 },
+    { "type": "workflow.agent", "data": { "id": "agent-scout", "name": "scout" }, "job": "job-demo-1", "t": 1710000000002 },
+    { "type": "workflow.agent", "data": { "id": "agent-builder", "name": "builder" }, "job": "job-demo-1", "t": 1710000000003 },
+    { "type": "workflow.agent", "data": { "id": "agent-checker", "name": "checker" }, "job": "job-demo-1", "t": 1710000000004 },
+    { "type": "workflow.stage", "data": { "stage": "reconstruction" }, "job": "job-demo-1", "t": 1710000000005 },
+    { "type": "workflow.todo.add", "data": { "id": "u1", "label": "login page shell", "route": "/login" }, "job": "job-demo-1", "t": 1710000000006 },
+    { "type": "workflow.todo.add", "data": { "id": "u2", "label": "login form", "route": "/login" }, "job": "job-demo-1", "t": 1710000000007 },
+    { "type": "workflow.todo.add", "data": { "id": "u3", "label": "dashboard shell", "route": "/dashboard" }, "job": "job-demo-1", "t": 1710000000008 },
+    { "type": "workflow.todo.add", "data": { "id": "u4", "label": "charts widget", "route": "/dashboard" }, "job": "job-demo-1", "t": 1710000000009 },
+    { "type": "workflow.todo.add", "data": { "id": "u5", "label": "settings shell", "route": "/settings" }, "job": "job-demo-1", "t": 1710000000010 },
+    { "type": "workflow.todo.add", "data": { "id": "u6", "label": "settings panel", "route": "/settings" }, "job": "job-demo-1", "t": 1710000000011 },
+    { "type": "workflow.todo.done", "data": { "id": "u1", "agent": "agent-scout" }, "job": "job-demo-1", "t": 1710000000012 },
+    { "type": "workflow.todo.done", "data": { "id": "u2", "agent": "agent-builder" }, "job": "job-demo-1", "t": 1710000000013 },
+    { "type": "workflow.todo.done", "data": { "id": "u3" }, "job": "job-demo-1", "t": 1710000000014 },
+    { "type": "workflow.todo.done", "data": { "id": "u4" }, "job": "job-demo-1", "t": 1710000000015 },
+    { "type": "workflow.todo.done", "data": { "id": "u5" }, "job": "job-demo-1", "t": 1710000000016 },
+    { "type": "workflow.todo.done", "data": { "id": "u6" }, "job": "job-demo-1", "t": 1710000000017 },
+    { "type": "workflow.stage", "data": { "stage": "verification" }, "job": "job-demo-1", "t": 1710000000018 },
+    { "type": "workflow.stage", "data": { "stage": "export" }, "job": "job-demo-1", "t": 1710000000019 }
+  ]
+}

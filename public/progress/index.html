@@ -1,0 +1,31 @@
+<!doctype html>
+<!-- Swarm build viewer page — served by src/platform/progress-routes.js at
+     GET /progress/:jobId. Vanilla ES module + canvas, no dependencies, no CDNs.
+     Live mode streams the job's bus events over SSE; ?demo=1 plays the fixture
+     event JSON (fixtures/progress-events.json) served at /progress/demo-events.json. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Swarm build viewer</title>
+    <link rel="stylesheet" href="/progress/viewer.css" />
+  </head>
+  <body>
+    <header id="top">
+      <h1>swarm build</h1>
+      <div id="hud" aria-live="polite">0 agents · 0/0 units · —</div>
+      <div id="conn">connecting…</div>
+    </header>
+    <nav id="banner" aria-label="build stages"></nav>
+    <main>
+      <div id="stage">
+        <canvas id="swarm" width="960" height="560"></canvas>
+      </div>
+      <aside id="side">
+        <h2>build units</h2>
+        <ul id="todos"></ul>
+      </aside>
+    </main>
+    <script type="module" src="/progress/viewer.js"></script>
+  </body>
+</html>

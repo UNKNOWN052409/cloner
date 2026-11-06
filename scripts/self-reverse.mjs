@@ -36,7 +36,7 @@ import { fileURLToPath } from "node:url";
 import { validatePublicUrl } from "../src/security/url-guard.js";
 import { runExplorationJob } from "../src/pipeline/exploration-pipeline.js";
 import { reconstructFromArtifacts } from "../src/reconstruction/reconstruction-pipeline.js";
-import { verifyTask } from "../src/platform/verify.js";
+import { verifyTask } from "../src/reconstruction/verify.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.chdir(ROOT); // verifyTask spawns scripts/compare-clone.mjs relative to cwd

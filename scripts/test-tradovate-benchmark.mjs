@@ -24,7 +24,7 @@ import { chromium } from "playwright";
 import { startTradovateFixtureServer, quoteMap, wsTimeline, SYMBOLS, POLLING_TOTAL } from "./fixtures/tradovate/server.mjs";
 import { runExplorationJob } from "../src/pipeline/exploration-pipeline.js";
 import { reconstructFromArtifacts } from "../src/reconstruction/reconstruction-pipeline.js";
-import { verifyTask } from "../src/platform/verify.js";
+import { verifyTask } from "../src/reconstruction/verify.js";
 import { analyzeFidelity } from "../src/reconstruction/visual-fidelity-analyzer.js";
 import { flattenNumericStructure } from "../src/exploration/websocket-session-capture.js";
 import { DOM_EXTRACTOR_SCRIPT } from "../src/intelligence/dom-extractor.js";

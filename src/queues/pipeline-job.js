@@ -57,7 +57,7 @@ export async function runPipelineJob(payload, {
   artifactsRoot = DEFAULT_ARTIFACTS_ROOT,
   linkJobId = noop,
 } = {}) {
-  const { url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], monetize = false, instructions = "", frameworkPreference = null } = payload || {};
+  const { url, username, password, cookies, storage, policy, sessionId = "local", interactionRecords = [], monetize = false, instructions = "", frameworkPreference = null, storageStateFile = null, sessionSidecarFile = null } = payload || {};
 
   // task 4.5.5: ad slots ONLY for a clone whose owner opted in (monetize, the
   // policy-safe default is OFF). resolveCloneAdConfig() returns null when no
@@ -82,6 +82,10 @@ export async function runPipelineJob(payload, {
   // ---- Stage 1: exploration ----
   const { jobId: id, artifactsDir, manifest } = await runExplorationJob({
     url, cookies, storage, username, password,
+    // session reuse: a prior job's verified auth/session.json (+ sessionStorage
+    // sidecar) seeds this context so NO second login happens — Tradovate-style
+    // sites kick the older concurrent session on a repeated login
+    storageStateFile, sessionSidecarFile,
     config: { policy, sessionId },
     artifactsRoot,
     // BullMQ path pins the id decided at enqueue time; the memory path lets the

@@ -3,6 +3,45 @@
 // detection, repeated-component detection, fixed/sticky element detection.
 // Runs inside the page — self-contained, no external deps.
 export const DOM_EXTRACTOR_SCRIPT = `(() => {
+  // canvas/WebGL → <img dataURL snapshot FIRST (same idiom as browser.js
+  // serializeEnhanced): charts and order ladders paint into canvases; without
+  // this the sampled <canvas> reconstructs as an empty black box. Runs before
+  // the element walk so the snapshot <img> is what gets sampled + generated.
+  for (const c of document.querySelectorAll("canvas")) {
+    try {
+      const r = c.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      // only snapshot PAINTED canvases — a blank canvas reconstructs as the
+      // same blank box, and mutating it breaks dynamic-region detection
+      // (spa-depth suite asserts on raw <canvas> fixtures). Paint check via
+      // a 1/16th-scale sample: any non-transparent pixel counts.
+      let painted = false;
+      try {
+        const probe = document.createElement("canvas");
+        probe.width = 16; probe.height = 16;
+        const pctx = probe.getContext("2d");
+        if (pctx) {
+          pctx.drawImage(c, 0, 0, 16, 16);
+          const px = pctx.getImageData(0, 0, 16, 16).data;
+          for (let p = 3; p < px.length; p += 4) { if (px[p] !== 0) { painted = true; break; } }
+        }
+      } catch { painted = true; /* tainted → assume painted */ }
+      if (!painted) continue;
+      const img = document.createElement("img");
+      img.src = c.toDataURL("image/png");
+      img.alt = "captured canvas";
+      const cs = getComputedStyle(c);
+      for (const p of ["display", "position", "top", "right", "bottom", "left", "width", "height",
+        "minWidth", "minHeight", "maxWidth", "maxHeight", "margin", "verticalAlign", "transform",
+        "zIndex", "borderRadius", "objectFit", "opacity", "visibility", "pointerEvents"]) {
+        img.style[p] = cs[p];
+      }
+      if (cs.position === "static" && (!img.style.width || img.style.width === "auto")) img.style.width = r.width + "px";
+      if (cs.position === "static" && (!img.style.height || img.style.height === "auto")) img.style.height = r.height + "px";
+      img.setAttribute("data-cloner-snap", "1");
+      c.replaceWith(img);
+    } catch (e) { /* tainted canvas — leave as-is */ }
+  }
   const MAX = 1200;
   const PROPS = ["display","position","flexDirection","justifyContent","alignItems","gap","gridTemplateColumns",
     "padding","margin","backgroundColor","backgroundImage","color","fontFamily","fontSize","fontWeight","lineHeight",
@@ -26,6 +65,9 @@ export const DOM_EXTRACTOR_SCRIPT = `(() => {
       ariaName: el.getAttribute("aria-label") || null,
       id: el.id || null,
       dataClonerTrigger: el.getAttribute("data-cloner-trigger") || null,
+      // canvas-snapshot marker (tag=img, painted canvas replaced in-place):
+      // dynamic-region detection reads this instead of the lost tag=canvas
+      dataClonerSnap: el.hasAttribute("data-cloner-snap") ? true : null,
       href: el.tagName === "A" ? (el.getAttribute("href") || null) : null,
       src: el.tagName === "IMG" ? (el.currentSrc || el.getAttribute("src") || null) : null,
       cls: String(el.className || "").slice(0, 80) || null,

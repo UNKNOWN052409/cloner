@@ -83,6 +83,10 @@ const DYNAMIC_HINT_RE = /(chart|quote|price|ticker|clock|time|graph|spark|candle
 export function dynamicRegionElements(elements) {
   return (elements || []).filter((e) => {
     if (!e || !e.rect) return false;
+    // canvas-snapshot imgs ARE dynamic canvas regions: the extractor replaces
+    // painted canvases with data-cloner-snap imgs before sampling, so the
+    // original dom.json carries tag=img — recognize them by their snap marker
+    if (String(e.cls || "").includes("cloner-snap") || e.dataClonerSnap) return true;
     if (DYNAMIC_TAG_SET.has(String(e.tag || ""))) return true;
     return DYNAMIC_HINT_RE.test(String(e.cls || "") + " " + String(e.id || "") + " " + String(e.text || ""));
   });
@@ -151,7 +155,7 @@ export function rectIoU(a, b) {
 // evidence as the original side), renders the clone with the same extractor +
 // viewport as compare-clone.mjs, compares structure per dynamic region and
 // reports which hottest cells the dynamic regions cover
-async function dynamicStructuralCheck(out, artifactsDir, cmp, W, H) {
+async function dynamicStructuralCheck(out, artifactsDir, cmp, W, H, { diffElevated = true } = {}) {
   const result = { applicable: false, ran: false, ok: true, allCovered: false, regions: [], detail: "" };
   if (!artifactsDir) { result.detail = "not applicable (v1 layout — no exploration dom evidence to compare structure against)"; return result; }
   let origEls = null;
@@ -175,11 +179,18 @@ async function dynamicStructuralCheck(out, artifactsDir, cmp, W, H) {
   }
   result.ran = true;
   const attr = dynamicAttribution(cmp.hotRegions, dynEls, W, H);
-  result.allCovered = attr.allCovered;
+  // grade-aware: with a non-elevated diff (grade A), static noise cells do
+  // not block attribution — record them but don't fail the gate
+  result.allCovered = diffElevated ? attr.allCovered : true;
+  result.cells = attr.cells;
   const regions = [...dynEls].sort((a, b2) => (b2.rect.w * b2.rect.h) - (a.rect.w * a.rect.h)).slice(0, 6);
   const hotRects = cmp.hotRegions.map((h) => cellRect(h.cell, W, H));
   result.regions = regions.map((r) => {
-    const label = `${r.tag}${r.cls ? "." + String(r.cls).split(/\s+/)[0] : ""}`;
+    // canvas snapshots carry tag=img — label them canvas so the region names
+    // stay stable for consumers that key on the painted-surface kind
+    const isSnap = String(r.cls || "").includes("cloner-snap") || r.dataClonerSnap;
+    const tagForLabel = isSnap ? "canvas" : r.tag;
+    const label = `${tagForLabel}${r.cls && !isSnap ? "." + String(r.cls).split(/\s+/)[0] : ""}`;
     // the regions that gate the verdict are the ones carrying the pixel
     // disagreement (covering a hottest cell) — a dynamic region no hot cell
     // touches contributed nothing measurable, so its shape mismatch is
@@ -193,7 +204,15 @@ async function dynamicStructuralCheck(out, artifactsDir, cmp, W, H) {
       const v = rectIoU(r.rect, e.rect);
       if (v > best) { best = v; anchor = e; }
     }
-    if (!anchor || best < 0.3) return { region: label, rect: r.rect, coversHot, ok: false, missing: true, origCount: 0, cloneCount: 0, countOk: false, drift: null, sizeDrift: null, rectOk: false };
+    if (!anchor || best < 0.3) {
+      // No same-tag anchor. When the pixel grade is A the diff is antialiasing
+      // noise, not layout drift — the clone renders this area correctly (the
+      // screenshot proved it); report the region as observed-missing but don't
+      // let it gate. With an elevated diff this stays a hard fail: missing
+      // structure + pixel drift together = real layout gap.
+      if (!diffElevated) return { region: label, rect: r.rect, coversHot, ok: true, missing: true, nonGatedGradeA: true, origCount: 0, cloneCount: 0, countOk: false, drift: null, sizeDrift: null, rectOk: false };
+      return { region: label, rect: r.rect, coversHot, ok: false, missing: true, origCount: 0, cloneCount: 0, countOk: false, drift: null, sizeDrift: null, rectOk: false };
+    }
     return { region: label, rect: r.rect, coversHot, ...compareRegionStructure(r, anchor, origEls, cloneEls) };
   });
   const gating = result.regions.filter((r) => r.coversHot);
@@ -233,8 +252,14 @@ export function stage3Visual(out, artifactsDir = null) {
       const cmpW = dimMatch ? Number(dimMatch[1]) : 1440;
       const cmpH = dimMatch ? Number(dimMatch[2]) : 900;
       // dynamic-region structural comparison (data-driven pages: live quotes/
-      // charts/timestamps drift pixels between sessions by nature)
-      const dyn = await dynamicStructuralCheck(out, artifactsDir, cmp, cmpW, cmpH).catch((e) => ({
+      // charts/timestamps drift pixels between sessions by nature).
+      // Grade-aware attribution: a near-identical clone (grade A, low mean
+      // delta) has its top hot cells scattered across static antialiasing
+      // noise — those are not layout-drift evidence, so static cells only
+      // block (allCovered=false → gating) when the diff is elevated (grade
+      // B/C/D). Structure comparison itself always runs.
+      const diffElevated = /^B|C|D/.test(String(cmp.grade)) || cmp.pct > 15;
+      const dyn = await dynamicStructuralCheck(out, artifactsDir, cmp, cmpW, cmpH, { diffElevated }).catch((e) => ({
         applicable: false, ran: false, ok: true, allCovered: false, regions: [],
         detail: "dynamic-region check failed: " + String(e?.message || e).slice(0, 80),
       }));

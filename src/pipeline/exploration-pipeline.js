@@ -80,7 +80,7 @@ async function captureInAppStateArtifacts(store, p, stateId, stateUrl) {
   return { screenshotRef, domRef };
 }
 
-export async function runExplorationJob({ url, cookiesFile, cookies, storage, username, password, config = {}, artifactsRoot = "artifacts", jobId: forcedId, onProgress = null } = {}) {
+export async function runExplorationJob({ url, cookiesFile, cookies, storage, username, password, storageStateFile = null, sessionSidecarFile = null, config = {}, artifactsRoot = "artifacts", jobId: forcedId, onProgress = null } = {}) {
   const id = forcedId || makeJobId();
   const store = createArtifactStore(artifactsRoot, id);
   const policy = resolvePolicy(config.policy || {});
@@ -140,6 +140,34 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     let sessionState = null;
     let sessionStorageData = null;
     if (username && password) {
+      // session REUSE first: a prior job's verified storage state (auth/session
+      // .json + sessionStorage sidecar) seeds this context without a second
+      // login — repeated logins kick the older concurrent session on sites
+      // like trader.tradovate.com. Fall back to a fresh login only when the
+      // saved files are missing/unreadable.
+      let reused = false;
+      if (storageStateFile && fs.existsSync(storageStateFile)) {
+        try {
+          sessionState = JSON.parse(fs.readFileSync(storageStateFile, "utf8"));
+          if (sessionSidecarFile && fs.existsSync(sessionSidecarFile)) {
+            sessionStorageData = JSON.parse(fs.readFileSync(sessionSidecarFile, "utf8"));
+            store.writeJson("auth/session-storage.json", sessionStorageData);
+          }
+          store.writeJson("auth/session.json", sessionState);
+          authOk = true;
+          authStatus = "verified";
+          reused = true;
+          authIndicators = ["reused-session-state"];
+          logger.info("auth", "session reused from prior job (no second login)", {
+            ref: storageStateFile,
+            cookies: (sessionState.cookies || []).length,
+            sessionStorage: sessionStorageData ? Object.keys(sessionStorageData.items || {}).length : 0,
+          });
+        } catch (e) {
+          warnings.push("auth: session reuse failed — falling back to fresh login: " + String(e?.message || e).slice(0, 120));
+        }
+      }
+      if (!reused) {
       const auth = await authenticateSession({ url, username, password, policy, logger, artifactsDir: store.dirs.root });
       for (const w of auth.warnings || []) warnings.push("auth: " + w);
       if (auth.ok) {
@@ -204,6 +232,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
         authReason = auth.reason;
         warnings.push(`auth: session not established — exploring without authentication (fail-soft): ${auth.reason}`);
       }
+      } // end if (!reused) — fresh-login fallback
     }
 
     // ---- browser: pooled (default) or per-job launch (CLONER_BROWSER_POOL=0) ----
@@ -304,6 +333,45 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     try { await page.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
+    // SPA hydration gate (heavy SPAs like trader.tradovate.com render shell →
+    // "app-initializing" → real DOM minutes later than networkidle): wait until
+    // the app's initializing marker class disappears, bounded by
+    // CLONER_HYDRATION_WAIT_MS (default 20000; 0 = off).
+    const hydrationWaitMs = Number(process.env.CLONER_HYDRATION_WAIT_MS ?? 20000);
+    if (hydrationWaitMs > 0) {
+      const hydrated = await page
+        .waitForFunction(
+          () => !document.querySelector(".app-initializing, [class*='app-initializing' i], #app-initializing"),
+          { timeout: hydrationWaitMs },
+        )
+        .then(() => true, () => false);
+      if (hydrated) logger.info("browser", "SPA hydration gate passed (app-initializing cleared)", { waitedMs: hydrationWaitMs });
+      else logger.debug("browser", "hydration gate: no app-initializing marker or timeout — continuing", { waitedMs: hydrationWaitMs });
+      // settled-DOM gate: the marker class clears BEFORE the real DOM mounts
+      // (measured on trader.tradovate.com: class gone → topbar still ~4s away).
+      // Wait for the app to become interactive: some visible chrome beyond the
+      // loading shell (any element whose area > 30% viewport below the shell),
+      // then a fixed settle window for late data-driven DOM (charts/quotes).
+      const settleMs = Number(process.env.CLONER_SPA_SETTLE_MS ?? 8000);
+      await page
+        .waitForFunction(
+          () => {
+            const shell = document.querySelector(".app-initializing, [class*='app-initializing' i]");
+            if (shell && document.contains(shell)) return false;
+            const els = document.body ? document.body.querySelectorAll("*") : [];
+            let visible = 0;
+            for (const el of els) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 40 && r.height > 12 && r.top >= 0 && r.top < innerHeight && el.children.length === 0 && (el.textContent || "").trim()) visible++;
+              if (visible >= 8) return true;
+            }
+            return false;
+          },
+          { timeout: settleMs },
+        )
+        .then(() => logger.info("browser", "SPA settle gate passed (real DOM visible)"), () => {});
+      await page.waitForTimeout(Math.min(settleMs, 4000)).catch(() => {});
+    }
     logger.debug("browser", "page loaded", { url: page.url() });
     await sampleRss("after seed load");
     const spaScript = spaRecorderScript(policy.routes.maxSpaEvents);

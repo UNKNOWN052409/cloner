@@ -26,9 +26,14 @@ try {
 
 const [url, usernameArg, passwordArg, depthArg] = process.argv.slice(2);
 if (!url) {
-  console.error("usage: node scripts/clone-v2.mjs <url> [username password] [maxRoutes]  (TV_USER/TV_PASS in .env are the default credentials)");
+  console.error("usage: node scripts/clone-v2.mjs <url> [username password] [maxRoutes] [--framework react|vue]  (TV_USER/TV_PASS in .env are the default credentials)");
   process.exit(1);
 }
+// output framework (R-P0.22): --framework react|vue emits a REAL framework
+// project beside the static clone (components from measured page evidence).
+// Env CLONE_FRAMEWORK works too; default static (engine's proven output).
+const fwFlagIdx = process.argv.indexOf("--framework");
+const framework = fwFlagIdx >= 0 ? String(process.argv[fwFlagIdx + 1] || "").toLowerCase() : String(process.env.CLONE_FRAMEWORK || "").toLowerCase() || null;
 // depth knob: maxRoutes (pages incl. seed); "max" = engine max 40, in-URL states 16
 const maxRoutes = depthArg === "max" ? 40 : Number(depthArg) || 0;
 // session reuse: reuse a prior job's verified session (NO second login —
@@ -85,7 +90,7 @@ console.log("[clone-v2] one-shot:", url, username ? "(with credentials)" : "");
 try {
   const result = await runPipelineJob(
     // defaults policy budgets (900s / 30 routes) — heavy SPAs like trader.tradovate.com need the room
-    { url, username, password, instructions: "", sessionId: "clone-v2", storageStateFile, sessionSidecarFile, ...(policy ? { policy } : {}) },
+    { url, username, password, instructions: "", sessionId: "clone-v2", storageStateFile, sessionSidecarFile, ...(framework ? { frameworkPreference: framework } : {}), ...(policy ? { policy } : {}) },
     {
       // live stage transitions — the same events the platform's /progress streams
       report: (status, data = {}) => console.log(`[clone-v2] stage: ${status}`, data.jobId ? `job=${data.jobId}` : ""),

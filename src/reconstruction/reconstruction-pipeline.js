@@ -6,6 +6,7 @@ import { loadArtifacts } from "./artifact-loader.js";
 import { buildComponentTree, flattenTree } from "./analysis/component-tree-builder.js";
 import { analyzeLayout, buildTokens, tokensCss } from "./analysis/layout-analyzer.js";
 import { buildComponentCss, buildLayoutCss, generatePageHtml, generateProject, buildLayoutCss as layoutCssBuilder } from "./generation/project-generator.js";
+import { emitFrameworkProject } from "./generation/framework.js"; // R-P0.22: react/vue output beside the static clone
 import { createLogger } from "../observability/logger.js";
 import { createWorkflowEmitter } from "../observability/workflow-events.js";
 // Phase 3.4 integrations (applied by the integration agent — each module keeps
@@ -240,8 +241,9 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
   // Deterministic, from recorded evidence + the user's instructions; writes
   // artifactsDir/blueprint.json. Non-fatal: a blueprint failure logs a
   // limitation and reconstruction proceeds (pre-blueprint behavior).
+  let bp = null; // hoisted: the framework emitter (R-P0.22) reads bp.blueprint.stack.output.framework
   try {
-    const bp = buildBlueprint(artifactsDir, { instructions, frameworkPreference });
+    bp = buildBlueprint(artifactsDir, { instructions, frameworkPreference });
     if (bp.ok) {
       report.blueprint = {
         ok: true,
@@ -376,7 +378,7 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
         file = `${stem}-${n}.html`;
       }
       usedFiles.add(file);
-      pages.push({ route, html, file, elements: flat.length });
+      pages.push({ pageId: lp.pageId, route, html, file, elements: flat.length });
       fileByPageId.set(lp.pageId, file);
       allElements.push(...lp.elements);
       logger.info("generate", `${lp.pageId}: ${flat.length} components, file: ${file}`);
@@ -595,6 +597,38 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
   // ---- slop lint (ADR-0003 hygiene): traceability gate after generation ----
   // Deterministic scan of the generated project for generator-injected generic
   // patterns the captured evidence never shows; evidence-backed values stay,
+  // ---- framework output (R-P0.22): when the blueprint's output framework is
+  // react/vue, emit a REAL framework project beside the static clone. The
+  // framework app renders the VERIFIED static clone's own markup (verbatim,
+  // through dangerouslySetInnerHTML / v-html) with the same CSS + runtime —
+  // v1's skeleton components produced a black screen (no CSS, no markup), so
+  // fidelity now comes from reusing the generated pages, never from re-deriving
+  // them. Never blocks the static result: a failure is a limitation note.
+  if (bp?.ok && bp.blueprint?.stack?.output?.framework && bp.blueprint.stack.output.framework !== "static") {
+    try {
+      const fwResult = emitFrameworkProject({
+        artifactsDir,
+        outDir,
+        framework: bp.blueprint.stack.output.framework,
+        // pageId + generated file + route: the emitter reads each generated
+        // page's own body markup from disk (the fidelity source)
+        pageFiles: pages.filter((p) => p.html).map((p) => ({ pageId: p.pageId, file: p.file, route: p.route })),
+        tokens,
+        originalUrl: loaded.manifest?.originalUrl || "",
+        logger,
+      });
+      if (fwResult.ok) {
+        report.framework = { ok: true, dir: path.basename(fwResult.dir), framework: fwResult.framework, components: fwResult.components, files: fwResult.files };
+        logger.info("framework", `emitted ${fwResult.framework} project (${fwResult.components} components) → ${path.basename(fwResult.dir)}/`);
+      } else {
+        report.limitations.push(`framework emitter: ${fwResult.why}`);
+      }
+    } catch (e) {
+      report.framework = { ok: false, error: String(e?.message || e).slice(0, 120) };
+      report.limitations.push("framework emitter failed: " + String(e?.message || e).slice(0, 120));
+    }
+  }
+
   // deterministically fixable injections are fixed in place. Non-fatal by
   // contract: a lint failure logs a limitation and never blocks the clone.
   try {

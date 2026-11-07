@@ -51,6 +51,13 @@ const STACK_SIGNALS = [
   ["nuxt", /\/_nuxt\/|__NUXT__/i],
   ["angular", /ng-version|ng-app|angular\.min\.js/i],
   ["react", /data-reactroot|react(-dom)?[-.]production|__REACT_DEVTOOLS/i],
+  // bundle-level markers: SPA frameworks name their chunks/scripts even when
+  // the sampled DOM carries no framework attrs (measured on trader.tradovate.com
+  // — react chunks + vite/webpack fingerprints live in script/asset URLs)
+  ["react", /\breact(-dom)?[-_.@][0-9a-z~]|react-dom\.client|react-router|jsx-runtime|@react/i],
+  ["vue", /vue(\.runtime)?\.[a-z]+\.(js|mjs)|\/vue[.-]|__VUE__|data-v-[0-9a-f]{6,}/i],
+  ["vite", /vite\/modulepreload-polyfill|__vite__|vite\.preload|\/assets\/(index|vendor)-[0-9a-f]{8}\.js/i],
+  ["webpack", /webpack(chunk|Runtime|jsonP)?[-_.]|__webpack_require__|webpack-[0-9a-f]{6,}/i],
   ["svelte", /class=["'][^"']*svelte-[a-z0-9]{4,}/i],
   ["wordpress", /wp-content|wp-includes|wp-json/i],
   ["shopify", /cdn\.shopify\.com|shopify-section|Shopify\.theme/i],

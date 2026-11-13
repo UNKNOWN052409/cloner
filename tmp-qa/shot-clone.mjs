@@ -1,0 +1,12 @@
+﻿import { chromium } from "playwright";
+const b = await chromium.launch({ headless: true, channel: "chrome" });
+const p = await (await b.newContext({ viewport: { width: 1440, height: 900 } })).newPage();
+p.on("console", (m) => { if (m.type() === "error") console.log("console-error:", m.text().slice(0, 200)); });
+p.on("pageerror", (e) => console.log("pageerror:", String(e).slice(0, 300)));
+await p.goto("http://127.0.0.1:5199/", { waitUntil: "domcontentloaded", timeout: 30000 });
+await p.waitForSelector(".tv-app", { timeout: 15000 });
+await p.waitForTimeout(1500);
+await p.screenshot({ path: "artifacts/tradovate-live-capture/shots/clone-00-baseline.png" });
+console.log("title:", await p.title());
+console.log("modules:", await p.locator(".tv-module").count(), "| canvases:", await p.locator("canvas").count());
+await b.close();

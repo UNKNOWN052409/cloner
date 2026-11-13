@@ -29,3 +29,6 @@ Thumbs.db
 .DS_Store
 nul
 .serena/
+
+# portable frontend clone deliverable (node_modules + build output)
+tradovate clone/

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en" class="theme-dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>modules-a harness</title>
+    <link rel="stylesheet" href="../../artifacts/tradovate-frontend-clone/src/styles/tokens.css" />
+    <link rel="stylesheet" href="../../artifacts/tradovate-frontend-clone/src/styles/ui.css" />
+    <link rel="stylesheet" href="../../artifacts/tradovate-frontend-clone/src/styles/modules-a.css" />
+    <style>
+      html, body, #root { height: 100%; margin: 0; }
+      body { background: #0b0c0e; color: var(--text); font-family: var(--font); overflow: auto; }
+      .harness { display: flex; min-height: 100vh; }
+      .harness-nav {
+        width: 210px; flex: 0 0 210px; background: #141519; border-right: 1px solid var(--border);
+        padding: 10px; display: flex; flex-direction: column; gap: 3px;
+      }
+      .harness-brand { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-faint); margin-bottom: 8px; }
+      .harness-nav-btn {
+        text-align: left; border: 0; background: transparent; color: var(--text-muted);
+        font-size: 11.5px; padding: 6px 8px; border-radius: 3px; cursor: pointer;
+      }
+      .harness-nav-btn:hover { background: #1e2026; color: var(--text); }
+      .harness-nav-btn.is-active { background: #1e2026; color: #fff; box-shadow: inset 2px 0 0 var(--green); }
+      .harness-controls { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding-top: 12px; border-top: 1px solid var(--border); }
+      .harness-controls label { font-size: 10px; color: var(--text-muted); display: flex; flex-direction: column; gap: 3px; }
+      .harness-controls select { background: #000; color: #fff; border: 1px solid var(--border); height: 24px; font-size: 11px; }
+      .harness-btn { background: var(--blue); color: #fff; border: 0; border-radius: 3px; padding: 6px 8px; font-size: 11px; cursor: pointer; }
+      .harness-counts { font-size: 10px; color: var(--text-muted); line-height: 1.6; font-family: var(--mono); }
+      .harness-stage { flex: 1 1 auto; padding: 18px; display: flex; align-items: flex-start; justify-content: flex-start; }
+      .harness-module { height: 720px; max-width: calc(100vw - 260px); }
+      .harness-toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 6px; z-index: 500; }
+      .harness-toast { background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 4px; padding: 6px 10px; font-size: 11px; display: flex; flex-direction: column; gap: 2px; min-width: 220px; }
+      .harness-toast b { color: var(--text); font-weight: 600; }
+      .harness-toast span { color: var(--text-muted); }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="harness.js"></script>
+  </body>
+</html>

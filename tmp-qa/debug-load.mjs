@@ -1,0 +1,11 @@
+﻿import { chromium } from "playwright";
+const b = await chromium.launch({ headless: true, channel: "chrome" });
+const p = await (await b.newContext({ viewport: { width: 1440, height: 900 } })).newPage();
+p.on("pageerror", (e) => console.log("PAGEERROR:", String(e).slice(0, 400)));
+p.on("console", (m) => { if (m.type() === "error") console.log("CONSOLE:", m.text().slice(0, 400)); });
+await p.goto("http://127.0.0.1:5199/", { waitUntil: "domcontentloaded" });
+await p.waitForTimeout(2500);
+console.log("title:", await p.title());
+console.log("body text:", (await p.evaluate(() => document.body.innerText)).slice(0, 200).replace(/\s+/g, " "));
+console.log("app present:", await p.locator(".tv-app").count(), "root html:", (await p.evaluate(() => document.getElementById("root")?.innerHTML.length)));
+await b.close();

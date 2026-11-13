@@ -1,0 +1,75 @@
+{
+  "results": [
+    {
+      "type": "marketAnalyzer",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "Market Analyzer"
+    },
+    {
+      "type": "stocksHotList",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "Stocks Hot List"
+    },
+    {
+      "type": "orders",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "Orders"
+    },
+    {
+      "type": "positions",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "Positions"
+    },
+    {
+      "type": "orderTicket",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "MNQZ6 5m"
+    },
+    {
+      "type": "timeSales",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "MNQZ6 5m"
+    },
+    {
+      "type": "tradePerformance",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "Trade Performance"
+    },
+    {
+      "type": "pulse",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "Pulse"
+    },
+    {
+      "type": "spreadMatrix",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "MNQZ6 5m"
+    },
+    {
+      "type": "optionsChain",
+      "mounted": true,
+      "width": 542,
+      "height": 314,
+      "tab": "MNQZ6 5m"
+    }
+  ],
+  "errors": []
+}

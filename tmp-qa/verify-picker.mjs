@@ -1,0 +1,17 @@
+﻿import { chromium } from "playwright";
+const b = await chromium.launch({ headless: false, channel: "chrome" });
+const p = await (await b.newContext({ viewport: { width: 1440, height: 900 } })).newPage();
+const errs = []; p.on("pageerror", (e) => errs.push(String(e).slice(0, 160)));
+await p.goto("http://127.0.0.1:5199/", { waitUntil: "domcontentloaded" });
+await p.waitForSelector(".tv-app"); await p.waitForTimeout(1000);
+await p.locator(".tv-symbol-picker-btn").first().click(); await p.waitForTimeout(500);
+await p.screenshot({ path: "artifacts/tradovate-live-capture/shots/fix-07-picker-open.png" });
+console.log("rows:", await p.locator(".tv-symbol-picker-row").count(), "groups:", await p.locator(".tv-symbol-picker-list .tv-menu-heading").count());
+await p.keyboard.type("euro"); await p.waitForTimeout(400);
+console.log("euro rows:", await p.locator(".tv-symbol-picker-row").count());
+await p.screenshot({ path: "artifacts/tradovate-live-capture/shots/fix-08-picker-euro.png" });
+await p.locator(".tv-symbol-picker-row").first().click(); await p.waitForTimeout(500);
+console.log("picked -> symbol card:", (await p.locator(".tv-symbol-card").innerText()).replace(/\s+/g, " ").slice(0, 120));
+await p.screenshot({ path: "artifacts/tradovate-live-capture/shots/fix-09-picked.png" });
+console.log("errors:", errs.slice(0, 4));
+await b.close();

@@ -67,19 +67,45 @@ function loadEvidence(cloneDir, artifactsDir) {
     if (manifest) break;
     try { manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8")); } catch {}
   }
+  // v2 state-graph bridge: manifest pages carrying a state domRef are in-URL
+  // states — the v2 explorer writes exploration.json with behaviors: [] (v2
+  // evidence lives in the state graph), so without this map every t* mark in
+  // dom.json failed the record/behavior gate below, the intersection was 0 and
+  // the matrix shipped blind ({flows:[],bugs:[]}, note never on disk). The
+  // trigger id rides the domRef basename (states/<page>/<tNN>.html) — the
+  // manifest's `state` field is the trigger's TEXT, which becomes the label. A
+  // state-backed trigger's honest replay is its generated state page rendering,
+  // not an overlay paint (the runtime has no record for it).
+  const stateById = new Map();
+  for (const mp of manifest?.pages || []) {
+    if (!mp || !mp.pageId) continue;
+    const id =
+      (/^(t\d+)$/.test(String(mp.state || "")) && String(mp.state)) ||
+      String(mp.domRef || "").match(/(?:^|[/\\])(t\d+)\.html$/)?.[1];
+    if (!id) continue;
+    const file = cloneFileForRoute(cloneDir, mp.pageId, (mp.route || {}).url || mp.url);
+    if (file) stateById.set(id, { file, pageId: mp.pageId, url: mp.url || null, label: mp.state || "" });
+  }
+  ev.stateById = stateById;
   if (Array.isArray(manifest?.pages) && manifest.pages.length) {
     for (const mp of manifest.pages) {
       const file = cloneFileForRoute(cloneDir, mp.pageId, (mp.route || {}).url || mp.url);
       if (!file) continue; // no clone file for this route — deep-link N-cases would be meaningless
-      const page = { pageId: mp.pageId, route: (mp.route || {}).url || mp.url, file, triggers: [], hasInputs: false };
+      const page = { pageId: mp.pageId, route: (mp.route || {}).url || mp.url, file, triggers: [], hasInputs: false, statePage: !!mp.stateOf, stateLabel: mp.state || "" };
       try {
         const dom = JSON.parse(fs.readFileSync(path.join(artifactsDir, "pages", mp.pageId, "dom.json"), "utf8"));
         for (const el of dom.elements || []) {
           if (el.tag === "input" || el.tag === "textarea") page.hasInputs = true;
-          // only ids backed by recorded evidence (runtime record or exploration
-          // behavior) form a replayable cluster — dead clone marks stay stage 2's lane
-          if (el.dataClonerTrigger && (recordIds.has(el.dataClonerTrigger) || behaviorIds.has(el.dataClonerTrigger))) {
-            page.triggers.push({ id: el.dataClonerTrigger, label: el.ariaName || (el.text || "").slice(0, 40) });
+          // replayable-cluster gate: runtime record (v1 overlay) or exploration
+          // behavior, OR a v2 state page (the bridge above) — dead clone marks
+          // with none of the three stay stage 2's lane
+          const id = el.dataClonerTrigger;
+          if (!id) continue;
+          if (recordIds.has(id) || behaviorIds.has(id)) {
+            page.triggers.push({ id, label: el.ariaName || (el.text || "").slice(0, 40), via: "record" });
+          } else if (stateById.has(id)) {
+            const st = stateById.get(id);
+            page.triggers.push({ id, label: el.ariaName || (el.text || "").slice(0, 40) || st.label || st.pageId, via: "state" });
           }
         }
       } catch {} // no per-page dom evidence — cluster placement falls back below
@@ -123,7 +149,7 @@ function buildMatrix(ev) {
   for (const page of sitePages.slice(0, MAX_FLOWS)) {
     const flow = { id: `F${String(flows.length + 1).padStart(2, "0")}`, page: page.file, cases: [] };
     const triggers = page.triggers.slice(0, MAX_H_PER_FLOW);
-    triggers.forEach((t, i) => flow.cases.push({ id: `${flow.id}-H${i + 1}`, kind: "happy-replay", trigger: t.id, label: t.label || null, result: "pending", evidence: {} }));
+    triggers.forEach((t, i) => flow.cases.push({ id: `${flow.id}-H${i + 1}`, kind: t.via === "state" ? "state-replay" : "happy-replay", trigger: t.id, label: t.label || null, result: "pending", evidence: {} }));
     let e = 0, n = 0;
     const pushE = (kind, extra = {}) => flow.cases.push({ id: `${flow.id}-E${++e}`, kind, ...extra, result: "pending", evidence: {} });
     const pushN = (kind, extra = {}) => flow.cases.push({ id: `${flow.id}-N${++n}`, kind, ...extra, result: "pending", evidence: {} });
@@ -134,6 +160,20 @@ function buildMatrix(ev) {
     pushE("a11y-name-alt");                                                  // accessible names + image alts
     if (sitePages.length > 1 && page.pageId !== "page-001") pushN("wrong-state-navigation", { target: page.file, mode: "deep-link" });
     if (sitePages.length > 1) pushN("wrong-state-navigation", { mode: "cross-page" });
+    flows.push(flow);
+  }
+  // v2 state pages: each generated in-URL state is replayable evidence on its
+  // own — one flow per state page (H: the state renders; E: keyboard + a11y on
+  // it). Click-chain attribution (which t* opens this state) is the behavior
+  // model's job, not the gate's — so no happy-replay click cases here.
+  const statePages = ev.pages.filter((p) => p.statePage && p.file);
+  for (const page of statePages.slice(0, Math.max(0, MAX_FLOWS - flows.length))) {
+    const flow = { id: `F${String(flows.length + 1).padStart(2, "0")}`, page: page.file, cases: [] };
+    flow.cases.push({ id: `${flow.id}-H1`, kind: "state-replay", trigger: null, target: page.file, label: page.stateLabel || null, result: "pending", evidence: {} });
+    let e = 0;
+    const pushE = (kind, extra = {}) => flow.cases.push({ id: `${flow.id}-E${++e}`, kind, ...extra, result: "pending", evidence: {} });
+    pushE("keyboard-focus");
+    pushE("a11y-name-alt");
     flows.push(flow);
   }
   return flows;
@@ -177,6 +217,22 @@ async function runHappy(p, c, ctx) {
   c.result = res.found && res.opened ? "pass" : "fail";
   c.evidence.target = c.trigger;
   c.evidence.detail = res.found ? (res.opened ? `trigger ${c.trigger} opened its panel` : `trigger ${c.trigger} clicked but nothing opened`) : `trigger ${c.trigger} missing from the clone`;
+}
+
+// state-replay — a v2 in-URL state: the trigger's recorded effect ships as its
+// own clone page (manifest pages[].state), so the honest replay is that page
+// rendering without errors. The runtime carries no record for it (the overlay
+// t* records are honestly skipped when no v1 behavior documents them), so a
+// click-assertion here would manufacture a false bug.
+async function runStateReplay(p, c, ctx) {
+  const st = c.target || (ctx.ev.stateById && ctx.ev.stateById.get(c.trigger))?.file;
+  if (!st) { c.result = "fail"; c.evidence.detail = `no state page for trigger ${c.trigger || "(unattributed)"}`; return; }
+  ctx.fctx.current = null;
+  await p.goto(fileUrl(ctx.cloneDir, st), { waitUntil: "load", timeout: 20000 });
+  await p.waitForTimeout(300);
+  const res = await p.evaluate(() => ({ rendered: !!(document.body && document.body.children.length), nodes: document.body ? document.body.querySelectorAll("*").length : 0 }));
+  c.result = res.rendered && ctx.errors.length === 0 ? "pass" : "fail";
+  c.evidence.detail = `state page ${st} rendered (${res.nodes} nodes, ${ctx.errors.length ? ctx.errors.length + " error(s)" : "no errors"})`;
 }
 
 async function runDoubleClick(p, c, ctx) {
@@ -276,6 +332,7 @@ async function runCrossPage(p, c, ctx) {
 // bug mapping — severity per case kind; the a11y runner pushes per-offender bugs (medium/low)
 const BUG_FOR_KIND = {
   "happy-replay": { severity: "high", what: (c) => `recorded interaction "${c.label || c.trigger}" does not replay on the clone` },
+  "state-replay": { severity: "high", what: (c) => `recorded state "${c.label || c.trigger}" is blank or throws on the clone` },
   "double-click": { severity: "high", what: () => "double activation of a recorded control threw or broke the page" },
   "long-input": { severity: "medium", what: () => "oversized text input threw or broke the field" },
   "back-button": { severity: "medium", what: () => "back-button mid-flow landed blank or threw" },
@@ -284,7 +341,7 @@ const BUG_FOR_KIND = {
   "wrong-state-navigation": { severity: "high", what: (c) => `wrong-state navigation (${c.mode || "deep-link"}) landed blank or threw` },
 };
 
-const RUNNERS = { "happy-replay": runHappy, "double-click": runDoubleClick, "long-input": runLongInput, "back-button": runBackButton, "keyboard-focus": runKeyboardFocus, "a11y-name-alt": runA11y };
+const RUNNERS = { "happy-replay": runHappy, "state-replay": runStateReplay, "double-click": runDoubleClick, "long-input": runLongInput, "back-button": runBackButton, "keyboard-focus": runKeyboardFocus, "a11y-name-alt": runA11y };
 
 // runFlowMatrix(cloneDir, artifactsDir) — build + execute the flow matrix on the
 // clone. Non-fatal by contract: any internal error lands in report.error, the
@@ -335,12 +392,17 @@ export async function runFlowMatrix(cloneDir, artifactsDir) {
   return finish(report, artifactsDir, cloneDir);
 }
 
-// report write — the file carries exactly the { flows, bugs } contract
+// report write — the { flows, bugs } contract plus the honesty note: an empty
+// matrix must say WHY on disk (the 2026-11-07 audit found the in-memory note
+// never reached the file, leaving consumers unable to tell blind from clean)
 function finish(report, artifactsDir, cloneDir) {
   try {
     const dir = path.join(artifactsDir || cloneDir, "reports");
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "flow-matrix.json"), JSON.stringify({ flows: report.flows, bugs: report.bugs }, null, 2));
+    fs.writeFileSync(
+      path.join(dir, "flow-matrix.json"),
+      JSON.stringify({ flows: report.flows, bugs: report.bugs, ...(report.note ? { note: report.note } : {}) }, null, 2),
+    );
     report.reportFile = "reports/flow-matrix.json";
   } catch (e) {
     report.writeError = String(e?.message || e).slice(0, 120);

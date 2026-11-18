@@ -129,7 +129,18 @@ export function structureOf(payload, opts = {}) {
   }
   if (payload.length > o.maxPayloadAnalyzed) return { t: "text", len: payload.length, truncated: true };
   let parsed;
-  try { parsed = JSON.parse(payload); } catch { return { t: "text", len: payload.length }; }
+  try { parsed = JSON.parse(payload); } catch {
+    // non-JSON text protocol (trading platforms stream quotes as CSV/binary-ish
+    // text lines): the NUMBERS are the replayable surface — extract tokens
+    // (bounded), never store the strings. Generic: no protocol knowledge.
+    if (o.keepNumbers) {
+      const tokens = payload.match(/-?\d+(?:\.\d+)?/g) || [];
+      if (tokens.length) {
+        return { t: "text-numbers", len: payload.length, v: tokens.slice(0, 32).map(Number) };
+      }
+    }
+    return { t: "text", len: payload.length };
+  }
   return shapeOfValue(parsed, null, 0, o);
 }
 
@@ -140,6 +151,16 @@ export function flattenNumericStructure(shape, prefix = "", out = {}) {
   if (!shape || typeof shape !== "object") return out;
   if ((shape.t === "number" || shape.t === "number-from-text") && typeof shape.v === "number") {
     if (prefix) out[prefix] = shape.v;
+    return out;
+  }
+  // text-protocol frame: extracted numeric tokens become positional keys
+  // ("0","1",…) under the current path — feeds carry real captured values
+  if (shape.t === "text-numbers" && Array.isArray(shape.v)) {
+    if (prefix) {
+      shape.v.forEach((n, i) => { out[`${prefix}.${i}`] = n; });
+    } else {
+      shape.v.forEach((n, i) => { out[String(i)] = n; });
+    }
     return out;
   }
   if (shape.t === "object" && shape.f) {

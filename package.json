@@ -78,7 +78,8 @@
     "test:log-contract": "node scripts/test-log-contract.mjs",
     "test:slop-lint": "node scripts/test-slop-lint.mjs",
     "test:flow-matrix": "node scripts/test-flow-matrix.mjs",
-    "test:progress-viewer": "node scripts/test-progress-viewer.mjs"
+    "test:progress-viewer": "node scripts/test-progress-viewer.mjs",
+    "test:behavior": "node scripts/test-behavior-model.mjs && node scripts/test-behavior-store.mjs"
   },
   "dependencies": {
     "@google/stitch-sdk": "^0.3.5",

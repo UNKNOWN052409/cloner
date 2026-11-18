@@ -25,6 +25,7 @@ import { classifyDefects } from "./visual-diff-classifier.js"; // task 3.4.3
 import { analyzeLayoutDefects } from "./analysis/layout-analyzer.js"; // layout defect detections (header/overflow/section)
 import { runRepairLoop } from "./repair-executor.js"; // task 3.4.5
 import { runFlowMatrix } from "./verify-flows.js"; // flow-matrix: numbered flow cases (F01-H1…) replayed on the clone
+import { runBehaviorVerification, summarizeBehaviorVerification } from "./verify-behavior.js"; // C4: dispatch→delta gate on the generated store
 import { DOM_EXTRACTOR_SCRIPT } from "../intelligence/dom-extractor.js"; // clone element measurement
 import { createLogger } from "../observability/logger.js"; // stage summary (log contract)
 import { createWorkflowEmitter } from "../observability/workflow-events.js"; // viewer todo/stage events
@@ -214,6 +215,7 @@ export async function verifyTask(outDirPath, task = null, { wf: passedWf = null,
   // by contract: a matrix error lands in its own report field, never fails
   // verification; the full matrix goes to <artifacts>/reports/flow-matrix.json.
   let flowMatrix = null;
+  let behaviorReport = null;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     // stage order per spec: 1 functional → 2 optimization/completeness → 3 visual
     const s1 = await stage1Functional(v2Clone || outDirPath);
@@ -222,6 +224,15 @@ export async function verifyTask(outDirPath, task = null, { wf: passedWf = null,
         flowMatrix = await runFlowMatrix(v2Clone || outDirPath, outDirPath);
       } catch (e) {
         flowMatrix = { flows: [], bugs: [], error: e.message.slice(0, 140) };
+      }
+      // behavior verification (C4) runs once beside the matrix: the generated
+      // store's dispatch→delta assertions. NON-FATAL by contract — a missing
+      // contract (pre-C1 job) is a skip, never a failure. Summary joins the
+      // report below (report is built after the round body).
+      try {
+        behaviorReport = await runBehaviorVerification(v2Clone || outDirPath, outDirPath);
+      } catch (e) {
+        behaviorReport = { ok: false, checks: [], error: e.message.slice(0, 140) };
       }
       // flow-matrix todos (viewer contract): one todo per replayed flow, closed
       // with the honest per-flow result as soon as the matrix returns — the
@@ -244,6 +255,7 @@ export async function verifyTask(outDirPath, task = null, { wf: passedWf = null,
       passed: s1.passed && s2.passed && s3.passed,
       layout: v2Clone ? "v2" : "v1",
     };
+    if (round === 1 && behaviorReport) report.behavior = summarizeBehaviorVerification(behaviorReport);
     rounds.push({ round, passed: report.passed, failed: report.stages.filter((s) => !s.passed).map((s) => s.stage) });
     if (report.passed || round === MAX_ROUNDS) break;
     if (Date.now() >= verifyDeadline) {

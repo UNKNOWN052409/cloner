@@ -5,7 +5,10 @@
 //
 // Redaction contract (frozen by the task):
 //  - String values are NEVER stored. Every string becomes its type + length only.
-//    (Exception: keys listed in opts.safeStringKeys — e.g. a public symbol code.)
+//    (Exception: keys listed in opts.safeStringKeys — e.g. a public symbol code.
+//    Second exception: numeric-parseable strings become their PARSED number as
+//    { t: "number-from-text", v } — quote feeds send prices as text; the parsed
+//    number carries no secret and keeps the replay contract numeric.)
 //  - Numeric values ARE kept by default (keepNumbers: true): ticker/quote streams
 //    are numeric and the replay contract (data-stream-replayer) reproduces the
 //    observed sequence from them. keepNumbers: false restores full redaction.
@@ -87,6 +90,14 @@ function shapeOfValue(value, key, depth, opts) {
       return opts.keepBooleans ? { t: "boolean", v: value } : { t: "boolean" };
     case "string":
       if (key && opts.safeStringKeys.includes(String(key))) return { t: "string", v: String(value).slice(0, 120) };
+      // numeric-parseable text (quote feeds send prices as "2346.50"): keep the
+      // PARSED number, never the string — the value stays replay-safe and
+      // credential-free (a number cannot carry a secret), so quote feeds stop
+      // collapsing to type-only shapes. Flagged as number-from-text so
+      // consumers know the original wire type was a string.
+      if (opts.keepNumbers && value.length <= 24 && /^[+-]?\d+(\.\d+)?$/.test(value.trim())) {
+        return { t: "number-from-text", v: Number(value.trim()) };
+      }
       return { t: "string", len: value.length };
     case "object": {
       if (Array.isArray(value)) {
@@ -127,7 +138,7 @@ export function structureOf(payload, opts = {}) {
 // capture-derived sequence is numeric by construction).
 export function flattenNumericStructure(shape, prefix = "", out = {}) {
   if (!shape || typeof shape !== "object") return out;
-  if (shape.t === "number" && typeof shape.v === "number") {
+  if ((shape.t === "number" || shape.t === "number-from-text") && typeof shape.v === "number") {
     if (prefix) out[prefix] = shape.v;
     return out;
   }

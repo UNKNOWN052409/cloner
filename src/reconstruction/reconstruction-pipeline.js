@@ -26,6 +26,8 @@ import { buildComponentRegistry, annotateUnderstanding, registrySummary } from "
 // task 3.5.3: deep application-state reconstruction (documented hook in
 // application-state-builder.js — plan + augment once, after the round loop)
 import { buildAppStatePlan, augmentProjectWithAppState, summarizeAppStatePlan } from "./application-state-builder.js";
+import { buildBehaviorModel, writeBehaviorModel, summarizeBehaviorModel } from "./behavior-model.js"; // C1 behavior synthesis
+import { augmentProjectWithStore } from "./generation/store-generator.js"; // C2 store generation
 // ADR-0003 hygiene: slop lint — the one wiring point (like every other task integration)
 import { slopLint } from "./hygiene/slop-lint.js";
 
@@ -592,6 +594,20 @@ export async function reconstructFromArtifacts(artifactsDir, { outDir, interacti
     report.appStateAugmentation = augmentProjectWithAppState(outDir, appPlan, { pages: genFiles });
   } catch (e) {
     report.limitations.push(`app-state augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
+  }
+
+  // behavior synthesis (C1): the behavior contract feeds the store generator
+  // (generation/store-generator.js, C2) and the behavior verification gate
+  // (verify-behavior.js, C4). Pure analysis over the artifacts + one JSON write
+  // — never blocks reconstruction, honest-absence on thin evidence.
+  try {
+    const behavior = buildBehaviorModel(artifactsDir, {});
+    writeBehaviorModel(artifactsDir, behavior);
+    report.behaviorModel = summarizeBehaviorModel(behavior);
+    const storeResult = augmentProjectWithStore(outDir, behavior, { artifactsDir, pages: genFiles });
+    report.storeAugmentation = storeResult;
+  } catch (e) {
+    report.limitations.push(`behavior model / store augmentation skipped: ${String(e?.message || e).slice(0, 100)}`);
   }
 
   // ---- slop lint (ADR-0003 hygiene): traceability gate after generation ----

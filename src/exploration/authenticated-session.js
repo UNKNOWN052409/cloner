@@ -140,6 +140,9 @@ export async function authenticateSession(args = {}) {
     storageStatePath: forcedPath = null,
     sessionKey = null,
     headless = true,
+    keepAlive = false, // hand the logged-in browser/context/page back instead of closing —
+                       // storage-state transfer alone can yield a dead session on apps that
+                       // bind the api session to the login context (measured: trader.tradovate.com)
   } = args;
   const cfg = resolveAuthPolicy(policy);
   const log = adaptLogger(logger);
@@ -291,13 +294,26 @@ export async function authenticateSession(args = {}) {
       warnings.push("sessionStorage capture failed (context will rely on cookies/localStorage only): " + String(e?.message || e).slice(0, 100));
     }
 
-    return { ok: true, needsHuman: false, storageStatePath: storagePath, sessionStoragePath, indicators, warnings };
+    // keepAlive handoff: the logged-in trio goes back to the caller — the SAME
+    // context explores (no storage-state transfer, no second navigation)
+    const handoff = keepAlive ? { browser, context, page } : null;
+    return {
+      ok: true,
+      needsHuman: false,
+      storageStatePath: storagePath,
+      sessionStoragePath,
+      indicators,
+      warnings,
+      ...(handoff ? { browser: handoff.browser, context: handoff.context, page: handoff.page } : {}),
+    };
   } catch (err) {
     warnings.push(`authenticateSession error: ${err && err.message ? err.message : String(err)}`);
     return failed("error", warnings);
   } finally {
     if (detachWsGuard) detachWsGuard();
-    if (browser) await browser.close().catch(() => {});
+    // with a keepAlive handoff the CALLER owns the browser lifecycle — closing
+    // here would kill the session this call just established
+    if (browser && !keepAlive) await browser.close().catch(() => {});
   }
 }
 

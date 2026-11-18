@@ -10,6 +10,7 @@ import { launchBrowser, newContext, loadCookies } from "../browser.js";
 // (login once → verified → persisted storage state, official Playwright pattern)
 import { getWorkerPool, createWorkerPool, getBrowserRootPid, sampleBrowserRss } from "../browser/browser-pool.js";
 import { authenticateSession } from "../exploration/authenticated-session.js";
+import { reachAuthenticatedWorkspace } from "../exploration/workspace-reach.js"; // post-login reachability (welcome/gate → workspace)
 import { resolvePolicy } from "../exploration/exploration-policy.js";
 import { createRouteDiscovery, spaRecorderScript } from "../exploration/route-discovery.js";
 // task 3.5.6: the proven SPA in-URL walker (test-spa-depth.mjs) is wired into
@@ -139,6 +140,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     let authIndicators = null;
     let sessionState = null;
     let sessionStorageData = null;
+    let authHandoff = null; // keepAlive login: { browser, context, page } adopted for exploration
     if (username && password) {
       // session REUSE first: a prior job's verified storage state (auth/session
       // .json + sessionStorage sidecar) seeds this context without a second
@@ -168,7 +170,12 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
         }
       }
       if (!reused) {
-      const auth = await authenticateSession({ url, username, password, policy, logger, artifactsDir: store.dirs.root });
+      // keepAlive: explore in the SAME context that logged in — a storage-state
+      // transfer alone can yield a dead session (measured: fresh login → every
+      // route bounced to the login screen in the exploration context while the
+      // login context itself was verified). The adopted trio skips the pool.
+      const auth = await authenticateSession({ url, username, password, policy, logger, artifactsDir: store.dirs.root, keepAlive: true });
+      authHandoff = auth.ok ? { browser: auth.browser, context: auth.context, page: auth.page } : null;
       for (const w of auth.warnings || []) warnings.push("auth: " + w);
       if (auth.ok) {
         try {
@@ -275,7 +282,17 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
 
     // ---- browser session ----
     const sessionStart = Date.now();
-    if (pool) {
+    if (authHandoff) {
+      // adopted login context: explore where the session actually lives. The
+      // pool is skipped by design — the logged-in browser IS the exploration
+      // browser; closing either one kills the session for both.
+      browser = authHandoff.browser;
+      ctx = authHandoff.context;
+      page = authHandoff.page;
+      await page.setViewportSize(policy.viewports[0]).catch(() => {});
+      browserMemory.adoptedLoginContext = true;
+      logger.info("browser", "exploring in the adopted login context (no storage-state handoff)", { viewport: policy.viewports[0].name });
+    } else if (pool) {
       const createdBefore = pool.stats().browsersCreated;
       lease = await pool.acquire({ cookies: contextCookies, viewport: policy.viewports[0], storage: contextStorage });
       browser = lease.browser;
@@ -285,19 +302,21 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       browser = await launchBrowser({ headless: true });
     }
     browserMemory.browserRootPid = await getBrowserRootPid(browser).catch(() => null);
-    ctx = lease ? lease.context : await newContext(browser, { cookies: contextCookies, viewport: policy.viewports[0], storage: contextStorage });
-    if (sessionStorageData && ctx?.addInitScript) {
-      // SPA auth token lives in sessionStorage (storageState never carries it) —
-      // seed it before the first navigation. Origin-checked so a pooled context
-      // reused by a later different-site job cannot leak this site's token.
-      await ctx.addInitScript(({ origin, items }) => {
-        if (location.origin === origin) {
-          try { for (const [k, v] of Object.entries(items)) sessionStorage.setItem(k, v); } catch {}
-        }
-      }, sessionStorageData);
-      logger.info("auth", "sessionStorage injected into exploration context", { origin: sessionStorageData.origin, keys: Object.keys(sessionStorageData.items || {}).length });
-    }
-    page = lease ? await lease.newPage() : await ctx.newPage();
+    if (!authHandoff) {
+      ctx = lease ? lease.context : await newContext(browser, { cookies: contextCookies, viewport: policy.viewports[0], storage: contextStorage });
+      if (sessionStorageData && ctx?.addInitScript) {
+        // SPA auth token lives in sessionStorage (storageState never carries it) —
+        // seed it before the first navigation. Origin-checked so a pooled context
+        // reused by a later different-site job cannot leak this site's token.
+        await ctx.addInitScript(({ origin, items }) => {
+          if (location.origin === origin) {
+            try { for (const [k, v] of Object.entries(items)) sessionStorage.setItem(k, v); } catch {}
+          }
+        }, sessionStorageData);
+        logger.info("auth", "sessionStorage injected into exploration context", { origin: sessionStorageData.origin, keys: Object.keys(sessionStorageData.items || {}).length });
+      }
+      page = lease ? await lease.newPage() : await ctx.newPage();
+    } // adopted login context: ctx/page are the login trio — no re-seeding, no new page
     logger.metric("navigationMs", Date.now() - sessionStart);
     logger.info("browser", "browser + context ready", {
       viewport: policy.viewports[0].name,
@@ -374,6 +393,20 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
     }
     logger.debug("browser", "page loaded", { url: page.url() });
     await sampleRss("after seed load");
+
+    // workspace reach (post-login reachability): fresh logins land on
+    // welcome/trading-mode pages, not the authenticated workspace where the
+    // quote websocket lives. Simulation-side click only — LIVE is never
+    // clicked (hard guard). Non-fatal; notes land in the manifest auth block.
+    const workspaceReach = await reachAuthenticatedWorkspace(page, { logger, enabled: authOk });
+    if (workspaceReach.acted) {
+      logger.info("auth", "workspace reach pass acted", { landedUrl: workspaceReach.landedUrl, gatePassed: workspaceReach.gatePassed });
+      authIndicators = (authIndicators || []).concat(workspaceReach.gatePassed ? ["trading-mode-gate:simulation"] : ["welcome-reach:root"]);
+      // the SPA recorder must attach to the page the app actually lives on
+      await page.waitForTimeout(300).catch(() => {});
+    } else if (workspaceReach.notes.length) {
+      logger.debug("auth", "workspace reach pass: " + workspaceReach.notes[0]);
+    }
     const spaScript = spaRecorderScript(policy.routes.maxSpaEvents);
     await page.evaluate(spaScript).catch(() => {});
 
@@ -671,7 +704,7 @@ export async function runExplorationJob({ url, cookiesFile, cookies, storage, us
       coverage: { routesExplored: routesExplored, routesDiscovered: discovery.routes.length, statesRecorded: graphData.stats.nodes },
       errors: errors.map((e) => ({ message: String(e).slice(0, 200) })),
       warnings: warnings.map((w) => ({ message: String(w).slice(0, 200) })),
-      auth: { loginRequired: authInfo.loginRequired, credentialsUsed: !!(username && password), status: authStatus, reason: authReason, indicators: authIndicators, sessionStateRef: sessionState ? "auth/session.json" : null },
+      auth: { loginRequired: authInfo.loginRequired, credentialsUsed: !!(username && password), status: authStatus, reason: authReason, indicators: authIndicators, sessionStateRef: sessionState ? "auth/session.json" : null, workspaceReach: workspaceReach ? { acted: workspaceReach.acted, gatePassed: workspaceReach.gatePassed, landedUrl: workspaceReach.landedUrl, notes: (workspaceReach.notes || []).slice(0, 6) } : null },
       metrics: logger.metrics(),
       browserMemory: { ...browserMemory },
     });
